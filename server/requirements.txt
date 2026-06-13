@@ -1,0 +1,10 @@
+opencv-python
+ultralytics
+huggingface-hub
+Pillow
+grpcio
+grpcio-tools
+openai-whisper
+kokoro
+soundfile
+gradio

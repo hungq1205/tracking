@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+env/
+bin/
+lib/
+develop-eggs/
+dist/
+build/
+eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+
+# gRPC generated files
+*_pb2.py
+*_pb2_grpc.py
+*_pb2.pyi
+
+# Model weights and data
+*.pt
+*.pth
+*.ckpt
+models/
+
+# Output and Logs
+output/
+outputs/
+generated/
+*.log
+*.vtt
+
+# Sphinx documentation build
+docs/_build/
+
+# System/IDE files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

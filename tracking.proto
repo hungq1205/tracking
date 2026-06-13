@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package tracking;
+
+service TrackingService {
+  rpc DetectObject (DetectionRequest) returns (DetectionResponse);
+  rpc GetEmbedding (EmbeddingRequest) returns (EmbeddingResponse);
+  rpc Chat (ChatRequest) returns (ChatResponse);
+  rpc VoiceChat (VoiceChatRequest) returns (ChatResponse);
+  rpc StreamFrame (FrameRequest) returns (FrameResponse);
+}
+
+message DetectionRequest {
+  string prompt = 1;
+}
+
+message DetectionResponse {
+  repeated float box_xyxy = 1;
+  float score = 2;
+}
+
+message EmbeddingRequest {
+  repeated float box_xyxy = 1;
+}
+
+message EmbeddingResponse {
+  repeated float embedding = 1;
+}
+
+message ChatRequest {
+  string message = 1;
+}
+
+message ChatResponse {
+  string response = 1;
+  bytes audio_response = 2;
+}
+
+message VoiceChatRequest {
+  bytes audio_data = 1;
+}
+
+message FrameRequest {
+  bytes image_data = 1;
+}
+
+message FrameResponse {
+  bool success = 1;
+}
