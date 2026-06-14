@@ -19,11 +19,6 @@ var/
 wheels/
 *.egg-info/
 
-# gRPC generated files
-*_pb2.py
-*_pb2_grpc.py
-*_pb2.pyi
-
 # Model weights and data
 *.pt
 *.pth

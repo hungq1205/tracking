@@ -6,6 +6,7 @@ import tempfile
 import soundfile as sf
 import queue
 import time
+import threading
 from PIL import Image
 import tracking_pb2
 import tracking_pb2_grpc
@@ -20,6 +21,7 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         self.frame_queue = frame_queue
         self.latest_frame = None
         self.last_vlm_step_time = time.time()
+        self.vlm_lock = threading.Lock()
 
     def _decode_image(self, data):
         if not data:
@@ -47,6 +49,7 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         return byte_io.getvalue()
 
     def DetectObject(self, request, context):
+        print(f"[SERVER] Received DetectObject request: prompt='{request.prompt}'", flush=True)
         if self.latest_frame is None:
             return tracking_pb2.DetectionResponse()
         frame = self.latest_frame.copy()
@@ -56,30 +59,43 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(frame, f"{request.prompt}: {det.score:.2f}", (x1, max(y1 - 10, 0)), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        print(f"[SERVER] Sending DetectObject response: score={det.score:.2f}", flush=True)
         return tracking_pb2.DetectionResponse(box_xyxy=list(det.box_xyxy), score=det.score)
 
     def GetEmbedding(self, request, context):
+        print(f"[SERVER] Received GetEmbedding request: box={request.box_xyxy}", flush=True)
         if self.latest_frame is None:
             return tracking_pb2.EmbeddingResponse(embedding=[])
         emb = self.embedder.get_embedding(self.latest_frame, tuple(request.box_xyxy))
         if emb is not None:
             embedding_list = emb.detach().cpu().numpy().flatten().tolist()
+            print(f"[SERVER] Sending GetEmbedding response: embedding_len={len(embedding_list)}", flush=True)
             return tracking_pb2.EmbeddingResponse(embedding=embedding_list)
+        print(f"[SERVER] Sending GetEmbedding response: no embedding found", flush=True)
         return tracking_pb2.EmbeddingResponse(embedding=[])
 
     def Chat(self, request, context):
+        print(f"[SERVER] Received Chat request: message='{request.message}'", flush=True)
         if self.streaming_vlm_instance is None:
             return tracking_pb2.ChatResponse(response="Error: StreamingVLM not initialized.")
+        if self.latest_frame is None:
+            return tracking_pb2.ChatResponse(response="Error: No video frames received by server yet.")
         try:
-            reply = self.streaming_vlm_instance.chat(request.message)
-            # Reset the background timer since we just forced an inference step
-            self.last_vlm_step_time = time.time()
-            audio_bytes = self._generate_tts(reply)
-            return tracking_pb2.ChatResponse(response=reply, audio_response=audio_bytes)
+            with self.vlm_lock:
+                reply = self.streaming_vlm_instance.chat(request.message)
+                # Reset the background timer since we just forced an inference step
+                self.last_vlm_step_time = time.time()
+            
+            if reply:
+                audio_bytes = self._generate_tts(reply)
+                print(f"[SERVER] Sending Chat response: reply='{reply}'", flush=True)
+                return tracking_pb2.ChatResponse(response=reply, audio_response=audio_bytes)
+            return tracking_pb2.ChatResponse(response="VLM produced no response.")
         except Exception as e:
             return tracking_pb2.ChatResponse(response=f"Error: {str(e)}")
 
     def VoiceChat(self, request, context):
+        print(f"[SERVER] Received VoiceChat request: audio_len={len(request.audio_data)}", flush=True)
         if self.streaming_vlm_instance is None or not request.audio_data:
             return tracking_pb2.ChatResponse(response="Error: Setup issues.")
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -90,15 +106,19 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
             user_text = result["text"].strip()
             if not user_text:
                 return tracking_pb2.ChatResponse(response="[ASR] Could not understand audio.")
-            reply = self.streaming_vlm_instance.chat(user_text)
-            self.last_vlm_step_time = time.time()
-            audio_bytes = self._generate_tts(reply)
+            with self.vlm_lock:
+                reply = self.streaming_vlm_instance.chat(user_text)
+                self.last_vlm_step_time = time.time()
+                audio_bytes = self._generate_tts(reply)
+            print(f"[SERVER] Sending VoiceChat response: transcribed='{user_text}', reply='{reply}'", flush=True)
             return tracking_pb2.ChatResponse(response=f"[Voice: {user_text}]\n{reply}", audio_response=audio_bytes)
         finally:
             import os
             if os.path.exists(tmp_path): os.remove(tmp_path)
 
     def StreamFrame(self, request, context):
+        # Print throttled or removed if too noisy, keeping for debug visibility
+        # print(f"[SERVER] Received StreamFrame request: data_len={len(request.image_data)}", flush=True)
         frame = self._decode_image(request.image_data)
         if frame is not None:
             self.latest_frame = frame
@@ -114,13 +134,14 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
                     start_time = float(self.streaming_vlm_instance.chunk_index)
                     end_time = start_time + 1.0
                     
-                    reply = self.streaming_vlm_instance.process_video_step()
+                    with self.vlm_lock:
+                        reply = self.streaming_vlm_instance.process_video_step()
                     if reply:
                         # Clean the suffix for logging, same as inference.py
                         clean_reply = reply[:-4] if reply.endswith(" ...") else reply
                         hms_start = time.strftime('%H:%M:%S', time.gmtime(int(start_time)))
                         hms_end = time.strftime('%H:%M:%S', time.gmtime(int(end_time)))
-                        print(f"Time={hms_start}-{hms_end}: \033[1m\033[34m{clean_reply}\033[0m")
+                        print(f"Time={hms_start}-{hms_end}: \033[1m\033[34m{clean_reply}\033[0m", flush=True)
                     
                     self.last_vlm_step_time = now
 

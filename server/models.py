@@ -34,10 +34,11 @@ class GroundingDINODetector:
         if not clean_prompt.endswith("."): clean_prompt += "."
 
         inputs = self.processor(images=image, text=clean_prompt, return_tensors="pt").to(self.device)
+
+        # Optimization: GroundingDINO works well in float16 on CUDA
         if self.device.type == "cuda":
-            for k, v in inputs.items():
-                if torch.is_floating_point(v): inputs[k] = v.half() # Convert inputs to float16
-        
+            inputs = {k: v.half() if torch.is_floating_point(v) else v for k, v in inputs.items()}
+
         # Use autocast for mixed precision inference
         with torch.autocast(device_type=self.device.type, dtype=torch.float16 if self.device.type == "cuda" else torch.float32):
             with torch.no_grad():

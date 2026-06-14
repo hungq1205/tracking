@@ -1,4 +1,5 @@
 import grpc
+import os
 from concurrent import futures
 import tracking_pb2
 import tracking_pb2_grpc
@@ -12,6 +13,8 @@ from vlm_wrapper import HanLabStreamingVLM
 from servicer import TrackingServiceServicer
 from server_gui import create_ui
 
+vlm_model_path = os.getenv("VLM_MODEL_PATH", "/models/qwen")
+
 gui_frame_queue = queue.Queue(maxsize=10)
 print("[SERVER] Initializing heavy models on GPU/High-end CPU...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -22,8 +25,12 @@ embedder = EfficientNetLiteEmbedder()
 streaming_vlm_instance = None
 vlm_model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
 print("[SERVER] Initializing StreamingVLM - ${vlm_model_id}...")
-vlm_model = AutoModelForImageTextToText.from_pretrained(vlm_model_id, torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32, device_map="auto")
-vlm_processor = AutoProcessor.from_pretrained(vlm_model_id)
+vlm_model = AutoModelForImageTextToText.from_pretrained(
+    vlm_model_path,
+    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto",
+)
+vlm_processor = AutoProcessor.from_pretrained(vlm_model_path)
 streaming_vlm_instance = HanLabStreamingVLM(model=vlm_model, processor=vlm_processor, device=device)
 print("[SERVER] StreamingVLM Ready.")
 print("[SERVER] Initializing ASR (Whisper) & TTS (Kokoro)...")
@@ -42,6 +49,6 @@ def _start_grpc_server(servicer_instance):
 if __name__ == "__main__":
     servicer = TrackingServiceServicer(detector, embedder, asr_model, tts_pipeline, streaming_vlm_instance, gui_frame_queue)
     grpc_thread = futures.ThreadPoolExecutor(max_workers=1).submit(_start_grpc_server, servicer)
-    app = create_ui(gui_frame_queue)
+    app = create_ui(gui_frame_queue, streaming_vlm_instance)
     print("[SERVER] Launching Gradio app...")
-    app.queue().launch(server_name="127.0.0.1", server_port=7860, theme="monochrome")
+    app.queue().launch(server_name="0.0.0.0", server_port=7860, theme="monochrome")

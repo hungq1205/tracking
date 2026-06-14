@@ -13,6 +13,12 @@ class HanLabStreamingVLM:
     def __init__(self, model, processor, device):
         # Patch the model for streaming attention
         self.model = convert_qwen2_5_to_streaming(model)
+        
+        # Manual attribute injection to fix compatibility with newer transformers versions
+        for m in self.model.modules():
+            if "Attention" in m.__class__.__name__ and not hasattr(m, "_flash_attn_uses_top_left_mask"):
+                m._flash_attn_uses_top_left_mask = False
+
         self.processor = processor
         self.device = device
         
@@ -72,16 +78,21 @@ class HanLabStreamingVLM:
         
         # 3. Build text prompt for the current step
         prompt = f'Time={self.chunk_index:.1f}-{self.chunk_index+1.0:.1f}s'
-        vlm_instruction = query if query else "Commentate on this match"
+        
+        # Base instruction acts as the constant 'attention sink' task description
+        base_instruction = "Please describe the video."
 
         if self.chunk_index == 0:
-            user_content = [{"type": "text", "text": prompt}, {"type": "video", "video": "live"}, {"type": "text", "text": vlm_instruction}]
+            # Always include the base instruction in the first chunk to anchor the task
+            user_content = [{"type": "text", "text": prompt}, {"type": "video", "video": "live"}, {"type": "text", "text": base_instruction}]
+            if query:
+                user_content.append({"type": "text", "text": query})
+                
             self.full_conversation_history = [{"role": "previous text", "content": ""}, {"role": "user", "content": user_content}]
             text = self.processor.apply_chat_template(self.full_conversation_history, tokenize=False, add_generation_prompt=True)
         else:
             user_content = [{"type": "text", "text": prompt}, {"type": "video", "video": "live"}]
-            # Only include text instruction in subsequent turns if it's an explicit user query
-            if query is not None:
+            if query:
                 user_content.append({"type": "text", "text": query})
             self.full_conversation_history.append({"role": "user", "content": user_content})
             text = self.processor.apply_chat_template([{"role": "user", "content": user_content}], tokenize=False, add_generation_prompt=True)
@@ -107,7 +118,6 @@ class HanLabStreamingVLM:
         outputs = self.model.generate(**inputs, past_key_values=self.past_key_values, max_new_tokens=20, 
                                       use_cache=True, return_dict_in_generate=True, do_sample=True,
                                       streaming_args=self.streaming_args, pad_token_id=151645,
-                                      streaming_args=self.streaming_args, pad_token_id=151645, 
                                       temperature=0.9, repetition_penalty=1.05)
         
         generated_ids = outputs.sequences

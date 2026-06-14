@@ -24,9 +24,11 @@ class RemoteTrackingClient:
 
     def detect(self, frame, prompt, *args, **kwargs):
         # Server uses the previously streamed frame; frame argument is kept for API compatibility
+        print(f"[CLIENT] Requesting DetectObject: prompt='{prompt}'")
         request = tracking_pb2.DetectionRequest(prompt=prompt)
         try:
             res = self.track_stub.DetectObject(request)
+            print(f"[CLIENT] Received DetectObject response: score={res.score:.2f}")
             # Scale the bounding box back to original image dimensions
             scaled_box = tuple(coord / self.last_scale for coord in res.box_xyxy)
             return Detection(box_xyxy=scaled_box, score=res.score)
@@ -37,11 +39,13 @@ class RemoteTrackingClient:
     def get_embedding(self, frame, box):
         # Scale the request box down to match the resized image
         scaled_box = [coord * self.last_scale for coord in box]
+        print(f"[CLIENT] Requesting GetEmbedding: scaled_box={scaled_box}")
         request = tracking_pb2.EmbeddingRequest(
             box_xyxy=scaled_box
         )
         try:
             res = self.track_stub.GetEmbedding(request)
+            print(f"[CLIENT] Received GetEmbedding response: embedding_len={len(res.embedding)}")
             if not res.embedding:
                 return None
             return torch.tensor(res.embedding).unsqueeze(0)
@@ -50,17 +54,22 @@ class RemoteTrackingClient:
             return None
 
     def chat(self, frame, message):
+        message = message or ""
+        print(f"[CLIENT] Requesting Chat: message='{message}'", flush=True)
         request = tracking_pb2.ChatRequest(message=message)
         try:
             res = self.track_stub.Chat(request)
+            print(f"[CLIENT] Received Chat response: '{res.response}'", flush=True)
             return res
         except grpc.RpcError as e:
             return tracking_pb2.ChatResponse(response=f"Chat RPC failed: {e}")
 
     def voice_chat(self, audio_data):
+        print(f"[CLIENT] Requesting VoiceChat: audio_data_len={len(audio_data)}")
         request = tracking_pb2.VoiceChatRequest(audio_data=audio_data)
         try:
             res = self.track_stub.VoiceChat(request)
+            print(f"[CLIENT] Received VoiceChat response: '{res.response}'")
             return res
         except grpc.RpcError as e:
             return tracking_pb2.ChatResponse(response=f"Voice Chat RPC failed: {e}")
@@ -72,6 +81,7 @@ class RemoteTrackingClient:
         request = tracking_pb2.FrameRequest(image_data=image_data)
         try:
             res = self.track_stub.StreamFrame(request)
+            # Response is a simple success boolean, no need for extra log if no exception
         except grpc.RpcError as e:
             print(f"[EDGE] Gui frame RPC failed: {e}")
             pass
