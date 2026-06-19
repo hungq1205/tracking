@@ -34,6 +34,9 @@ message ChatRequest {
 message ChatResponse {
   string response = 1;
   bytes audio_response = 2;
+  string agent_name = 3;
+  string agent_state = 4;
+  string agent_payload = 5;
 }
 
 message VoiceChatRequest {

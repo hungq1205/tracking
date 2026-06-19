@@ -13,7 +13,7 @@ class HanLabStreamingVLM:
     def __init__(self, model, processor, device):
         # Patch the model for streaming attention
         self.model = convert_qwen2_5_to_streaming(model)
-        
+
         # Manual attribute injection to fix compatibility with newer transformers versions
         for m in self.model.modules():
             if "Attention" in m.__class__.__name__ and not hasattr(m, "_flash_attn_uses_top_left_mask"):
@@ -38,7 +38,16 @@ class HanLabStreamingVLM:
         self.system_prompt_offset = len(processor.apply_chat_template([{"role": "system", "content": ""}], tokenize=False))
         self.frame_buffer = []
         # Match inference.py defaults
-        self.text_round = 16 
+        self.text_round = 16
+        self.visual_round = 16
+        self.max_new_tokens = 20
+        self.base_instruction = "Precisely and concisely describe objects and its relative positions, and events or actions taking place in view."
+
+    def update_params(self, params: dict):
+        self.max_new_tokens = params.get("max_new_tokens", self.max_new_tokens)
+        self.base_instruction = params.get("base_instruction", self.base_instruction)
+        self.text_round = params.get("text_round", self.text_round)
+        self.visual_round = params.get("visual_round", self.visual_round)
 
     def push_frame(self, pil_image):
         """Buffers frames for the next streaming inference step."""
@@ -56,7 +65,7 @@ class HanLabStreamingVLM:
         # 1. Manage KV Cache and sliding window
         self.past_key_values, self.prev_generated_ids, self.recent_video_window_clips, self.recent_pixel_values_videos = process_past_kv(
             self.past_key_values, self.chunk_index, 
-            text_round=self.text_round, visual_round=self.text_round, 
+            text_round=self.text_round, visual_round=self.visual_round, 
             full_conversation_history=self.full_conversation_history, 
             prev_generated_ids=self.prev_generated_ids, 
             assistant_start_bias=self.assistant_start_bias, 
@@ -80,7 +89,7 @@ class HanLabStreamingVLM:
         prompt = f'Time={self.chunk_index:.1f}-{self.chunk_index+1.0:.1f}s'
         
         # Base instruction acts as the constant 'attention sink' task description
-        base_instruction = "Please describe the video."
+        base_instruction = self.base_instruction
 
         if self.chunk_index == 0:
             # Always include the base instruction in the first chunk to anchor the task
@@ -115,7 +124,7 @@ class HanLabStreamingVLM:
             torch.cat([self.streaming_args.video_grid_thw, inputs['video_grid_thw']], dim=0)
 
         # 5. Generate Response
-        outputs = self.model.generate(**inputs, past_key_values=self.past_key_values, max_new_tokens=20, 
+        outputs = self.model.generate(**inputs, past_key_values=self.past_key_values, max_new_tokens=self.max_new_tokens, 
                                       use_cache=True, return_dict_in_generate=True, do_sample=True,
                                       streaming_args=self.streaming_args, pad_token_id=151645,
                                       temperature=0.9, repetition_penalty=1.05)

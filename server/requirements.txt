@@ -1,10 +1,34 @@
-opencv-python
-ultralytics
+# Core ML
+torch
+torchvision
+transformers
+accelerate
 huggingface-hub
-Pillow
+
+# gRPC
 grpcio
 grpcio-tools
+
+# Vision / Detection
+opencv-python
+Pillow
+paddlepaddle-gpu
+paddleocr[doc-parser]>=3.4.0
+
+# Audio
 openai-whisper
 kokoro
 soundfile
+
+# NLP / Embeddings
+sentence-transformers
+
+# VLM / Streaming
+qwen-vl-utils
+decord
+
+# Server / UI
 gradio
+
+# Utilities
+numpy

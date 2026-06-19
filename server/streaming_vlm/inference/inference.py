@@ -82,6 +82,14 @@ def load_model_and_processor(model_path, model_base = 'Qwen2_5'):
         )
         model = convert_qwen2_to_streaming(model)
         processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
+    elif model_base == 'Qwen3':
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            model_path, torch_dtype="auto", device_map="cuda",
+            attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager"
+        )
+        model = convert_qwen3_to_streaming(model)
+        processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
     return model, processor
 
 def process_past_kv(past_key_values, i, text_round, visual_round, full_conversation_history, prev_generated_ids,
@@ -224,9 +232,12 @@ def streaming_inference(model_path="",
             model = convert_qwen2_5_to_streaming(model)
         elif model_base == 'Qwen2':
             model = convert_qwen2_to_streaming(model)
+        elif model_base == 'Qwen3':
+            from streaming_vlm.inference.qwen3.patch_model import convert_qwen3_to_streaming
+            model = convert_qwen3_to_streaming(model)
     
     assistant_start_bias = len(processor(text="<|im_start|>assistant\n")['input_ids'][0])
-    assistant_end_bias = len(processor(text=" ...<|im_end|>")['input_ids'][0])
+    assistant_end_bias = len(processor(text=" ...")['input_ids'][0])
 
     # Load GT
     use_gt = False
@@ -529,7 +540,7 @@ if __name__ == "__main__":
     args.add_argument("--pos_mode", type=str, default="shrink", choices=["append", "shrink"])
     args.add_argument("--all_text", action="store_true", default=False)
     args.add_argument("--model_path", type=str, default="mit-han-lab/StreamingVLM")
-    args.add_argument("--model_base", type=str, choices=["Qwen2_5", "Qwen2", "VILA"], default="Qwen2_5")
+    args.add_argument("--model_base", type=str, choices=["Qwen2_5", "Qwen2", "Qwen3", "VILA"], default="Qwen2_5")
     args.add_argument("--video_path", type=str, default=default_video)
     args.add_argument("--window_size", type=int, default=DEFAULT_WINDOW_SIZE)
     args.add_argument("--chunk_duration", type=int, default=DEFAULT_CHUNK_DURATION)

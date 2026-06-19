@@ -1,53 +1,107 @@
 import grpc
 import os
 from concurrent import futures
-import tracking_pb2
-import tracking_pb2_grpc
-from models import GroundingDINODetector, EfficientNetLiteEmbedder
 import queue
+import threading
+
 import torch
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoProcessor, AutoModelForImageTextToText, pipeline as hf_pipeline
 import whisper
 from kokoro import KPipeline
-from vlm_wrapper import HanLabStreamingVLM
-from servicer import TrackingServiceServicer
-from server_gui import create_ui
 
-vlm_model_path = os.getenv("VLM_MODEL_PATH", "/models/qwen")
+import tracking_pb2_grpc
+from agents import TrackingAgent, ReadingAgent, MemoryAgent, InfoAgent
+from orchestrator import Orchestrator
+from services.servicer import TrackingServiceServicer
+from server_gui import create_ui
+from tools import (
+    GroundingDINODetector,
+    OCRTool,
+    JsonMemoryStore,
+    RagStore,
+    KokoroTTS,
+    WhisperASR,
+)
+from tools.intent_parser import GeneralIntentParser, ReadingIntentParser, TrackingIntentParser
+from tools.embedder import EfficientNetLiteEmbedder
+from vlm_wrapper import HanLabStreamingVLM
+
+vlm_model_path = os.getenv("VLM_MODEL_PATH", "/models/qwen/7B")
+vlm_model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
+intent_parser_model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+memory_base_dir = os.getenv("MEMORY_STORE_DIR", os.path.join(os.path.dirname(__file__), "data", "memory"))
 
 gui_frame_queue = queue.Queue(maxsize=10)
 print("[SERVER] Initializing heavy models on GPU/High-end CPU...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
 detector = GroundingDINODetector()
 embedder = EfficientNetLiteEmbedder()
 
-# Initialize StreamingVLM components
+# Load VLM first so it gets full GPU VRAM priority before any other model
 streaming_vlm_instance = None
-vlm_model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
-print("[SERVER] Initializing StreamingVLM - ${vlm_model_id}...")
+model_to_load = vlm_model_path if os.path.exists(vlm_model_path) else vlm_model_id
+print(f"[SERVER] Initializing StreamingVLM from {model_to_load}...")
 vlm_model = AutoModelForImageTextToText.from_pretrained(
-    vlm_model_path,
+    model_to_load,
     torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     device_map="auto",
 )
-vlm_processor = AutoProcessor.from_pretrained(vlm_model_path)
+vlm_processor = AutoProcessor.from_pretrained(model_to_load, use_fast=True)
 streaming_vlm_instance = HanLabStreamingVLM(model=vlm_model, processor=vlm_processor, device=device)
 print("[SERVER] StreamingVLM Ready.")
-print("[SERVER] Initializing ASR (Whisper) & TTS (Kokoro)...")
-asr_model = whisper.load_model("base")
-tts_pipeline = KPipeline(lang_code='a')
-print("[SERVER] ASR & TTS Ready.")
+
+# Intent parser on CPU to avoid VRAM contention with the VLM
+intent_pipe = hf_pipeline("text-generation", model=intent_parser_model_id, device="cpu")
+general_parser = GeneralIntentParser(pipe=intent_pipe)
+reading_parser = ReadingIntentParser(pipe=intent_pipe)
+tracking_parser = TrackingIntentParser(pipe=intent_pipe)
+memory_store = JsonMemoryStore(base_dir=memory_base_dir)
+rag_store = RagStore(base_dir=memory_base_dir)
+ocr = OCRTool()
+asr_model = WhisperASR()
+tts = KokoroTTS()
+
+vlm_lock = threading.Lock()
+memory_agent = MemoryAgent(
+    store=memory_store,
+    rag_store=rag_store,
+    vlm=streaming_vlm_instance,
+    vlm_lock=vlm_lock,
+)
+reading_agent = ReadingAgent(ocr=ocr, rag_store=rag_store)
+tracking_agent = TrackingAgent(detector=detector)
+info_agent = InfoAgent(vlm=streaming_vlm_instance, vlm_lock=vlm_lock)
+
+orchestrator = Orchestrator(
+    agents=[tracking_agent, reading_agent, memory_agent, info_agent],
+    general_parser=general_parser,
+    reading_parser=reading_parser,
+    tracking_parser=tracking_parser,
+    rag_store=rag_store,
+)
+
+servicer = TrackingServiceServicer(
+    orchestrator=orchestrator,
+    detector=detector,
+    embedder=embedder,
+    asr=asr_model,
+    tts=tts,
+    streaming_vlm_instance=streaming_vlm_instance,
+    frame_queue=gui_frame_queue,
+)
+
 
 def _start_grpc_server(servicer_instance):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     tracking_pb2_grpc.add_TrackingServiceServicer_to_server(servicer_instance, server)
-    server.add_insecure_port('[::]:50051')
+    server.add_insecure_port("[::]:50051")
     server.start()
     print("[SERVER] gRPC server started on port 50051.")
     server.wait_for_termination()
 
+
 if __name__ == "__main__":
-    servicer = TrackingServiceServicer(detector, embedder, asr_model, tts_pipeline, streaming_vlm_instance, gui_frame_queue)
     grpc_thread = futures.ThreadPoolExecutor(max_workers=1).submit(_start_grpc_server, servicer)
     app = create_ui(gui_frame_queue, streaming_vlm_instance)
     print("[SERVER] Launching Gradio app...")

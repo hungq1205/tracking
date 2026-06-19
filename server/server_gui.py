@@ -4,7 +4,16 @@ import queue
 from typing import Dict, Any, Generator
 
 def create_ui(gui_frame_queue, vlm_instance):
-    def run_experiment() -> Generator[Dict[str, Any], None, None]:
+    def run_experiment(max_tokens, instruction, t_round, v_round) -> Generator[Dict[str, Any], None, None]:
+        if vlm_instance:
+            # Package parameters into a dict for the VLM wrapper
+            vlm_instance.update_params({
+                "max_new_tokens": int(max_tokens),
+                "base_instruction": instruction,
+                "text_round": int(t_round),
+                "visual_round": int(v_round)
+            })
+
         print("[SERVER GUI] Listening for live Edge signal...")
         while True:
             try:
@@ -41,13 +50,20 @@ def create_ui(gui_frame_queue, vlm_instance):
             with gr.Row():
                 btn_start = gr.Button("Run", variant="primary", scale=1)
                 btn_stop = gr.Button("Stop", variant="stop", scale=1)
+            
+            with gr.Accordion("VLM Streaming Settings", open=False):
+                ui_max_tokens = gr.Slider(minimum=10, maximum=256, value=20, step=1, label="Max New Tokens")
+                ui_instruction = gr.Textbox(value="Precisely and concisely describe objects and its relative positions, and events or actions taking place in view.", 
+                                            label="Base Instruction", lines=2)
+                ui_text_round = gr.Number(value=16, label="Text KV Rounding (tokens)")
+                ui_visual_round = gr.Number(value=16, label="Visual KV Rounding (frames)")
             ui_image = gr.Image(label="Processed GPU Output Pipeline View")
             ui_status = gr.Textbox(label="Framework Metrics & Connection Status", lines=2, interactive=False)
             ui_chatbot = gr.Chatbot(label="VLM Conversation History")
 
         run_event = btn_start.click(
             fn=run_experiment,
-            inputs=[],
+            inputs=[ui_max_tokens, ui_instruction, ui_text_round, ui_visual_round],
             outputs=[ui_image, ui_status, ui_chatbot]
         )
         btn_stop.click(fn=None, cancels=[run_event])

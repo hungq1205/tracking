@@ -2,6 +2,7 @@ import grpc
 import numpy as np
 import cv2
 import torch
+import traceback
 from proto import tracking_pb2
 from proto import tracking_pb2_grpc
 from core.interfaces import Detection, HandTrack
@@ -33,6 +34,7 @@ class RemoteTrackingClient:
             scaled_box = tuple(coord / self.last_scale for coord in res.box_xyxy)
             return Detection(box_xyxy=scaled_box, score=res.score)
         except grpc.RpcError as e:
+            traceback.print_exc()
             print(f"[EDGE] Detection RPC failed: {e}")
             return Detection(box_xyxy=(0,0,0,0), score=0.0)
 
@@ -50,6 +52,7 @@ class RemoteTrackingClient:
                 return None
             return torch.tensor(res.embedding).unsqueeze(0)
         except grpc.RpcError as e:
+            traceback.print_exc()
             print(f"[EDGE] Embedding RPC failed: {e}")
             return None
 
@@ -62,6 +65,7 @@ class RemoteTrackingClient:
             print(f"[CLIENT] Received Chat response: '{res.response}'", flush=True)
             return res
         except grpc.RpcError as e:
+            traceback.print_exc()
             return tracking_pb2.ChatResponse(response=f"Chat RPC failed: {e}")
 
     def voice_chat(self, audio_data):
@@ -72,6 +76,7 @@ class RemoteTrackingClient:
             print(f"[CLIENT] Received VoiceChat response: '{res.response}'")
             return res
         except grpc.RpcError as e:
+            traceback.print_exc()
             return tracking_pb2.ChatResponse(response=f"Voice Chat RPC failed: {e}")
 
     def send_gui_frame(self, frame):
@@ -83,8 +88,8 @@ class RemoteTrackingClient:
             res = self.track_stub.StreamFrame(request)
             # Response is a simple success boolean, no need for extra log if no exception
         except grpc.RpcError as e:
+            traceback.print_exc()
             print(f"[EDGE] Gui frame RPC failed: {e}")
-            pass
 
 # Wrapper classes to maintain compatibility with existing interfaces
 class RemoteGroundingDINO(RemoteTrackingClient): pass

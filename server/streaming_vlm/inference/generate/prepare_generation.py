@@ -35,12 +35,13 @@ def prepare_multiturn_multimodal_inputs_for_generation(
         )
 
     input_ids_key = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+    target_device = self.device
     if not self.config.is_encoder_decoder:
         if inputs_embeds is not None and len(cache_position) == inputs_embeds.shape[1]:
             model_inputs[input_ids_key] = None
             model_inputs["inputs_embeds"] = inputs_embeds
         else:
-            model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
+            model_inputs[input_ids_key] = input_ids.to(target_device).clone(memory_format=torch.contiguous_format)
             model_inputs["inputs_embeds"] = None
     else:
         model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
