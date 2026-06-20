@@ -1,4 +1,16 @@
-# Use NVIDIA CUDA runtime (not devel — no nvcc needed at inference time)
+# # Step 1 — compile the wheel (runs builder fully before anything else)
+# docker build \
+#   -f Dockerfile.builder \
+#   -t streaming-vlm-builder \
+#   .
+
+# Step 2 — build the runtime image (pulls wheel from the named image above)
+# docker build .
+
+# Pull the pre-compiled wheel from the separately built builder image
+FROM streaming-vlm-builder AS builder
+
+# Runtime image — no nvcc, no devel headers
 FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -48,7 +60,8 @@ RUN python3.11 -m pip install \
     transformers==4.52.3 accelerate peft pillow-heif gpustat timm sentencepiece \
     liger_kernel numpy==1.24.4 bitsandbytes
 
-# Compiles CUDA kernels — needs nvcc; if build fails add cuda-nvcc-12-8 to the apt block above
-RUN python3.11 -m pip install git+https://github.com/mit-han-lab/block-sparse-attn
+# Install the pre-compiled wheel from the builder stage — no nvcc needed here
+COPY --from=builder /dist/*.whl /tmp/
+RUN python3.11 -m pip install /tmp/*.whl && rm -f /tmp/*.whl
 
 COPY grab-pov.mp4 .

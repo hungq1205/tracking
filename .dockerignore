@@ -11,12 +11,6 @@
 # Eval toolkit — large, not needed for inference
 server/streaming_vlm/eval/
 
-# Media files — never bake into the image
-*.mp4
-*.avi
-*.mov
-*.mkv
-
-# Local secrets / logs
+# Local config / secrets / logs
 .env
 *.log

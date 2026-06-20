@@ -1,0 +1,7 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        - CUDA_VERSION
+        - CUDA_SHORT
