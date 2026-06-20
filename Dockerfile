@@ -1,11 +1,9 @@
-# Use NVIDIA CUDA as base image to support GPU acceleration and 4-bit quantization
-FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+# Use NVIDIA CUDA runtime (not devel — no nvcc needed at inference time)
+FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
 
-# Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y software-properties-common && \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update && apt-get install -y \
@@ -21,37 +19,36 @@ RUN apt-get update && apt-get install -y software-properties-common && \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Set python3.11 as the default python
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
-# Set working directory
 WORKDIR /home/hungq/projects/streaming-vlm
 
-# Pull the repository and copy local files
-RUN git clone https://github.com/mit-han-lab/streaming-vlm .
+# Shallow clone + strip eval toolkit and git history (not needed at inference time)
+RUN git clone --depth 1 --single-branch https://github.com/mit-han-lab/streaming-vlm . && \
+    rm -rf .git eval/
 
-# Install dependencies following the specified sequence
-RUN python3.11 -m pip install --upgrade pip
+RUN python3.11 -m pip install --upgrade pip && \
+    python3.11 -m pip install packaging ninja wheel setuptools
 
-RUN python3.11 -m pip install \
-    packaging \
-    ninja \
-    wheel \
-    setuptools
-
-# Install PyTorch ecosystem and Qwen utilities
+# PyTorch in its own layer — cache survives requirements changes
 RUN python3.11 -m pip install torch==2.7.1 torchvision torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+
 RUN python3.11 -m pip install qwen_vl_utils==0.0.11
 
 COPY infer_requirements.txt infer_requirements.txt
 
-RUN if [ -f infer_requirements.txt ]; then python3.11 -m pip install -r infer_requirements.txt; fi
+# PaddlePaddle must be installed before paddleocr resolves its backend dependency
+RUN python3.11 -m pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu128/
 
-# Install core libraries (including bitsandbytes for 4-bit quantization support)
-RUN python3.11 -m pip install transformers==4.52.3 accelerate deepspeed peft opencv-python decord datasets \
-    tensorboard gradio pillow-heif gpustat timm sentencepiece openai \
-    liger_kernel numpy==1.24.4 yt-dlp tqdm huggingface_hub ffmpeg wandb bitsandbytes
+RUN python3.11 -m pip install -r infer_requirements.txt
 
-# Ensure grab-pov.mp4 is in the same directory as this Dockerfile
+# Packages not covered by infer_requirements.txt (duplicates removed)
+RUN python3.11 -m pip install \
+    transformers==4.52.3 accelerate peft pillow-heif gpustat timm sentencepiece \
+    liger_kernel numpy==1.24.4 bitsandbytes
+
+# Compiles CUDA kernels — needs nvcc; if build fails add cuda-nvcc-12-8 to the apt block above
+RUN python3.11 -m pip install git+https://github.com/mit-han-lab/block-sparse-attn
+
 COPY grab-pov.mp4 .

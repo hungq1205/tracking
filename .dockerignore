@@ -1,0 +1,22 @@
+# Git history
+.git/
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.egg-info/
+.eggs/
+
+# Eval toolkit — large, not needed for inference
+server/streaming_vlm/eval/
+
+# Media files — never bake into the image
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Local secrets / logs
+.env
+*.log
