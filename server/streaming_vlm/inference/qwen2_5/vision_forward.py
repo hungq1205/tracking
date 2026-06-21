@@ -4,7 +4,8 @@ import torch
 from typing import Optional, Tuple
 from torch.nn import functional as F
 from types import MethodType
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import logger,apply_rotary_pos_emb_flashatt,flash_attn_varlen_func
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import logger, apply_rotary_pos_emb_flashatt
+from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
 def streaming_visual_attention_forward(
         self,

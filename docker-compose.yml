@@ -1,0 +1,18 @@
+services:
+  streaming-vlm-server:
+    build: .
+    ports:
+      - "7680:7680"
+      - "50051:50051"
+    volumes:
+      - E:/Models:/models/qwen
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped

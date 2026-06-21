@@ -2,6 +2,7 @@ import json
 import re
 
 from domain.intents import ParsedIntent
+from interfaces import IIntentParser
 
 
 _GENERAL_PROMPT = (
@@ -76,7 +77,7 @@ _TRACKING_PROMPT = (
 )
 
 
-class GeneralIntentParser:
+class GeneralIntentParser(IIntentParser):
     """Used when not in any active mode (idle)."""
 
     def __init__(self, pipe):
@@ -86,7 +87,7 @@ class GeneralIntentParser:
         return _run_parse(self.pipe, _GENERAL_PROMPT, text)
 
 
-class ReadingIntentParser:
+class ReadingIntentParser(IIntentParser):
     """Used when reading_state != 'idle'. Handles navigation and STOP_READING only."""
 
     def __init__(self, pipe):
@@ -96,7 +97,7 @@ class ReadingIntentParser:
         return _run_parse(self.pipe, _READING_PROMPT, text)
 
 
-class TrackingIntentParser:
+class TrackingIntentParser(IIntentParser):
     """Used when active_agent == 'tracking'. Handles STOP_TRACKING, retarget, and INFO."""
 
     def __init__(self, pipe):

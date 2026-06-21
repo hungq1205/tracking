@@ -1,70 +1,59 @@
-import tempfile
-import os
 import numpy as np
 from typing import List
 
 import cv2
 
 
-class PaddleOCRVLTool:
+class DocLayoutRapidOCRTool:
     def __init__(self):
-        from paddleocr import PaddleOCRVL
+        # from doclayout_yolo import YOLOv10
+        # from rapidocr_onnxruntime import RapidOCR
+        from huggingface_hub import hf_hub_download
 
-        print("[SERVER] Initializing PaddleOCR-VL-1.5...")
-        self._pipeline = PaddleOCRVL(pipeline_version="v1.5")
+        print("[SERVER] Initializing DocLayout-YOLO + RapidOCR...")
+        # model_path = hf_hub_download(
+        #     repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
+        #     filename="doclayout_yolo_docstructbench_imgsz1024.pt",
+        # )
+        # self._layout = YOLOv10(model_path)
+        # self._ocr = RapidOCR()
+        print("[SERVER] DocLayout-YOLO + RapidOCR ready.")
 
     def read_blocks(self, frame: np.ndarray, direction: str = "ltr") -> List[str]:
-        """Return one string per layout block, in reading order.
-
-        direction is accepted for API compatibility; PaddleOCR-VL-1.5
-        infers reading order automatically from the document structure.
-        """
-        del direction  # handled by the model internally
+        """Return one string per layout block, in reading order (top-to-bottom, left-to-right)."""
+        del direction
         if frame is None:
             return []
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
 
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
+        results = self._layout.predict(rgb, imgsz=1024, conf=0.2, verbose=False)
+        raw_boxes = results[0].boxes.xyxy.cpu().numpy() if results and results[0].boxes else []
+        boxes = sorted(raw_boxes, key=lambda b: (b[1], b[0]))
 
-        try:
-            from PIL import Image
-            Image.fromarray(rgb).save(tmp_path)
+        blocks: List[str] = []
+        for box in boxes:
+            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
 
-            blocks: List[str] = []
-            for res in self._pipeline.predict(tmp_path):
-                blocks.extend(_extract_blocks(res))
-        finally:
-            os.unlink(tmp_path)
+            ocr_result, _ = self._ocr(rgb[y1:y2, x1:x2])
+            if not ocr_result:
+                continue
+
+            text = " ".join(line[1] for line in ocr_result if line[1]).strip()
+            if text:
+                blocks.append(text)
+
+        if not blocks:
+            ocr_result, _ = self._ocr(rgb)
+            if ocr_result:
+                blocks = [line[1] for line in ocr_result if line[1] and line[1].strip()]
 
         return blocks
 
     def read_text(self, frame: np.ndarray, direction: str = "ltr") -> str:
         return " ".join(self.read_blocks(frame, direction))
-
-
-def _extract_blocks(res) -> List[str]:
-    """Pull ordered text blocks out of a PaddleOCRVL result object."""
-    # res.res is the raw dict from the pipeline
-    raw = getattr(res, "res", None)
-    if raw is None:
-        return []
-
-    blocks: List[str] = []
-
-    # layout_det_res contains blocks sorted in reading order by the pipeline
-    for item in raw.get("layout_det_res", {}).get("input_path", []):
-        text = (item.get("text") or "").strip()
-        if text:
-            blocks.append(text)
-
-    # If layout path yields nothing, fall back to the overall OCR text in order
-    if not blocks:
-        ocr = raw.get("overall_ocr_res", {})
-        for item in ocr.get("rec_texts", []):
-            text = str(item).strip()
-            if text:
-                blocks.append(text)
-
-    return blocks

@@ -1,7 +1,12 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Tuple, Dict, Any, Optional
+from typing import TYPE_CHECKING, Tuple, Dict, Any, Optional
 import numpy as np
+
+if TYPE_CHECKING:
+    from domain.intents import ParsedIntent
 
 @dataclass
 class ObjectTrack:
@@ -45,4 +50,16 @@ class IObjectTracker(ABC):
 class IHandDetector(ABC):
     @abstractmethod
     def detect(self, frame: np.ndarray) -> HandTrack:
+        pass
+
+
+class IObjectDetector(ABC):
+    @abstractmethod
+    def detect(self, frame: np.ndarray, prompt: str) -> Detection:
+        pass
+
+
+class IIntentParser(ABC):
+    @abstractmethod
+    def parse(self, text: str) -> "ParsedIntent":
         pass

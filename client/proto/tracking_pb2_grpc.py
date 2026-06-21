@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-from proto import tracking_pb2 as tracking__pb2
+import tracking_pb2 as tracking__pb2
 
-GRPC_GENERATED_VERSION = '1.81.0'
+GRPC_GENERATED_VERSION = '1.81.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -258,6 +258,164 @@ class TrackingService:
             '/tracking.TrackingService/StreamFrame',
             tracking__pb2.FrameRequest.SerializeToString,
             tracking__pb2.FrameResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class MediatorServiceStub:
+    """Missing associated documentation comment in .proto file."""
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.StreamFrameWithGuidance = channel.unary_unary(
+                '/tracking.MediatorService/StreamFrameWithGuidance',
+                request_serializer=tracking__pb2.FrameRequest.SerializeToString,
+                response_deserializer=tracking__pb2.GuidanceFrameResponse.FromString,
+                _registered_method=True)
+        self.Chat = channel.unary_unary(
+                '/tracking.MediatorService/Chat',
+                request_serializer=tracking__pb2.ChatRequest.SerializeToString,
+                response_deserializer=tracking__pb2.ChatResponse.FromString,
+                _registered_method=True)
+        self.VoiceChat = channel.unary_unary(
+                '/tracking.MediatorService/VoiceChat',
+                request_serializer=tracking__pb2.VoiceChatRequest.SerializeToString,
+                response_deserializer=tracking__pb2.ChatResponse.FromString,
+                _registered_method=True)
+
+
+class MediatorServiceServicer:
+    """Missing associated documentation comment in .proto file."""
+
+    def StreamFrameWithGuidance(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Chat(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def VoiceChat(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_MediatorServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'StreamFrameWithGuidance': grpc.unary_unary_rpc_method_handler(
+                    servicer.StreamFrameWithGuidance,
+                    request_deserializer=tracking__pb2.FrameRequest.FromString,
+                    response_serializer=tracking__pb2.GuidanceFrameResponse.SerializeToString,
+            ),
+            'Chat': grpc.unary_unary_rpc_method_handler(
+                    servicer.Chat,
+                    request_deserializer=tracking__pb2.ChatRequest.FromString,
+                    response_serializer=tracking__pb2.ChatResponse.SerializeToString,
+            ),
+            'VoiceChat': grpc.unary_unary_rpc_method_handler(
+                    servicer.VoiceChat,
+                    request_deserializer=tracking__pb2.VoiceChatRequest.FromString,
+                    response_serializer=tracking__pb2.ChatResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'tracking.MediatorService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('tracking.MediatorService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class MediatorService:
+    """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def StreamFrameWithGuidance(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tracking.MediatorService/StreamFrameWithGuidance',
+            tracking__pb2.FrameRequest.SerializeToString,
+            tracking__pb2.GuidanceFrameResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Chat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tracking.MediatorService/Chat',
+            tracking__pb2.ChatRequest.SerializeToString,
+            tracking__pb2.ChatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def VoiceChat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tracking.MediatorService/VoiceChat',
+            tracking__pb2.VoiceChatRequest.SerializeToString,
+            tracking__pb2.ChatResponse.FromString,
             options,
             channel_credentials,
             insecure,

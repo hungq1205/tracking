@@ -40,3 +40,5 @@ docs/_build/
 .idea/
 .DS_Store
 Thumbs.db
+
+block_sparse_attention.egg/
