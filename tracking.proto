@@ -50,3 +50,21 @@ message FrameRequest {
 message FrameResponse {
   bool success = 1;
 }
+
+message GuidanceFrameResponse {
+  bool success = 1;
+  string instruction = 2;
+  string tracking_status = 3;
+  float object_confidence = 4;
+  repeated float object_box_xyxy = 5;
+  repeated float hand_box_xyxy = 6;
+  float delta_x = 7;
+  float delta_y = 8;
+  float distance_px = 9;
+}
+
+service MediatorService {
+  rpc StreamFrameWithGuidance (FrameRequest) returns (GuidanceFrameResponse);
+  rpc Chat (ChatRequest) returns (ChatResponse);
+  rpc VoiceChat (VoiceChatRequest) returns (ChatResponse);
+}

@@ -3,12 +3,12 @@ import torch
 import logging
 from PIL import Image
 
-from interfaces import Detection
+from interfaces import Detection, IObjectDetector
 
 logger = logging.getLogger(__name__)
 
 
-class GroundingDINODetector:
+class GroundingDINODetector(IObjectDetector):
     def __init__(self, model_id: str = "IDEA-Research/grounding-dino-tiny"):
         from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 

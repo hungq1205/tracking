@@ -26,9 +26,9 @@ from tools.intent_parser import GeneralIntentParser, ReadingIntentParser, Tracki
 from tools.embedder import EfficientNetLiteEmbedder
 from vlm_wrapper import HanLabStreamingVLM
 
-vlm_model_path = os.getenv("VLM_MODEL_PATH", "/models/qwen/7B")
-vlm_model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
-intent_parser_model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+vlm_model_path = os.getenv("VLM_MODEL_PATH", "/models/qwen/3B")
+vlm_model_id = os.getenv("VLM_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
+intent_parser_model_id = os.getenv("INTENT_PARSER_MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
 memory_base_dir = os.getenv("MEMORY_STORE_DIR", os.path.join(os.path.dirname(__file__), "data", "memory"))
 
 gui_frame_queue = queue.Queue(maxsize=10)
@@ -40,8 +40,12 @@ embedder = EfficientNetLiteEmbedder()
 
 # Load VLM first so it gets full GPU VRAM priority before any other model
 streaming_vlm_instance = None
-model_to_load = vlm_model_path if os.path.exists(vlm_model_path) else vlm_model_id
-print(f"[SERVER] Initializing StreamingVLM from {model_to_load}...")
+if os.path.exists(vlm_model_path):
+    model_to_load = vlm_model_path
+    print(f"[SERVER] Loading VLM from local path: {model_to_load}")
+else:
+    model_to_load = vlm_model_id
+    print(f"[SERVER] Local model not found at {vlm_model_path}, downloading from HuggingFace: {model_to_load}")
 vlm_model = AutoModelForImageTextToText.from_pretrained(
     model_to_load,
     torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
@@ -66,6 +70,7 @@ vlm_lock = threading.Lock()
 memory_agent = MemoryAgent(
     store=memory_store,
     rag_store=rag_store,
+    detector=detector,
     vlm=streaming_vlm_instance,
     vlm_lock=vlm_lock,
 )
