@@ -1,5 +1,11 @@
+import re
 import torch
 import numpy as np
+
+_READING_CTX_PATTERN = re.compile(
+    r'<<<READING_CONTEXT_START>>>\n.*?\n<<<READING_CONTEXT_END>>>\n',
+    re.DOTALL,
+)
 from streaming_vlm.inference.qwen2_5.patch_model import convert_qwen2_5_to_streaming
 from streaming_vlm.inference.streaming_args import StreamingArgs
 from streaming_vlm.inference.inference import process_past_kv
@@ -41,7 +47,40 @@ class HanLabStreamingVLM:
         self.text_round = 16
         self.visual_round = 16
         self.max_new_tokens = 20
-        self.base_instruction = "Precisely and concisely describe objects and its relative positions, and events or actions taking place in view."
+        self.base_instruction = "Short noun phrases only, comma-separated. No full sentences. Example: chair left, bottle on table, socks floor, person walking."
+
+    def strip_reading_context(self):
+        """Remove injected reading-session OCR text from conversation history and invalidate KV cache."""
+        modified = False
+        for turn in self.full_conversation_history:
+            if turn.get("role") != "user":
+                continue
+            content = turn["content"]
+            if isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text" and "<<<READING_CONTEXT_START>>>" in item["text"]:
+                        item["text"] = _READING_CTX_PATTERN.sub("", item["text"])
+                        modified = True
+            elif isinstance(content, str) and "<<<READING_CONTEXT_START>>>" in content:
+                turn["content"] = _READING_CTX_PATTERN.sub("", content)
+                modified = True
+        if modified:
+            self.past_key_values = None
+            self.prev_generated_ids = None
+            print("[VLM] Stripped reading context from history. KV cache invalidated.")
+
+    def reset(self):
+        self.past_key_values = None
+        self.full_conversation_history = []
+        self.prev_generated_ids = None
+        self.recent_video_window_clips = []
+        self.recent_pixel_values_videos = []
+        self.chunk_index = 0
+        self.frame_buffer = []
+        self.streaming_args.input_ids = None
+        self.streaming_args.video_grid_thw = None
+        self.streaming_args.second_per_grid_ts = None
+        print("[VLM] KV cache and conversation history cleared.")
 
     def update_params(self, params: dict):
         self.max_new_tokens = params.get("max_new_tokens", self.max_new_tokens)
@@ -62,24 +101,25 @@ class HanLabStreamingVLM:
         Performs a single streaming inference step.
         If query is None, generates a background description to serve as memory.
         """
+        # Guard: skip entirely if no frames — don't touch KV state so the next
+        # call with the same chunk_index can still prune + refill correctly.
+        if len(self.frame_buffer) == 0:
+            return ""
+
         # 1. Manage KV Cache and sliding window
         self.past_key_values, self.prev_generated_ids, self.recent_video_window_clips, self.recent_pixel_values_videos = process_past_kv(
-            self.past_key_values, self.chunk_index, 
-            text_round=self.text_round, visual_round=self.visual_round, 
-            full_conversation_history=self.full_conversation_history, 
-            prev_generated_ids=self.prev_generated_ids, 
-            assistant_start_bias=self.assistant_start_bias, 
-            assistant_end_bias=self.assistant_end_bias, 
+            self.past_key_values, self.chunk_index,
+            text_round=self.text_round, visual_round=self.visual_round,
+            full_conversation_history=self.full_conversation_history,
+            prev_generated_ids=self.prev_generated_ids,
+            assistant_start_bias=self.assistant_start_bias,
+            assistant_end_bias=self.assistant_end_bias,
             recent_video_window_clips=self.recent_video_window_clips,
             recent_pixel_values_videos=self.recent_pixel_values_videos,
             text_sink=512, text_sliding_window=512
         )
 
         # 2. Pull the 1-second chunk of frames from the buffer
-        if len(self.frame_buffer) == 0:
-            # If no frames arrived in this second, we skip to maintain sync
-            return ""
-        
         # Take all frames buffered in the last second
         current_clip = self.frame_buffer
         self.frame_buffer = [] # Reset buffer for next step

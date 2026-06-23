@@ -120,11 +120,19 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         print(f"[SERVER] Received Chat request: message='{request.message}'", flush=True)
         return self._handle_chat_message(request.message or "")
 
+    def _asr_mode(self) -> str:
+        ctx = self.orchestrator.context
+        if ctx.reading_state != "idle":
+            return "reading"
+        if ctx.active_agent == "tracking":
+            return "tracking"
+        return "general"
+
     def VoiceChat(self, request, context):
         print(f"[SERVER] Received VoiceChat request: audio_len={len(request.audio_data)}", flush=True)
         if not request.audio_data:
             return tracking_pb2.ChatResponse(response="Error: Setup issues.")
-        user_text = self.asr.transcribe(request.audio_data)
+        user_text = self.asr.transcribe(request.audio_data, mode=self._asr_mode())
         if not user_text:
             return tracking_pb2.ChatResponse(response="[ASR] Could not understand audio.")
         response = self._handle_chat_message(user_text, prefix=f"[Voice: {user_text}]\n")

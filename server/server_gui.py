@@ -3,7 +3,13 @@ import cv2
 import queue
 from typing import Dict, Any, Generator
 
-def create_ui(gui_frame_queue, vlm_instance):
+def create_ui(gui_frame_queue, vlm_instance, orchestrator=None):
+    def reset_session():
+        if vlm_instance:
+            vlm_instance.reset()
+        if orchestrator:
+            orchestrator.reset_context()
+
     def run_experiment(max_tokens, instruction, t_round, v_round) -> Generator[Dict[str, Any], None, None]:
         if vlm_instance:
             # Package parameters into a dict for the VLM wrapper
@@ -52,10 +58,10 @@ def create_ui(gui_frame_queue, vlm_instance):
                 btn_stop = gr.Button("Stop", variant="stop", scale=1)
             
             with gr.Accordion("VLM Streaming Settings", open=False):
-                ui_max_tokens = gr.Slider(minimum=10, maximum=256, value=20, step=1, label="Max New Tokens")
-                ui_instruction = gr.Textbox(value="Precisely and concisely describe objects and its relative positions, and events or actions taking place in view.", 
+                ui_max_tokens = gr.Slider(minimum=10, maximum=256, value=25, step=5, label="Max New Tokens")
+                ui_instruction = gr.Textbox(value="You assist vision-impaired user, what you see is the user POV. Noun phrases, short sentences only, comma-separated. Example: bottle on table, bag next to racket, person walk by, user put phone to bag. Max 15 words.",
                                             label="Base Instruction", lines=2)
-                ui_text_round = gr.Number(value=16, label="Text KV Rounding (tokens)")
+                ui_text_round = gr.Number(value=32, label="Text KV Rounding (tokens)")
                 ui_visual_round = gr.Number(value=16, label="Visual KV Rounding (frames)")
             ui_image = gr.Image(label="Processed GPU Output Pipeline View")
             ui_status = gr.Textbox(label="Framework Metrics & Connection Status", lines=2, interactive=False)
@@ -66,6 +72,6 @@ def create_ui(gui_frame_queue, vlm_instance):
             inputs=[ui_max_tokens, ui_instruction, ui_text_round, ui_visual_round],
             outputs=[ui_image, ui_status, ui_chatbot]
         )
-        btn_stop.click(fn=None, cancels=[run_event])
+        btn_stop.click(fn=reset_session, inputs=[], outputs=[], cancels=[run_event])
 
     return app
