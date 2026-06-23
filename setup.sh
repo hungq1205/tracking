@@ -5,7 +5,8 @@ apt-get update && apt-get install -y software-properties-common
 add-apt-repository ppa:deadsnakes/ppa
 apt-get update && apt-get install -y \
     git wget curl ffmpeg libgl1 libglib2.0-0 \
-    build-essential python3.11 python3.11-dev python3-pip
+    build-essential python3.11 python3.11-dev python3-pip \
+    libportaudio2 portaudio19-dev
 rm -rf /var/lib/apt/lists/*
 
 update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
@@ -16,6 +17,7 @@ python3.11 -m pip install torch==2.7.1 torchvision torchaudio==2.7.1 --index-url
 python3.11 -m pip install qwen_vl_utils==0.0.11
 python3.11 -m pip install -r /tmp/infer_requirements.txt
 python3.11 -m pip install --no-build-isolation openai-whisper
+python3.11 -m pip install sounddevice soundfile resampy
 python3.11 -m pip install \
     transformers==4.52.3 accelerate decord \
     gradio pillow-heif gpustat timm sentencepiece \
@@ -40,5 +42,3 @@ if [ -d "$REPO/.git" ]; then
 else
     git clone https://github.com/hungq1205/tracking "$REPO"
 fi
-
-exec python "$REPO/server/grpc_server.py"

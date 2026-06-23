@@ -134,7 +134,21 @@ class ReadingAgent(BaseAgent):
         if ctx.reading_state != "scanning":
             # Auto-start in scan mode then scan immediately
             self._start(request)
-        return self._do_ocr_and_append(request, speak=False, state="SCANNING")
+        result = self._do_ocr_and_append(request, speak=True, state="SCANNING")
+        if not result.reply_text:
+            return AgentResult(
+                agent_name=self.name,
+                state="SCANNING",
+                reply_text="Scanning. No new text found.",
+                speak=True,
+            )
+        return AgentResult(
+            agent_name=self.name,
+            state="SCANNING",
+            payload=result.payload,
+            reply_text=f"Scanning. {result.reply_text}",
+            speak=True,
+        )
 
     def _frame_tick(self, request: AgentRequest) -> AgentResult:
         return self._do_ocr_and_append(request, speak=False, state="SCANNING")

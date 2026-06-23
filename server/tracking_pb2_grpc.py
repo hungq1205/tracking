@@ -5,7 +5,7 @@ import warnings
 
 import tracking_pb2 as tracking__pb2
 
-GRPC_GENERATED_VERSION = '1.81.1'
+GRPC_GENERATED_VERSION = '1.71.2'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,14 +18,14 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in tracking_pb2_grpc.py depends on'
+        + f' but the generated code in tracking_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
 
 
-class TrackingServiceStub:
+class TrackingServiceStub(object):
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -61,7 +61,7 @@ class TrackingServiceStub:
                 _registered_method=True)
 
 
-class TrackingServiceServicer:
+class TrackingServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def DetectObject(self, request, context):
@@ -130,7 +130,7 @@ def add_TrackingServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class TrackingService:
+class TrackingService(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
@@ -269,7 +269,7 @@ class TrackingService:
             _registered_method=True)
 
 
-class MediatorServiceStub:
+class MediatorServiceStub(object):
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -295,7 +295,7 @@ class MediatorServiceStub:
                 _registered_method=True)
 
 
-class MediatorServiceServicer:
+class MediatorServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def StreamFrameWithGuidance(self, request, context):
@@ -342,7 +342,7 @@ def add_MediatorServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class MediatorService:
+class MediatorService(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod

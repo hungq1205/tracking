@@ -2,7 +2,7 @@ services:
   streaming-vlm-server:
     build: .
     ports:
-      - "7680:7680"
+      - "7860:7860"
       - "50051:50051"
     volumes:
       - E:/Models:/models/qwen

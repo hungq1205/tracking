@@ -20,6 +20,11 @@ class InfoAgent(BaseAgent):
             )
 
         user_text = request.user_text
+        ctx = request.context
+        if ctx.reading_state != "idle" and ctx.scan_buffer:
+            user_text = (
+                f"<<<READING_CONTEXT_START>>>\n{ctx.scan_buffer}\n<<<READING_CONTEXT_END>>>\n{user_text}"
+            )
         if request.rag_context:
             user_text = f"Relevant saved memory:\n{request.rag_context}\n\nUser: {user_text}"
 

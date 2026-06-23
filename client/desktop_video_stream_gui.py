@@ -5,7 +5,11 @@ import threading
 import gradio as gr
 import os
 import tempfile
-from typing import Dict, Any, Generator, Optional
+import io
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+from typing import Dict, Any, Generator, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 
 from rpc_client.grpc_client import RemoteGroundingDINO, RemoteEmbedder
@@ -17,6 +21,75 @@ from core.renderer import GUIRenderer
 from core.interfaces import IClientApp
 
 global_executor = ThreadPoolExecutor(max_workers=4)
+
+SAMPLE_RATE = 16000
+VAD_CHUNK = 512          # frames per chunk (~32 ms at 16kHz)
+VAD_THRESHOLD = 0.01     # RMS threshold to consider speech (0.0–1.0 float32 range)
+VAD_SILENCE_CHUNKS = 47  # consecutive silent chunks before submitting (~1500 ms)
+VAD_MIN_SPEECH_CHUNKS = 5  # minimum speech chunks to avoid noise triggers
+
+
+class VoiceActivityDetector:
+    """Always-on VAD: listens, detects speech by RMS, submits on silence."""
+
+    def __init__(self, on_audio: Callable[[bytes], None]):
+        self._on_audio = on_audio
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _run(self):
+        buffer: list[np.ndarray] = []
+        silent_chunks = 0
+        speech_chunks = 0
+        in_speech = False
+
+        def callback(indata, frames, time_info, status):
+            nonlocal buffer, silent_chunks, speech_chunks, in_speech
+            chunk = indata[:, 0].copy()
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+
+            if rms >= VAD_THRESHOLD:
+                buffer.append(chunk)
+                speech_chunks += 1
+                silent_chunks = 0
+                if not in_speech and speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
+                    in_speech = True
+            else:
+                if in_speech:
+                    buffer.append(chunk)
+                    silent_chunks += 1
+                    if silent_chunks >= VAD_SILENCE_CHUNKS:
+                        self._submit(buffer[:])
+                        buffer.clear()
+                        silent_chunks = 0
+                        speech_chunks = 0
+                        in_speech = False
+                else:
+                    speech_chunks = max(0, speech_chunks - 1)
+
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=VAD_CHUNK,
+            callback=callback,
+        ):
+            while not self._stop_event.is_set():
+                time.sleep(0.05)
+
+    def _submit(self, chunks: list):
+        audio = np.concatenate(chunks)
+        buf = io.BytesIO()
+        sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        self._on_audio(buf.getvalue())
 
 
 class DesktopVideoStreamGUI(IClientApp):
@@ -38,9 +111,13 @@ class DesktopVideoStreamGUI(IClientApp):
         self._agent_state: str = ""
         self._reading_timer: Optional[threading.Timer] = None
         self._pending_audio: Optional[str] = None
+        self._pending_voice_result: Optional[tuple] = None  # (response_text, audio_path)
+        self._chat_history: list = []
+        self._vad = VoiceActivityDetector(on_audio=self._on_vad_audio)
+        self._vad.start()
 
-    def _initialize_backend_services(self, server_ip, nfeatures, renewal_interval):
-        self.server_addr = f"{server_ip}:50051"
+    def _initialize_backend_services(self, server_ip, grpc_port, nfeatures, renewal_interval):
+        self.server_addr = f"{server_ip}:{grpc_port}"
         print(f"[DESKTOP GUI] Connecting to Server at {self.server_addr}...")
         self.remote_detector = RemoteGroundingDINO(self.server_addr)
         self.remote_embedder = RemoteEmbedder(self.server_addr)
@@ -90,6 +167,8 @@ class DesktopVideoStreamGUI(IClientApp):
         elif state == "STOPPED":
             self.tracking_active = False
             self.initialized = False
+            if self.backend:
+                self.backend.stop()
         elif state in ("DONE_READING", "STOPPED"):
             self._cancel_reading_timer()
 
@@ -175,12 +254,12 @@ class DesktopVideoStreamGUI(IClientApp):
 
     # ── experiment generator ──────────────────────────────────────────────────
 
-    def _run_experiment_generator(self, video_file, server_ip, stream_to_server_toggle, nfeatures, renewal_interval, stream_fps) -> Generator[Dict[str, Any], None, None]:
+    def _run_experiment_generator(self, video_file, server_ip, grpc_port, stream_to_server_toggle, nfeatures, renewal_interval, stream_fps) -> Generator[Dict[str, Any], None, None]:
         if video_file is None:
             yield {ui_status: "Status: Please upload a video file."}
             return
 
-        self._initialize_backend_services(server_ip, nfeatures, renewal_interval)
+        self._initialize_backend_services(server_ip, grpc_port, nfeatures, renewal_interval)
         self.stream_to_server_flag = stream_to_server_toggle
         self.emulator = CameraEmulator(video_file, target_fps=15)
 
@@ -244,11 +323,11 @@ class DesktopVideoStreamGUI(IClientApp):
         history = history or []
         message = message or ""
         if self.remote_detector is None:
-            return history + [["User", "Error: Click 'Run' first."]], None
+            return history + [{"role": "assistant", "content": "Error: Click 'Run' first."}], None
         if not self.stream_to_server_flag:
-            return history + [["User", "Error: Enable 'Stream to Server'."]], None
+            return history + [{"role": "assistant", "content": "Error: Enable 'Stream to Server'."}], None
         if self.latest_frame is None:
-            return history + [["User", "Error: No frames."]], None
+            return history + [{"role": "assistant", "content": "Error: No frames."}], None
 
         res = self.remote_detector.chat(self.latest_frame, message)
         self._handle_agent_response(res)
@@ -261,7 +340,9 @@ class DesktopVideoStreamGUI(IClientApp):
             if self._agent_state == "READING_ALOUD":
                 self._schedule_reading_continue(res.audio_response)
 
-        history.append((message, res.response))
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": res.response})
+        self._chat_history = list(history)
         return history, audio_path
 
     def _handle_voice_chat(self, audio_path, history):
@@ -269,11 +350,11 @@ class DesktopVideoStreamGUI(IClientApp):
         if audio_path is None:
             return history, None
         if self.remote_detector is None:
-            return history + [["System", "Error: Click 'Run' first."]], None
+            return history + [{"role": "assistant", "content": "Error: Click 'Run' first."}], None
         if not self.stream_to_server_flag:
-            return history + [["System", "Error: Enable 'Stream to Server'."]], None
+            return history + [{"role": "assistant", "content": "Error: Enable 'Stream to Server'."}], None
         if self.latest_frame is None:
-            return history + [["System", "Error: No frames."]], None
+            return history + [{"role": "assistant", "content": "Error: No frames."}], None
 
         with open(audio_path, "rb") as f:
             audio_data = f.read()
@@ -289,8 +370,39 @@ class DesktopVideoStreamGUI(IClientApp):
             if self._agent_state == "READING_ALOUD":
                 self._schedule_reading_continue(res.audio_response)
 
-        history.append((None, res.response))
+        history.append({"role": "assistant", "content": res.response})
+        self._chat_history = list(history)
         return history, out_audio
+
+    def _on_vad_audio(self, audio_bytes: bytes) -> None:
+        """Called from VAD background thread when a speech segment is ready."""
+        if self.remote_detector is None or not self.stream_to_server_flag or self.latest_frame is None:
+            return
+        try:
+            res = self.remote_detector.voice_chat(audio_bytes)
+            self._handle_agent_response(res)
+            out_audio = None
+            if res.audio_response:
+                out_audio = os.path.join(tempfile.gettempdir(), "vad_response.wav")
+                with open(out_audio, "wb") as f:
+                    f.write(res.audio_response)
+                if self._agent_state == "READING_ALOUD":
+                    self._schedule_reading_continue(res.audio_response)
+            self._chat_history.append({"role": "assistant", "content": f"[Voice] {res.response}"})
+            self._pending_voice_result = (list(self._chat_history), out_audio)
+        except Exception as e:
+            print(f"[VAD] Error submitting audio: {e}")
+
+    def _poll_vad_result(self):
+        while True:
+            time.sleep(0.3)
+            result = self._pending_voice_result
+            if result is not None:
+                self._pending_voice_result = None
+                history, audio_path = result
+                yield history, audio_path
+            else:
+                yield gr.update(), None
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -306,7 +418,9 @@ class DesktopVideoStreamGUI(IClientApp):
             with gr.Row():
                 with gr.Column(scale=1):
                     ui_video = gr.Video(label="Video Input Stream")
-                    ui_server_ip = gr.Textbox(value=server_ip, label="gRPC Server IP")
+                    with gr.Row():
+                        ui_server_ip = gr.Textbox(value=server_ip, label="gRPC Server IP", scale=3)
+                        ui_grpc_port = gr.Textbox(value="50051", label="gRPC Port", scale=1)
 
                     with gr.Accordion("Engine Settings", open=False):
                         ui_nfeatures = gr.Slider(minimum=100, maximum=3000, step=100, value=800, label="ORB Anchors")
@@ -336,12 +450,19 @@ class DesktopVideoStreamGUI(IClientApp):
                                 container=False,
                             )
                             btn_chat = gr.Button("Ask", variant="secondary", scale=1)
+                        ui_vad_status = gr.Textbox(
+                            value="VAD: listening...",
+                            label=None,
+                            interactive=False,
+                            container=False,
+                            lines=1,
+                        )
                         ui_status.render()
                         ui_audio_playback = gr.Audio(visible=False, autoplay=True)
 
             run_event = btn_start.click(
                 fn=self._run_experiment_generator,
-                inputs=[ui_video, ui_server_ip, ui_stream_toggle, ui_nfeatures, ui_renewal, ui_stream_fps],
+                inputs=[ui_video, ui_server_ip, ui_grpc_port, ui_stream_toggle, ui_nfeatures, ui_renewal, ui_stream_fps],
                 outputs=[ui_image, ui_status],
             )
             btn_stop.click(fn=None, cancels=[run_event])
@@ -362,6 +483,12 @@ class DesktopVideoStreamGUI(IClientApp):
             app.load(
                 fn=self._poll_pending_audio_stream,
                 outputs=[ui_audio_playback],
+            )
+
+            # Poll for VAD voice results (always-on microphone)
+            app.load(
+                fn=self._poll_vad_result,
+                outputs=[ui_chatbot, ui_audio_playback],
             )
 
         print("[DESKTOP GUI] Launching Gradio app...")

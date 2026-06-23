@@ -28,25 +28,18 @@ class RagStore:
         model_id: str = "sentence-transformers/all-MiniLM-L6-v2",
         clip_model_id: str = "clip-ViT-B-32",
     ):
+        from sentence_transformers import SentenceTransformer
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        self._embedder = None
-        self._model_id = model_id
-        self._clip_embedder = None
-        self._clip_model_id = clip_model_id
+        print(f"[RagStore] Loading text embedding model {model_id}...")
+        self._embedder = SentenceTransformer(model_id)
+        print(f"[RagStore] Loading CLIP model {clip_model_id}...")
+        self._clip_embedder = SentenceTransformer(clip_model_id)
 
     def _get_embedder(self):
-        if self._embedder is None:
-            from sentence_transformers import SentenceTransformer
-            print(f"[RagStore] Loading text embedding model {self._model_id}...")
-            self._embedder = SentenceTransformer(self._model_id)
         return self._embedder
 
     def _get_clip_embedder(self):
-        if self._clip_embedder is None:
-            from sentence_transformers import SentenceTransformer
-            print(f"[RagStore] Loading CLIP model {self._clip_model_id}...")
-            self._clip_embedder = SentenceTransformer(self._clip_model_id)
         return self._clip_embedder
 
     # ── path helpers ──────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ import queue
 import threading
 
 import torch
-from transformers import AutoProcessor, AutoModelForImageTextToText, pipeline as hf_pipeline
+from transformers import AutoProcessor, AutoModelForImageTextToText
 import whisper
 from kokoro import KPipeline
 
@@ -28,8 +28,11 @@ from vlm_wrapper import HanLabStreamingVLM
 
 vlm_model_path = os.getenv("VLM_MODEL_PATH", "/models/qwen/3B")
 vlm_model_id = os.getenv("VLM_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
-intent_parser_model_id = os.getenv("INTENT_PARSER_MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
 memory_base_dir = os.getenv("MEMORY_STORE_DIR", os.path.join(os.path.dirname(__file__), "data", "memory"))
+rag_model_id = os.getenv("RAG_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
+rag_clip_model_id = os.getenv("RAG_CLIP_MODEL_ID", "clip-ViT-B-32")
+
+ocr_server_url = os.getenv("OCR_SERVER_URL", "http://localhost:8100")
 
 gui_frame_queue = queue.Queue(maxsize=10)
 print("[SERVER] Initializing heavy models on GPU/High-end CPU...")
@@ -55,14 +58,12 @@ vlm_processor = AutoProcessor.from_pretrained(model_to_load, use_fast=True)
 streaming_vlm_instance = HanLabStreamingVLM(model=vlm_model, processor=vlm_processor, device=device)
 print("[SERVER] StreamingVLM Ready.")
 
-# Intent parser on CPU to avoid VRAM contention with the VLM
-intent_pipe = hf_pipeline("text-generation", model=intent_parser_model_id, device="cpu")
-general_parser = GeneralIntentParser(pipe=intent_pipe)
-reading_parser = ReadingIntentParser(pipe=intent_pipe)
-tracking_parser = TrackingIntentParser(pipe=intent_pipe)
+general_parser = GeneralIntentParser()
+reading_parser = ReadingIntentParser()
+tracking_parser = TrackingIntentParser()
 memory_store = JsonMemoryStore(base_dir=memory_base_dir)
-rag_store = RagStore(base_dir=memory_base_dir)
-ocr = OCRTool()
+rag_store = RagStore(base_dir=memory_base_dir, model_id=rag_model_id, clip_model_id=rag_clip_model_id)
+ocr = OCRTool(url=ocr_server_url)
 asr_model = WhisperASR()
 tts = KokoroTTS()
 
@@ -108,6 +109,6 @@ def _start_grpc_server(servicer_instance):
 
 if __name__ == "__main__":
     grpc_thread = futures.ThreadPoolExecutor(max_workers=1).submit(_start_grpc_server, servicer)
-    app = create_ui(gui_frame_queue, streaming_vlm_instance)
+    app = create_ui(gui_frame_queue, streaming_vlm_instance, orchestrator)
     print("[SERVER] Launching Gradio app...")
     app.queue().launch(server_name="0.0.0.0", server_port=7860, theme="monochrome")
