@@ -37,6 +37,8 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         self.latest_frame = None
         self.last_vlm_step_time = time.time()
         self.vlm_lock = threading.Lock()
+        self.announced_obstacles: dict[str, float] = {}
+        self._OBSTACLE_COOLDOWN_SECS = 15.0
 
     def _decode_image(self, data):
         if not data:
@@ -55,6 +57,26 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
 
     def _generate_tts(self, text):
         return self.tts.synthesize(text)
+
+    def _is_obstacle_response(self, text: str) -> bool:
+        return text.strip().upper().startswith("ALERT:")
+
+    def _get_alert_text(self, text: str) -> str:
+        s = text.strip()
+        idx = s.upper().find("ALERT:") + len("ALERT:")
+        return s[idx:].strip()
+
+    def _dedup_obstacle(self, text: str) -> bool:
+        now = time.time()
+        expired = [k for k, t in self.announced_obstacles.items()
+                   if now - t > self._OBSTACLE_COOLDOWN_SECS]
+        for k in expired:
+            del self.announced_obstacles[k]
+        key = text.strip().upper()
+        if key in self.announced_obstacles:
+            return False
+        self.announced_obstacles[key] = now
+        return True
 
     def DetectObject(self, request, context):
         print(f"[SERVER] Received DetectObject request: prompt='{request.prompt}'", flush=True)
@@ -120,11 +142,19 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         print(f"[SERVER] Received Chat request: message='{request.message}'", flush=True)
         return self._handle_chat_message(request.message or "")
 
+    def _asr_mode(self) -> str:
+        ctx = self.orchestrator.context
+        if ctx.reading_state != "idle":
+            return "reading"
+        if ctx.active_agent == "tracking":
+            return "tracking"
+        return "general"
+
     def VoiceChat(self, request, context):
         print(f"[SERVER] Received VoiceChat request: audio_len={len(request.audio_data)}", flush=True)
         if not request.audio_data:
             return tracking_pb2.ChatResponse(response="Error: Setup issues.")
-        user_text = self.asr.transcribe(request.audio_data)
+        user_text = self.asr.transcribe(request.audio_data, mode=self._asr_mode())
         if not user_text:
             return tracking_pb2.ChatResponse(response="[ASR] Could not understand audio.")
         response = self._handle_chat_message(user_text, prefix=f"[Voice: {user_text}]\n")
@@ -146,6 +176,7 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
                         with self.vlm_lock:
                             reply = self.streaming_vlm_instance.process_video_step()
                         reading_result = self.orchestrator.on_frame_tick(frame)
+                        obstacle_audio = b""
                         if reply:
                             clean_reply = reply[:-4] if reply.endswith(" ...") else reply
                             hms_start = time.strftime("%H:%M:%S", time.gmtime(int(start_time)))
@@ -154,12 +185,20 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
                                 f"Time={hms_start}-{hms_end}: \033[1m\033[34m{clean_reply}\033[0m",
                                 flush=True,
                             )
+                            if self._is_obstacle_response(clean_reply):
+                                alert_text = self._get_alert_text(clean_reply)
+                                if self._dedup_obstacle(alert_text):
+                                    obstacle_audio = self._generate_tts(alert_text)
+                                    print(f"[OBSTACLE ALERT] {alert_text}", flush=True)
                         if reading_result and reading_result.reply_text and reading_result.speak:
                             print(
                                 f"[SERVER] Reading (frame tick): {reading_result.reply_text[:120]}",
                                 flush=True,
                             )
                         self.last_vlm_step_time = now
+                        if obstacle_audio:
+                            self._push_frame(frame)
+                            return tracking_pb2.FrameResponse(success=True, audio_response=obstacle_audio)
 
                 self._push_frame(frame)
             return tracking_pb2.FrameResponse(success=True)

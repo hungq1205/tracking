@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+paddlepaddle-gpu
+paddleocr[doc-parser]
+opencv-python-headless
+numpy
+python-multipart

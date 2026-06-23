@@ -120,6 +120,10 @@ class Orchestrator:
         self._update_context(result, frame_tick=frame_tick)
         return result
 
+    def reset_context(self):
+        self.context = SessionContext()
+        print("[Orchestrator] Session context reset.")
+
     def on_frame_tick(self, frame: np.ndarray) -> Optional[AgentResult]:
         if self.context.reading_state != "scanning":
             return None
@@ -132,6 +136,10 @@ class Orchestrator:
         if result.agent_name == "reading":
             state = result.state
             if state in ("STOPPED", "DONE_READING"):
+                info_agent = self.agents_by_name.get("info")
+                if info_agent and getattr(info_agent, "vlm", None):
+                    with info_agent.vlm_lock:
+                        info_agent.vlm.strip_reading_context()
                 self.context.active_agent = None
                 self.context.reading_state = "idle"
                 self.context.scan_buffer = ""

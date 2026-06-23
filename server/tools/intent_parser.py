@@ -1,124 +1,178 @@
-import json
-import re
+from __future__ import annotations
 
-from domain.intents import ParsedIntent
+import re
+from typing import List, Optional
+
+from domain.intents import Intent, ParsedIntent
 from interfaces import IIntentParser
 
 
-_GENERAL_PROMPT = (
-    "You are an intent parser for an assistive vision robot for vision-impaired users. "
-    "Extract intent and fields as JSON. Only output a JSON object, nothing else.\n"
-    "Intents:\n"
-    "- START_TRACKING: user wants to track/find an object. Fields: target\n"
-    "- STOP_TRACKING: user wants to stop tracking. Phrases: 'stop tracking', 'quit', 'exit'\n"
-    "- START_READING: user wants to enter a reading session. Fields: label (optional). Phrases: 'enter reading', 'reading mode'\n"
-    "- READ_SCREEN: user wants to read text on screen right now, one-shot, no session. "
-    "Phrases: 'read it out loud', 'read what's on screen', 'read this'\n"
-    "- REMEMBER_OBJECT: user identifies an object they want remembered. "
-    "Extract the object name as label. Phrases: 'this is my phone', 'this is the AC remote', 'remember this as my wallet'\n"
-    "- SAVE_MEMORY: user wants to save scanned text to persistent memory. Fields: label\n"
-    "- INFO: general conversation, questions about the scene, questions about saved items, or anything else\n"
-    "Examples:\n"
-    "'Find the backpack' -> {\"intent\": \"START_TRACKING\", \"target\": \"backpack\"}\n"
-    "'reading mode' -> {\"intent\": \"START_READING\"}\n"
-    "'read it out loud' -> {\"intent\": \"READ_SCREEN\"}\n"
-    "'this is my phone' -> {\"intent\": \"REMEMBER_OBJECT\", \"label\": \"my phone\"}\n"
-    "'this is the AC remote' -> {\"intent\": \"REMEMBER_OBJECT\", \"label\": \"AC remote\"}\n"
-    "'remember this as my medicine' -> {\"intent\": \"REMEMBER_OBJECT\", \"label\": \"medicine\"}\n"
-    "'save this as my grocery list' -> {\"intent\": \"SAVE_MEMORY\", \"label\": \"grocery_list\"}\n"
-    "'what do I need to buy?' -> {\"intent\": \"INFO\"}\n"
-    "'what is on my shopping list?' -> {\"intent\": \"INFO\"}\n"
-    "'what do you see?' -> {\"intent\": \"INFO\"}\n"
-)
+def _strip_punct(text: str) -> str:
+    return re.sub(r"[^\w\s]", "", text).strip()
 
-_READING_PROMPT = (
-    "You are an intent parser for an assistive reading mode. "
-    "The user is currently in a reading session. Extract intent as JSON. Only output a JSON object.\n"
-    "Intents:\n"
-    "- SCAN_PAGE: scan current page/screen into buffer. Phrases: 'scan this', 'scan this page', 'capture this'\n"
-    "- READ_ALOUD: read the accumulated buffer aloud. Phrases: 'read it', 'read aloud', 'read what you have'\n"
-    "- PAUSE_READING: pause playback. Phrases: 'pause', 'stop for now', 'wait', 'hold on'\n"
-    "- CONTINUE_READING: resume playback. Phrases: 'continue', 'keep going', 'next', 'go on', 'resume'\n"
-    "- BACK_SENTENCE: go back one sentence. Phrases: 'go back', 'back', 'back a sentence', 'repeat last'\n"
-    "- FORWARD_SENTENCE: skip to next sentence. Phrases: 'skip', 'next sentence', 'forward', 'skip ahead'\n"
-    "- READ_AGAIN: restart from beginning. Phrases: 'read again', 'from the beginning', 'restart', 'start over'\n"
-    "- FLIP_READING_DIRECTION: change column reading order. Phrases: 'flip direction', 'switch direction'\n"
-    "- STOP_READING: exit reading mode entirely. Phrases: 'quit reading', 'exit reading mode', 'done'\n"
-    "- INFO: a question or comment unrelated to reading navigation\n"
-    "Examples:\n"
-    "'scan this page' -> {\"intent\": \"SCAN_PAGE\"}\n"
-    "'read it' -> {\"intent\": \"READ_ALOUD\"}\n"
-    "'read it aloud' -> {\"intent\": \"READ_ALOUD\"}\n"
-    "'pause' -> {\"intent\": \"PAUSE_READING\"}\n"
-    "'continue' -> {\"intent\": \"CONTINUE_READING\"}\n"
-    "'go back' -> {\"intent\": \"BACK_SENTENCE\"}\n"
-    "'skip ahead' -> {\"intent\": \"FORWARD_SENTENCE\"}\n"
-    "'read again' -> {\"intent\": \"READ_AGAIN\"}\n"
-    "'flip direction' -> {\"intent\": \"FLIP_READING_DIRECTION\"}\n"
-    "'exit reading mode' -> {\"intent\": \"STOP_READING\"}\n"
-    "'what page is this?' -> {\"intent\": \"INFO\"}\n"
-)
 
-_TRACKING_PROMPT = (
-    "You are an intent parser for an assistive tracking mode. "
-    "The user is currently tracking an object. Extract intent as JSON. Only output a JSON object.\n"
-    "Intents:\n"
-    "- STOP_TRACKING: stop tracking entirely. Phrases: 'stop', 'quit', 'exit', 'found it', 'never mind', 'stop tracking', 'cancel'\n"
-    "- START_TRACKING: switch to track a different object. Fields: target. Phrases: 'track the X instead', 'find the X', 'switch to X'\n"
-    "- INFO: questions about tracking state or the scene. Phrases: 'where is it?', 'am I close?', 'how far?'\n"
-    "Examples:\n"
-    "'stop' -> {\"intent\": \"STOP_TRACKING\"}\n"
-    "'found it' -> {\"intent\": \"STOP_TRACKING\"}\n"
-    "'never mind' -> {\"intent\": \"STOP_TRACKING\"}\n"
-    "'track the phone instead' -> {\"intent\": \"START_TRACKING\", \"target\": \"phone\"}\n"
-    "'find the keys' -> {\"intent\": \"START_TRACKING\", \"target\": \"keys\"}\n"
-    "'am I close?' -> {\"intent\": \"INFO\"}\n"
-    "'where is it?' -> {\"intent\": \"INFO\"}\n"
-)
+def _match(patterns: List[str], text: str) -> Optional[re.Match]:
+    for pat in patterns:
+        m = re.fullmatch(pat, text, re.IGNORECASE)
+        if m:
+            return m
+    return None
+
+
+def _extract(m: re.Match, group: int = 1) -> str:
+    try:
+        return (m.group(group) or "").strip()
+    except IndexError:
+        return ""
 
 
 class GeneralIntentParser(IIntentParser):
-    """Used when not in any active mode (idle)."""
-
-    def __init__(self, pipe):
-        self.pipe = pipe
+    _START_READING = [
+        r"reading\s+mode",
+        r"enter\s+reading(?:\s+mode)?",
+        r"start\s+reading(?:\s+mode)?",
+    ]
+    _READ_SCREEN = [
+        r"read\s+it\s+out\s+loud",
+        r"read\s+this",
+        r"read\s+aloud",
+        r"read\s+it",
+    ]
+    _REMEMBER_OBJECT = [
+        r"remember\s+that\s+is\s+(.+)",
+        r"remember\s+that\s+as\s+(.+)",
+        r"remember\s+this\s+is\s+(.+)",
+        r"remember\s+this\s+as\s+(.+)",
+        r"remember\s+this\s+(.+)",
+        r"remember\s+(.+)",
+    ]
+    _SAVE_MEMORY = [
+        r"scan\s+and\s+remember\s+my\s+(.+)",
+        r"scan\s+then\s+remember\s+(.+)",
+        r"scan\s+remember\s+(.+)",
+    ]
+    _START_TRACKING = [
+        r"start\s+(?:tracking|track)(?:\s+me)(?:\s+to)?\s+(?:the\s+)?(.+)",
+        r"start\s+navigating?\s+(?:me\s+)?to\s+(?:the\s+)?(.+)",
+    ]
 
     def parse(self, text: str) -> ParsedIntent:
-        return _run_parse(self.pipe, _GENERAL_PROMPT, text)
+        original = text.strip()
+        t = _strip_punct(original)
+
+        if _match(self._START_READING, t):
+            return ParsedIntent(intent=Intent.START_READING)
+
+        if _match(self._READ_SCREEN, t):
+            return ParsedIntent(intent=Intent.READ_SCREEN)
+
+        m = _match(self._REMEMBER_OBJECT, t)
+        if m:
+            return ParsedIntent(intent=Intent.REMEMBER_OBJECT, label=_extract(m, 1))
+
+        m = _match(self._SAVE_MEMORY, t)
+        if m:
+            label = _extract(m, 1).replace(" ", "_")
+            return ParsedIntent(intent=Intent.SAVE_MEMORY, label=label)
+
+        m = _match(self._START_TRACKING, t)
+        if m:
+            return ParsedIntent(intent=Intent.START_TRACKING, target=_extract(m, 1))
+
+        return ParsedIntent(intent=Intent.INFO, question=original)
 
 
 class ReadingIntentParser(IIntentParser):
-    """Used when reading_state != 'idle'. Handles navigation and STOP_READING only."""
-
-    def __init__(self, pipe):
-        self.pipe = pipe
+    _STOP_READING = [
+        r"quit\s+reading(?:\s+mode)?",
+        r"exit\s+reading(?:\s+mode)?",
+    ]
+    _FLIP = [
+        r"flip\s+direction",
+    ]
+    _READ_AGAIN = [
+        r"read\s+again",
+        r"start\s+over",
+    ]
+    _BACK = [
+        r"go\s+back",
+        r"repeat\s+last",
+        r"backward",
+    ]
+    _FORWARD = [
+        r"skip(?:\s+ahead)?",
+        r"next\s+sentence",
+        r"forward",
+    ]
+    _PAUSE = [
+        r"stop",
+        r"pause",
+        r"wait",
+        r"hold\s+on",
+    ]
+    _CONTINUE = [
+        r"continue",
+        r"keep\s+going",
+        r"go\s+on",
+        r"resume",
+    ]
+    _READ_ALOUD = [
+        r"read(?:\s+it)?(?:\s+aloud)?",
+    ]
+    _SCAN = [
+        r"scan(?:\s+this)?(?:\s+page)?",
+        r"capture(?:\s+this)?",
+    ]
 
     def parse(self, text: str) -> ParsedIntent:
-        return _run_parse(self.pipe, _READING_PROMPT, text)
+        original = text.strip()
+        t = _strip_punct(original)
+
+        if _match(self._STOP_READING, t):
+            return ParsedIntent(intent=Intent.STOP_READING)
+        if _match(self._FLIP, t):
+            return ParsedIntent(intent=Intent.FLIP_READING_DIRECTION)
+        if _match(self._READ_AGAIN, t):
+            return ParsedIntent(intent=Intent.READ_AGAIN)
+        if _match(self._BACK, t):
+            return ParsedIntent(intent=Intent.BACK_SENTENCE)
+        if _match(self._FORWARD, t):
+            return ParsedIntent(intent=Intent.FORWARD_SENTENCE)
+        if _match(self._PAUSE, t):
+            return ParsedIntent(intent=Intent.PAUSE_READING)
+        if _match(self._CONTINUE, t):
+            return ParsedIntent(intent=Intent.CONTINUE_READING)
+        if _match(self._READ_ALOUD, t):
+            return ParsedIntent(intent=Intent.READ_ALOUD)
+        if _match(self._SCAN, t):
+            return ParsedIntent(intent=Intent.SCAN_PAGE)
+
+        return ParsedIntent(intent=Intent.INFO, question=original)
 
 
 class TrackingIntentParser(IIntentParser):
-    """Used when active_agent == 'tracking'. Handles STOP_TRACKING, retarget, and INFO."""
-
-    def __init__(self, pipe):
-        self.pipe = pipe
+    _STOP = [
+        r"stop(?:\s+tracking)?",
+        r"quit",
+        r"exit",
+        r"cancel",
+    ]
+    _START = [
+        r"(?:track(?:\s+to)?|find|navigate\s+to|switch\s+to)\s+(?:the\s+)?(.+?)(?:\s+instead)?$",
+    ]
 
     def parse(self, text: str) -> ParsedIntent:
-        return _run_parse(self.pipe, _TRACKING_PROMPT, text)
+        original = text.strip()
+        t = _strip_punct(original)
 
+        if _match(self._STOP, t):
+            return ParsedIntent(intent=Intent.STOP_TRACKING)
 
-def _run_parse(pipe, system_prompt: str, text: str) -> ParsedIntent:
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": text},
-    ]
-    out = pipe(messages, max_new_tokens=80, do_sample=False)[0]["generated_text"][-1]["content"]
-    try:
-        match = re.search(r"\{.*\}", out, re.DOTALL)
-        data = json.loads(match.group(0)) if match else {"intent": "INFO"}
-        return ParsedIntent.from_dict(data)
-    except Exception:
-        return ParsedIntent()
+        m = _match(self._START, t)
+        if m:
+            return ParsedIntent(intent=Intent.START_TRACKING, target=_extract(m, 1))
+
+        return ParsedIntent(intent=Intent.INFO, question=original)
 
 
 # Legacy alias

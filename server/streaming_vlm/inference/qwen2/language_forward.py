@@ -4,7 +4,24 @@ import torch
 from typing import Optional, Tuple, List, Union
 from torch.nn import functional as F
 from types import MethodType
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import logger,rotate_half,Cache,BaseModelOutputWithPast,DynamicCache,repeat_kv,_flash_attention_forward
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import logger,rotate_half,Cache,BaseModelOutputWithPast,DynamicCache,repeat_kv
+
+try:
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import _flash_attention_forward
+except ImportError:
+    from flash_attn import flash_attn_func as _flash_attn_func
+
+    def _flash_attention_forward(
+        query_states, key_states, value_states, attention_mask, query_length,
+        dropout=0.0, sliding_window=None, is_causal=True, use_top_left_mask=False, **kwargs
+    ):
+        window_size = (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
+        return _flash_attn_func(
+            query_states, key_states, value_states,
+            dropout_p=dropout,
+            causal=is_causal,
+            window_size=window_size,
+        )
 from streaming_vlm.inference.streaming_args import StreamingArgs
 
 

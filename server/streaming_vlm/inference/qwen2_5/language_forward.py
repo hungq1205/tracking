@@ -4,7 +4,26 @@ import torch
 from typing import Optional, Tuple, List, Union
 from torch.nn import functional as F
 from types import MethodType
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import logger,rotate_half,Cache,BaseModelOutputWithPast,repeat_kv,_flash_attention_forward, StaticCache, SlidingWindowCache, AttentionMaskConverter, make_flex_block_causal_mask, BlockMask
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import logger,rotate_half,Cache,BaseModelOutputWithPast,repeat_kv, StaticCache, SlidingWindowCache, AttentionMaskConverter, make_flex_block_causal_mask, BlockMask
+
+try:
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import _flash_attention_forward
+except ImportError:
+    # transformers>=4.49 removed _flash_attention_forward from the model module;
+    # call flash_attn directly since it is already installed in this environment.
+    from flash_attn import flash_attn_func as _flash_attn_func
+
+    def _flash_attention_forward(
+        query_states, key_states, value_states, attention_mask, query_length,
+        dropout=0.0, sliding_window=None, is_causal=True, use_top_left_mask=False, **kwargs
+    ):
+        window_size = (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
+        return _flash_attn_func(
+            query_states, key_states, value_states,
+            dropout_p=dropout,
+            causal=is_causal,
+            window_size=window_size,
+        )
 from streaming_vlm.inference.generate.streaming_cache import StreamingCache
 from streaming_vlm.inference.streaming_args import StreamingArgs
 import math

@@ -23,6 +23,7 @@ class GPUVIOAnchorBackend(IObjectTracker):
         self.renewal_interval = renewal_interval
         self.last_renewal_time = 0
         self._renewal_running = False
+        self._active = False
         self.prompt = None
         
         self._ref_kp = None
@@ -33,7 +34,11 @@ class GPUVIOAnchorBackend(IObjectTracker):
         self._ref_crop_emb = None
         self._last_H = None
 
+    def stop(self):
+        self._active = False
+
     def initialize(self, first_frame_bgr: np.ndarray, prompt: str) -> ObjectTrack:
+        self._active = True
         self.prompt = prompt
         # Calls RemoteGroundingDINO via gRPC
         det = self.detector.detect(first_frame_bgr, prompt)
@@ -73,6 +78,8 @@ class GPUVIOAnchorBackend(IObjectTracker):
         Replaces anchors if the object is confirmed via embedding similarity.
         """
         try:
+            if not self._active:
+                return
             det = self.detector.detect(renewal_frame, self.prompt)
             if det.score < 0.2: return
 

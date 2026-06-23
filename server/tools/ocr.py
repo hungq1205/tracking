@@ -1,59 +1,67 @@
 import numpy as np
-from typing import List
-
 import cv2
+import requests
+from typing import List
 
 
 class DocLayoutRapidOCRTool:
-    def __init__(self):
-        # from doclayout_yolo import YOLOv10
-        # from rapidocr_onnxruntime import RapidOCR
-        from huggingface_hub import hf_hub_download
-
-        print("[SERVER] Initializing DocLayout-YOLO + RapidOCR...")
-        # model_path = hf_hub_download(
-        #     repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
-        #     filename="doclayout_yolo_docstructbench_imgsz1024.pt",
-        # )
-        # self._layout = YOLOv10(model_path)
-        # self._ocr = RapidOCR()
-        print("[SERVER] DocLayout-YOLO + RapidOCR ready.")
+    def __init__(self, url: str = "http://localhost:8100"):
+        self._url = url
+        print(f"[SERVER] OCR client ready → {self._url}")
 
     def read_blocks(self, frame: np.ndarray, direction: str = "ltr") -> List[str]:
-        """Return one string per layout block, in reading order (top-to-bottom, left-to-right)."""
         del direction
         if frame is None:
             return []
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
+        ok, buf = cv2.imencode(".jpg", frame)
+        if not ok:
+            return []
 
-        results = self._layout.predict(rgb, imgsz=1024, conf=0.2, verbose=False)
-        raw_boxes = results[0].boxes.xyxy.cpu().numpy() if results and results[0].boxes else []
-        boxes = sorted(raw_boxes, key=lambda b: (b[1], b[0]))
+        try:
+            resp = requests.post(
+                f"{self._url}/ocr",
+                files={"image": ("frame.jpg", buf.tobytes(), "image/jpeg")},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json().get("blocks", [])
+        except Exception as e:
+            print(f"[OCR] request failed: {e}")
+            return []
 
-        blocks: List[str] = []
-        for box in boxes:
-            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            ocr_result, _ = self._ocr(rgb[y1:y2, x1:x2])
-            if not ocr_result:
-                continue
-
-            text = " ".join(line[1] for line in ocr_result if line[1]).strip()
-            if text:
-                blocks.append(text)
-
+    def beat_blocks(self, frame: np.ndarray, direction: str = "ltr") -> list:
+        blocks = self.read_blocks(frame, direction)
         if not blocks:
-            ocr_result, _ = self._ocr(rgb)
-            if ocr_result:
-                blocks = [line[1] for line in ocr_result if line[1] and line[1].strip()]
+            return []
 
-        return blocks
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(blocks)):
+                for j in range(i + 1, len(blocks)):
+                    a, b = blocks[i], blocks[j]
+                    ax1, ay1, ax2, ay2 = a["box"]
+                    bx1, by1, bx2, by2 = b["box"]
+                    x_overlap = max(0, min(ax2, bx2) - max(ax1, bx1))
+                    w_a = ax2 - ax1
+                    w_b = bx2 - bx1
+                    if w_a > 0 and w_b > 0 and (x_overlap / w_a >= 0.7 or x_overlap / w_b >= 0.7):
+                        first, second = (a, b) if ay1 <= by1 else (b, a)
+                        merged = {
+                            "text": first["text"] + " " + second["text"],
+                            "box": [min(ax1, bx1), min(ay1, by1), max(ax2, bx2), max(ay2, by2)],
+                            "score": round((a.get("score", 1.0) + b.get("score", 1.0)) / 2, 4),
+                        }
+                        blocks = [blocks[k] for k in range(len(blocks)) if k not in (i, j)]
+                        blocks.append(merged)
+                        changed = True
+                        break
+                if changed:
+                    break
+
+        reverse = direction == "rtl"
+        return sorted(blocks, key=lambda b: b["box"][0], reverse=reverse)
 
     def read_text(self, frame: np.ndarray, direction: str = "ltr") -> str:
         return " ".join(self.read_blocks(frame, direction))
