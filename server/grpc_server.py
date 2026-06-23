@@ -4,8 +4,6 @@ from concurrent import futures
 import queue
 import threading
 
-import torch
-from transformers import AutoProcessor, AutoModelForImageTextToText
 import whisper
 from kokoro import KPipeline
 
@@ -24,37 +22,20 @@ from tools import (
 )
 from tools.intent_parser import GeneralIntentParser, ReadingIntentParser, TrackingIntentParser
 from tools.embedder import EfficientNetLiteEmbedder
-from vlm_wrapper import HanLabStreamingVLM
+from vlm_wrapper import GeminiLiveVLM
 
-vlm_model_path = os.getenv("VLM_MODEL_PATH", "/models/qwen/3B")
-vlm_model_id = os.getenv("VLM_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
 memory_base_dir = os.getenv("MEMORY_STORE_DIR", os.path.join(os.path.dirname(__file__), "data", "memory"))
-
 ocr_server_url = os.getenv("OCR_SERVER_URL", "http://localhost:8100")
+gemini_api_key = os.getenv("GEMINI_API_KEY", "")
 
 gui_frame_queue = queue.Queue(maxsize=10)
-print("[SERVER] Initializing heavy models on GPU/High-end CPU...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
+print("[SERVER] Initializing models...")
 
 detector = GroundingDINODetector()
 embedder = EfficientNetLiteEmbedder()
 
-# Load VLM first so it gets full GPU VRAM priority before any other model
-streaming_vlm_instance = None
-if os.path.exists(vlm_model_path):
-    model_to_load = vlm_model_path
-    print(f"[SERVER] Loading VLM from local path: {model_to_load}")
-else:
-    model_to_load = vlm_model_id
-    print(f"[SERVER] Local model not found at {vlm_model_path}, downloading from HuggingFace: {model_to_load}")
-vlm_model = AutoModelForImageTextToText.from_pretrained(
-    model_to_load,
-    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-    device_map="auto",
-)
-vlm_processor = AutoProcessor.from_pretrained(model_to_load, use_fast=True)
-streaming_vlm_instance = HanLabStreamingVLM(model=vlm_model, processor=vlm_processor, device=device)
-print("[SERVER] StreamingVLM Ready.")
+streaming_vlm_instance = GeminiLiveVLM(api_key=gemini_api_key)
+print("[SERVER] GeminiLiveVLM ready.")
 
 general_parser = GeneralIntentParser()
 reading_parser = ReadingIntentParser()

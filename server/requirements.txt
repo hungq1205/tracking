@@ -1,19 +1,17 @@
-# Core ML
+# Gemini Live
+google-generativeai
+
+# Vision / Detection (Grounding DINO)
 torch
-torchvision
 transformers
-accelerate
-huggingface-hub
-
-# gRPC
-grpcio
-grpcio-tools
-
-# Vision / Detection
 opencv-python
 Pillow
 paddlepaddle-gpu
 paddleocr[doc-parser]>=3.4.0
+
+# gRPC
+grpcio
+grpcio-tools
 
 # Audio
 openai-whisper
@@ -22,10 +20,6 @@ soundfile
 
 # NLP / Embeddings
 sentence-transformers
-
-# VLM / Streaming
-qwen-vl-utils
-decord
 
 # Server / UI
 gradio
