@@ -29,11 +29,12 @@ _PROMPTS = {
 
 
 class WhisperASR:
-    def __init__(self, model_name: str = "base"):
+    def __init__(self, model_name: str = "base", gpu_lock=None, device: str = "cpu"):
         import whisper
 
-        print(f"[SERVER] Initializing Whisper ASR ({model_name})...")
-        self.model = whisper.load_model(model_name)
+        print(f"[SERVER] Initializing Whisper ASR ({model_name}) on {device}...")
+        self.model = whisper.load_model(model_name, device=device)
+        self.gpu_lock = gpu_lock
 
     def transcribe(self, audio_data: bytes, mode: str = "general") -> str:
         if not audio_data:
@@ -42,11 +43,12 @@ class WhisperASR:
             tmp.write(audio_data)
             tmp_path = tmp.name
         try:
-            result = self.model.transcribe(
-                tmp_path,
-                language="en",
-                initial_prompt=_PROMPTS.get(mode, ""),
-            )
+            with self.gpu_lock:
+                result = self.model.transcribe(
+                    tmp_path,
+                    language="en",
+                    initial_prompt=_PROMPTS.get(mode, ""),
+                )
             return result["text"].strip()
         finally:
             if os.path.exists(tmp_path):

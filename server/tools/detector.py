@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class GroundingDINODetector(IObjectDetector):
-    def __init__(self, model_id: str = "IDEA-Research/grounding-dino-tiny"):
+    def __init__(self, model_id: str = "IDEA-Research/grounding-dino-tiny", gpu_lock=None):
         from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
         print(f"[SERVER] Initializing Grounding DINO ({model_id})...")
@@ -20,6 +20,7 @@ class GroundingDINODetector(IObjectDetector):
         ).to(self.device)
         if self.device.type == "cuda":
             self.model.half()
+        self.gpu_lock = gpu_lock
 
     def detect(self, frame, prompt: str, box_threshold: float = 0.35, text_threshold: float = 0.25):
         image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -32,20 +33,21 @@ class GroundingDINODetector(IObjectDetector):
         if self.device.type == "cuda":
             inputs = {k: v.half() if torch.is_floating_point(v) else v for k, v in inputs.items()}
 
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
-        ):
-            with torch.no_grad():
-                outputs = self.model(**inputs)
+        with self.gpu_lock:
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
+            ):
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
 
-        results = self.processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            threshold=box_threshold,
-            text_threshold=text_threshold,
-            target_sizes=[(height, width)],
-        )[0]
+            results = self.processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=box_threshold,
+                text_threshold=text_threshold,
+                target_sizes=[(height, width)],
+            )[0]
 
         if len(results["boxes"]) == 0:
             return Detection(box_xyxy=(0.0, 0.0, 0.0, 0.0), score=0.0)

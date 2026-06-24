@@ -3,74 +3,74 @@ import cv2
 import queue
 from typing import Dict, Any, Generator
 
-def create_ui(gui_frame_queue, vlm_instance, orchestrator=None):
+def create_ui(gui_frame_queue, vlm_instance, orchestrator=None, conversation_queue=None):
     def reset_session():
         if vlm_instance:
             vlm_instance.reset()
         if orchestrator:
             orchestrator.reset_context()
 
-    def run_experiment(max_tokens, instruction, t_round, v_round) -> Generator[Dict[str, Any], None, None]:
+    def run_experiment(instruction) -> Generator[Dict[str, Any], None, None]:
         if vlm_instance:
-            # Package parameters into a dict for the VLM wrapper
-            vlm_instance.update_params({
-                "max_new_tokens": int(max_tokens),
-                "base_instruction": instruction,
-                "text_round": int(t_round),
-                "visual_round": int(v_round)
-            })
+            vlm_instance.update_params({"base_instruction": instruction})
 
         print("[SERVER GUI] Listening for live Edge signal...")
+        chat_history = []
         while True:
+            # drain all pending conversation turns first
+            if conversation_queue is not None:
+                while True:
+                    try:
+                        entry = conversation_queue.get_nowait()
+                        user_text = entry.get("user") or ""
+                        asst_text = entry.get("assistant") or ""
+                        if user_text:
+                            chat_history.append({"role": "user", "content": user_text})
+                        if asst_text:
+                            chat_history.append({"role": "assistant", "content": asst_text})
+                    except queue.Empty:
+                        break
+                    except Exception:
+                        pass  # skip malformed entries
+
             try:
                 frame = gui_frame_queue.get(timeout=2.0)
-                
-                # Format the internal VLM history for the Gradio Chatbot component
-                formatted_history = []
-                if vlm_instance:
-                    for msg in vlm_instance.full_conversation_history:
-                        role = msg.get("role")
-                        content = msg.get("content")
-                        if role == "user":
-                            # Filter out internal timestamp prompts (e.g., Time=1.0-2.0s) from the GUI log
-                            user_text = " ".join([item["text"] for item in content if item["type"] == "text" and not item["text"].startswith("Time=")]) if isinstance(content, list) else content
-                            user_text = user_text.strip()
-                            # Only log the user turn if there is actual query text beyond timestamps
-                            if user_text:
-                                formatted_history.append({"role": "user", "content": user_text})
-                        elif role == "assistant":
-                            formatted_history.append({"role": "assistant", "content": content})
-
                 yield {
                     ui_image: cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
                     ui_status: "Status: Streaming Live from Edge Client",
-                    ui_chatbot: formatted_history
+                    ui_chat: chat_history,
                 }
             except queue.Empty:
-                yield {ui_status: "Status: Waiting for Edge connection..."}
+                yield {
+                    ui_status: "Status: Waiting for Edge connection...",
+                    ui_chat: chat_history,
+                }
 
     with gr.Blocks(title="Object Tracker") as app:
         gr.Markdown("## Object Tracker - Remote Server Monitor")
-        
+
         with gr.Column():
             with gr.Row():
                 btn_start = gr.Button("Run", variant="primary", scale=1)
                 btn_stop = gr.Button("Stop", variant="stop", scale=1)
-            
+
             with gr.Accordion("VLM Streaming Settings", open=False):
-                ui_max_tokens = gr.Slider(minimum=10, maximum=256, value=25, step=5, label="Max New Tokens")
-                ui_instruction = gr.Textbox(value="You assist vision-impaired user, what you see is the user POV. Noun phrases, short sentences only, comma-separated. Example: bottle on table, bag next to racket, person walk by, user put phone to bag. Max 15 words.",
-                                            label="Base Instruction", lines=2)
-                ui_text_round = gr.Number(value=32, label="Text KV Rounding (tokens)")
-                ui_visual_round = gr.Number(value=16, label="Visual KV Rounding (frames)")
+                ui_instruction = gr.Textbox(
+                    value=(
+                        "You assist a vision-impaired user. What you see is the user's POV. "
+                        "Short noun phrases, comma-separated. Example: bottle on table, person walking."
+                    ),
+                    label="Base Instruction",
+                    lines=2,
+                )
             ui_image = gr.Image(label="Processed GPU Output Pipeline View")
             ui_status = gr.Textbox(label="Framework Metrics & Connection Status", lines=2, interactive=False)
-            ui_chatbot = gr.Chatbot(label="VLM Conversation History")
+            ui_chat = gr.Chatbot(label="Conversation Log", height=300)
 
         run_event = btn_start.click(
             fn=run_experiment,
-            inputs=[ui_max_tokens, ui_instruction, ui_text_round, ui_visual_round],
-            outputs=[ui_image, ui_status, ui_chatbot]
+            inputs=[ui_instruction],
+            outputs=[ui_image, ui_status, ui_chat],
         )
         btn_stop.click(fn=reset_session, inputs=[], outputs=[], cancels=[run_event])
 

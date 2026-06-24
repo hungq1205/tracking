@@ -32,6 +32,7 @@ class Orchestrator:
         user_text: str,
         frame: Optional[np.ndarray] = None,
         frame_tick: bool = False,
+        timings: Optional[dict] = None,
     ) -> AgentResult:
         # Pick parser based on current mode
         if user_text:
@@ -41,7 +42,10 @@ class Orchestrator:
                 parser = self.tracking_parser
             else:
                 parser = self.general_parser
+            t0 = time.time()
             intent = parser.parse(user_text)
+            if timings is not None:
+                timings["intent_parse_ms"] = (time.time() - t0) * 1000
         else:
             intent = ParsedIntent()
 
@@ -58,7 +62,10 @@ class Orchestrator:
                 rag_query = intent.target
             if rag_query:
                 try:
+                    t0 = time.time()
                     hits = self.rag_store.query_global(rag_query, top_k=3)
+                    if timings is not None:
+                        timings["rag_ms"] = (time.time() - t0) * 1000
                     if hits:
                         rag_context = "\n".join(f"[{lbl}] {text}" for text, lbl, _ in hits)
                 except Exception as e:
@@ -77,7 +84,11 @@ class Orchestrator:
             frame_tick=frame_tick,
             rag_context=rag_context,
         )
+        t0 = time.time()
         result = agent.handle(request)
+        if timings is not None:
+            timings["agent_ms"] = (time.time() - t0) * 1000
+            timings["agent_name"] = agent_name
 
         # SAVE_MEMORY: transition to scanning mode, wait for frame ticks to accumulate
         if (
@@ -138,8 +149,7 @@ class Orchestrator:
             if state in ("STOPPED", "DONE_READING"):
                 info_agent = self.agents_by_name.get("info")
                 if info_agent and getattr(info_agent, "vlm", None):
-                    with info_agent.vlm_lock:
-                        info_agent.vlm.strip_reading_context()
+                    info_agent.vlm.reset()
                 self.context.active_agent = None
                 self.context.reading_state = "idle"
                 self.context.scan_buffer = ""

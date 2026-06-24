@@ -26,6 +26,7 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         tts,
         streaming_vlm_instance,
         frame_queue,
+        conversation_queue=None,
     ):
         self.orchestrator = orchestrator
         self.detector = detector
@@ -34,8 +35,9 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         self.tts = tts
         self.streaming_vlm_instance = streaming_vlm_instance
         self.frame_queue = frame_queue
+        self.conversation_queue = conversation_queue
         self.latest_frame = None
-        self.last_vlm_step_time = time.time()
+        self.last_frame_tick_time = time.time()
         self.vlm_lock = threading.Lock()
 
     def _decode_image(self, data):
@@ -89,19 +91,29 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         print("[SERVER] Sending GetEmbedding response: no embedding found", flush=True)
         return tracking_pb2.EmbeddingResponse(embedding=[])
 
-    def _handle_chat_message(self, user_text: str, prefix: str = "") -> tracking_pb2.ChatResponse:
+    def _handle_chat_message(
+        self, user_text: str, prefix: str = "", asr_ms: float = 0.0
+    ) -> tracking_pb2.ChatResponse:
         if self.streaming_vlm_instance is None:
             return tracking_pb2.ChatResponse(response="Error: StreamingVLM not initialized.")
         if self.latest_frame is None and not user_text:
             return tracking_pb2.ChatResponse(response="Error: No video frames received by server yet.")
 
         try:
-            with self.vlm_lock:
-                result = self.orchestrator.orchestrate(user_text, self.latest_frame)
-                if result.agent_name == "info":
-                    self.last_vlm_step_time = time.time()
+            timings: dict = {}
+            if asr_ms:
+                timings["asr_ms"] = asr_ms
 
+            t0 = time.time()
+            with self.vlm_lock:
+                result = self.orchestrator.orchestrate(user_text, self.latest_frame, timings=timings)
+            timings["orchestrate_ms"] = (time.time() - t0) * 1000
+
+            t0 = time.time()
             audio_bytes = self._generate_tts(result.reply_text) if result.speak and result.reply_text else b""
+            if result.speak and result.reply_text:
+                timings["tts_ms"] = (time.time() - t0) * 1000
+
             reply = f"{prefix}{result.reply_text}" if prefix else result.reply_text
             result = type(result)(
                 agent_name=result.agent_name,
@@ -110,7 +122,27 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
                 reply_text=reply,
                 speak=result.speak,
             )
-            print(f"[SERVER] Chat result: agent={result.agent_name} state={result.state}", flush=True)
+
+            parts = []
+            if "asr_ms" in timings:
+                parts.append(f"asr={timings['asr_ms']:.0f}ms")
+            if "intent_parse_ms" in timings:
+                parts.append(f"intent={timings['intent_parse_ms']:.0f}ms")
+            if "rag_ms" in timings:
+                parts.append(f"rag={timings['rag_ms']:.0f}ms")
+            if "agent_ms" in timings:
+                agent_label = timings.get("agent_name", "agent")
+                parts.append(f"{agent_label}={timings['agent_ms']:.0f}ms")
+            if "tts_ms" in timings:
+                parts.append(f"tts={timings['tts_ms']:.0f}ms")
+            parts.append(f"total={timings['orchestrate_ms'] + timings.get('asr_ms', 0) + timings.get('tts_ms', 0):.0f}ms")
+            timing_str = "  ".join(parts)
+            print(f"[SERVER] Chat result: agent={result.agent_name} state={result.state}  [{timing_str}]", flush=True)
+            if self.conversation_queue is not None:
+                try:
+                    self.conversation_queue.put_nowait({"user": user_text, "assistant": result.reply_text})
+                except queue.Full:
+                    pass
             return agent_result_to_chat_response(result, audio_bytes)
         except Exception as e:
             traceback.print_exc()
@@ -132,11 +164,12 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         print(f"[SERVER] Received VoiceChat request: audio_len={len(request.audio_data)}", flush=True)
         if not request.audio_data:
             return tracking_pb2.ChatResponse(response="Error: Setup issues.")
+        t0 = time.time()
         user_text = self.asr.transcribe(request.audio_data, mode=self._asr_mode())
+        asr_ms = (time.time() - t0) * 1000
         if not user_text:
             return tracking_pb2.ChatResponse(response="[ASR] Could not understand audio.")
-        response = self._handle_chat_message(user_text, prefix=f"[Voice: {user_text}]\n")
-        return response
+        return self._handle_chat_message(user_text, prefix=f"[Voice: {user_text}]\n", asr_ms=asr_ms)
 
     def StreamFrame(self, request, context):
         try:
@@ -147,27 +180,15 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
                     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     self.streaming_vlm_instance.push_frame(pil_image)
 
-                    now = time.time()
-                    if now - self.last_vlm_step_time >= 1.0:
-                        start_time = float(self.streaming_vlm_instance.chunk_index)
-                        end_time = start_time + 1.0
-                        with self.vlm_lock:
-                            reply = self.streaming_vlm_instance.process_video_step()
-                        reading_result = self.orchestrator.on_frame_tick(frame)
-                        if reply:
-                            clean_reply = reply[:-4] if reply.endswith(" ...") else reply
-                            hms_start = time.strftime("%H:%M:%S", time.gmtime(int(start_time)))
-                            hms_end = time.strftime("%H:%M:%S", time.gmtime(int(end_time)))
-                            print(
-                                f"Time={hms_start}-{hms_end}: \033[1m\033[34m{clean_reply}\033[0m",
-                                flush=True,
-                            )
-                        if reading_result and reading_result.reply_text and reading_result.speak:
-                            print(
-                                f"[SERVER] Reading (frame tick): {reading_result.reply_text[:120]}",
-                                flush=True,
-                            )
-                        self.last_vlm_step_time = now
+                now = time.time()
+                if now - self.last_frame_tick_time >= 1.0:
+                    reading_result = self.orchestrator.on_frame_tick(frame)
+                    self.last_frame_tick_time = now
+                    if reading_result and reading_result.reply_text and reading_result.speak:
+                        print(
+                            f"[SERVER] Reading (frame tick): {reading_result.reply_text[:120]}",
+                            flush=True,
+                        )
 
                 self._push_frame(frame)
             return tracking_pb2.FrameResponse(success=True)

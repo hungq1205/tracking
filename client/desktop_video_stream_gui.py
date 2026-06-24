@@ -319,61 +319,6 @@ class DesktopVideoStreamGUI(IClientApp):
 
     # ── chat handlers ─────────────────────────────────────────────────────────
 
-    def _handle_chat(self, message, history):
-        history = history or []
-        message = message or ""
-        if self.remote_detector is None:
-            return history + [{"role": "assistant", "content": "Error: Click 'Run' first."}], None
-        if not self.stream_to_server_flag:
-            return history + [{"role": "assistant", "content": "Error: Enable 'Stream to Server'."}], None
-        if self.latest_frame is None:
-            return history + [{"role": "assistant", "content": "Error: No frames."}], None
-
-        res = self.remote_detector.chat(self.latest_frame, message)
-        self._handle_agent_response(res)
-
-        audio_path = None
-        if res.audio_response:
-            audio_path = os.path.join(tempfile.gettempdir(), "response.wav")
-            with open(audio_path, "wb") as f:
-                f.write(res.audio_response)
-            if self._agent_state == "READING_ALOUD":
-                self._schedule_reading_continue(res.audio_response)
-
-        history.append({"role": "user", "content": message})
-        history.append({"role": "assistant", "content": res.response})
-        self._chat_history = list(history)
-        return history, audio_path
-
-    def _handle_voice_chat(self, audio_path, history):
-        history = history or []
-        if audio_path is None:
-            return history, None
-        if self.remote_detector is None:
-            return history + [{"role": "assistant", "content": "Error: Click 'Run' first."}], None
-        if not self.stream_to_server_flag:
-            return history + [{"role": "assistant", "content": "Error: Enable 'Stream to Server'."}], None
-        if self.latest_frame is None:
-            return history + [{"role": "assistant", "content": "Error: No frames."}], None
-
-        with open(audio_path, "rb") as f:
-            audio_data = f.read()
-
-        res = self.remote_detector.voice_chat(audio_data)
-        self._handle_agent_response(res)
-
-        out_audio = None
-        if res.audio_response:
-            out_audio = os.path.join(tempfile.gettempdir(), "voice_response.wav")
-            with open(out_audio, "wb") as f:
-                f.write(res.audio_response)
-            if self._agent_state == "READING_ALOUD":
-                self._schedule_reading_continue(res.audio_response)
-
-        history.append({"role": "assistant", "content": res.response})
-        self._chat_history = list(history)
-        return history, out_audio
-
     def _on_vad_audio(self, audio_bytes: bytes) -> None:
         """Called from VAD background thread when a speech segment is ready."""
         if self.remote_detector is None or not self.stream_to_server_flag or self.latest_frame is None:
@@ -435,23 +380,8 @@ class DesktopVideoStreamGUI(IClientApp):
 
                     with gr.Group():
                         ui_chatbot.render()
-                        with gr.Row(equal_height=True):
-                            ui_chat_input = gr.Textbox(
-                                placeholder="Ask something about the current view...",
-                                label=None,
-                                scale=4,
-                                container=False,
-                            )
-                            ui_audio_input = gr.Audio(
-                                sources=["microphone"],
-                                type="filepath",
-                                show_label=False,
-                                scale=3,
-                                container=False,
-                            )
-                            btn_chat = gr.Button("Ask", variant="secondary", scale=1)
-                        ui_vad_status = gr.Textbox(
-                            value="VAD: listening...",
+                        gr.Textbox(
+                            value="Microphone: always listening...",
                             label=None,
                             interactive=False,
                             container=False,
@@ -466,18 +396,6 @@ class DesktopVideoStreamGUI(IClientApp):
                 outputs=[ui_image, ui_status],
             )
             btn_stop.click(fn=None, cancels=[run_event])
-
-            btn_chat.click(
-                fn=self._handle_chat,
-                inputs=[ui_chat_input, ui_chatbot],
-                outputs=[ui_chatbot, ui_audio_playback],
-            )
-
-            ui_audio_input.stop_recording(
-                fn=self._handle_voice_chat,
-                inputs=[ui_audio_input, ui_chatbot],
-                outputs=[ui_chatbot, ui_audio_playback],
-            )
 
             # Poll for auto-continue audio pushed from background reading timer
             app.load(
