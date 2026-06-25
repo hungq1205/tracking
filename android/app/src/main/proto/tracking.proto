@@ -49,6 +49,7 @@ message FrameRequest {
 
 message FrameResponse {
   bool success = 1;
+  bytes audio_response = 2;
 }
 
 message GuidanceFrameResponse {

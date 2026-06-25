@@ -1,0 +1,5 @@
+-keep class com.google.protobuf.** { *; }
+-keep class tracking.** { *; }
+-keep class io.grpc.** { *; }
+-dontwarn io.grpc.**
+-dontwarn com.google.protobuf.**
