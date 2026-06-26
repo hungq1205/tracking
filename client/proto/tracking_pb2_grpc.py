@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-from . import tracking_pb2 as tracking__pb2
+import tracking_pb2 as tracking__pb2
 
-GRPC_GENERATED_VERSION = '1.81.1'
+GRPC_GENERATED_VERSION = '1.71.2'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,14 +18,14 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in tracking_pb2_grpc.py depends on'
+        + f' but the generated code in tracking_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
 
 
-class TrackingServiceStub:
+class TrackingServiceStub(object):
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -59,9 +59,14 @@ class TrackingServiceStub:
                 request_serializer=tracking__pb2.FrameRequest.SerializeToString,
                 response_deserializer=tracking__pb2.FrameResponse.FromString,
                 _registered_method=True)
+        self.VoiceChatStream = channel.stream_stream(
+                '/tracking.TrackingService/VoiceChatStream',
+                request_serializer=tracking__pb2.VoiceChatChunk.SerializeToString,
+                response_deserializer=tracking__pb2.AudioChunk.FromString,
+                _registered_method=True)
 
 
-class TrackingServiceServicer:
+class TrackingServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def DetectObject(self, request, context):
@@ -89,6 +94,12 @@ class TrackingServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def StreamFrame(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def VoiceChatStream(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -122,6 +133,11 @@ def add_TrackingServiceServicer_to_server(servicer, server):
                     request_deserializer=tracking__pb2.FrameRequest.FromString,
                     response_serializer=tracking__pb2.FrameResponse.SerializeToString,
             ),
+            'VoiceChatStream': grpc.stream_stream_rpc_method_handler(
+                    servicer.VoiceChatStream,
+                    request_deserializer=tracking__pb2.VoiceChatChunk.FromString,
+                    response_serializer=tracking__pb2.AudioChunk.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'tracking.TrackingService', rpc_method_handlers)
@@ -130,7 +146,7 @@ def add_TrackingServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class TrackingService:
+class TrackingService(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
@@ -268,8 +284,35 @@ class TrackingService:
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def VoiceChatStream(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/tracking.TrackingService/VoiceChatStream',
+            tracking__pb2.VoiceChatChunk.SerializeToString,
+            tracking__pb2.AudioChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
-class MediatorServiceStub:
+
+class MediatorServiceStub(object):
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -295,7 +338,7 @@ class MediatorServiceStub:
                 _registered_method=True)
 
 
-class MediatorServiceServicer:
+class MediatorServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def StreamFrameWithGuidance(self, request, context):
@@ -342,7 +385,7 @@ def add_MediatorServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class MediatorService:
+class MediatorService(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
@@ -416,6 +459,256 @@ class MediatorService:
             '/tracking.MediatorService/VoiceChat',
             tracking__pb2.VoiceChatRequest.SerializeToString,
             tracking__pb2.ChatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class MapServiceStub(object):
+    """── Map service ────────────────────────────────────────────────────────────
+
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.ListMaps = channel.unary_unary(
+                '/tracking.MapService/ListMaps',
+                request_serializer=tracking__pb2.ListMapsRequest.SerializeToString,
+                response_deserializer=tracking__pb2.ListMapsResponse.FromString,
+                _registered_method=True)
+        self.GetMapGeometry = channel.unary_stream(
+                '/tracking.MapService/GetMapGeometry',
+                request_serializer=tracking__pb2.GetMapRequest.SerializeToString,
+                response_deserializer=tracking__pb2.MapGeometryChunk.FromString,
+                _registered_method=True)
+        self.ScanFrame = channel.unary_unary(
+                '/tracking.MapService/ScanFrame',
+                request_serializer=tracking__pb2.ScanFrameRequest.SerializeToString,
+                response_deserializer=tracking__pb2.ScanFrameResponse.FromString,
+                _registered_method=True)
+        self.SetZoneLabel = channel.unary_unary(
+                '/tracking.MapService/SetZoneLabel',
+                request_serializer=tracking__pb2.SetZoneLabelRequest.SerializeToString,
+                response_deserializer=tracking__pb2.SetZoneLabelResponse.FromString,
+                _registered_method=True)
+        self.ExportScanMap = channel.unary_unary(
+                '/tracking.MapService/ExportScanMap',
+                request_serializer=tracking__pb2.ExportScanMapRequest.SerializeToString,
+                response_deserializer=tracking__pb2.ExportScanMapResponse.FromString,
+                _registered_method=True)
+
+
+class MapServiceServicer(object):
+    """── Map service ────────────────────────────────────────────────────────────
+
+    """
+
+    def ListMaps(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetMapGeometry(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ScanFrame(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SetZoneLabel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ExportScanMap(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_MapServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'ListMaps': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListMaps,
+                    request_deserializer=tracking__pb2.ListMapsRequest.FromString,
+                    response_serializer=tracking__pb2.ListMapsResponse.SerializeToString,
+            ),
+            'GetMapGeometry': grpc.unary_stream_rpc_method_handler(
+                    servicer.GetMapGeometry,
+                    request_deserializer=tracking__pb2.GetMapRequest.FromString,
+                    response_serializer=tracking__pb2.MapGeometryChunk.SerializeToString,
+            ),
+            'ScanFrame': grpc.unary_unary_rpc_method_handler(
+                    servicer.ScanFrame,
+                    request_deserializer=tracking__pb2.ScanFrameRequest.FromString,
+                    response_serializer=tracking__pb2.ScanFrameResponse.SerializeToString,
+            ),
+            'SetZoneLabel': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetZoneLabel,
+                    request_deserializer=tracking__pb2.SetZoneLabelRequest.FromString,
+                    response_serializer=tracking__pb2.SetZoneLabelResponse.SerializeToString,
+            ),
+            'ExportScanMap': grpc.unary_unary_rpc_method_handler(
+                    servicer.ExportScanMap,
+                    request_deserializer=tracking__pb2.ExportScanMapRequest.FromString,
+                    response_serializer=tracking__pb2.ExportScanMapResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'tracking.MapService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('tracking.MapService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class MapService(object):
+    """── Map service ────────────────────────────────────────────────────────────
+
+    """
+
+    @staticmethod
+    def ListMaps(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tracking.MapService/ListMaps',
+            tracking__pb2.ListMapsRequest.SerializeToString,
+            tracking__pb2.ListMapsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMapGeometry(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/tracking.MapService/GetMapGeometry',
+            tracking__pb2.GetMapRequest.SerializeToString,
+            tracking__pb2.MapGeometryChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ScanFrame(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tracking.MapService/ScanFrame',
+            tracking__pb2.ScanFrameRequest.SerializeToString,
+            tracking__pb2.ScanFrameResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetZoneLabel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tracking.MapService/SetZoneLabel',
+            tracking__pb2.SetZoneLabelRequest.SerializeToString,
+            tracking__pb2.SetZoneLabelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ExportScanMap(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tracking.MapService/ExportScanMap',
+            tracking__pb2.ExportScanMapRequest.SerializeToString,
+            tracking__pb2.ExportScanMapResponse.FromString,
             options,
             channel_credentials,
             insecure,

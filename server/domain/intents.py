@@ -25,6 +25,10 @@ class Intent(str, Enum):
     SAVE_MEMORY = "SAVE_MEMORY"
     READ_MEMORY = "READ_MEMORY"
     REMEMBER_OBJECT = "REMEMBER_OBJECT"
+    # Navigation
+    START_NAVIGATION = "START_NAVIGATION"
+    STOP_NAVIGATION = "STOP_NAVIGATION"
+    SET_DESTINATION = "SET_DESTINATION"
     # General
     INFO = "INFO"
 
@@ -32,6 +36,8 @@ class Intent(str, Enum):
 TRACKING_INTENTS = {Intent.START_TRACKING, Intent.STOP_TRACKING}
 
 MEMORY_INTENTS = {Intent.SAVE_MEMORY, Intent.READ_MEMORY, Intent.REMEMBER_OBJECT}
+
+NAVIGATE_INTENTS = {Intent.START_NAVIGATION, Intent.STOP_NAVIGATION, Intent.SET_DESTINATION}
 
 # Intents that route to the reading agent.
 # Navigation intents are included here because ReadingIntentParser can emit them

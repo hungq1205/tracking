@@ -7,6 +7,7 @@ class TrackingAgent(BaseAgent):
 
     def __init__(self, detector):
         self.detector = detector
+        self.last_detection: dict | None = None  # {box_xyxy, score, target}
 
     def handle(self, request: AgentRequest) -> AgentResult:
         intent = request.intent
@@ -23,7 +24,12 @@ class TrackingAgent(BaseAgent):
                     reply_text=f"I cannot see a frame yet to find '{target}'.",
                 )
             det = self.detector.detect(request.frame, target)
-            if det.score > 0.35:
+            self.last_detection = {
+                "box_xyxy": list(det.box_xyxy),
+                "score": float(det.score),
+                "target": target,
+            }
+            if det.score > 0.40:
                 state = "INITIALIZING"
                 payload = {"target": target, "memory_hint": request.rag_context}
                 if request.rag_context:
@@ -38,6 +44,7 @@ class TrackingAgent(BaseAgent):
                 else:
                     reply = f"I could not find '{target}' in view."
         elif intent.intent == Intent.STOP_TRACKING:
+            self.last_detection = None
             state = "STOPPED"
             reply = "Stopping tracking."
         else:

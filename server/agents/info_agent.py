@@ -1,26 +1,22 @@
-import threading
 from typing import Optional
 
+import numpy as np
+
 from agents.base import AgentRequest, AgentResult, BaseAgent
+from tools.cloud_vlm import CloudVLMClient
 
 
 class InfoAgent(BaseAgent):
     name = "info"
 
-    def __init__(self, vlm, vlm_lock: Optional[threading.Lock] = None):
-        self.vlm = vlm
-        self.vlm_lock = vlm_lock or threading.Lock()
+    def __init__(self, cloud_vlm: CloudVLMClient):
+        self.cloud_vlm = cloud_vlm
 
     def handle(self, request: AgentRequest) -> AgentResult:
-        if self.vlm is None:
-            return AgentResult(
-                agent_name=self.name,
-                state="ERROR",
-                reply_text="StreamingVLM is not initialized.",
-            )
-
         user_text = request.user_text
         ctx = request.context
+
+        # Inject reading context if mid-session
         if ctx.reading_state != "idle" and ctx.scan_buffer:
             user_text = (
                 f"<<<READING_CONTEXT_START>>>\n{ctx.scan_buffer}\n<<<READING_CONTEXT_END>>>\n{user_text}"
@@ -28,10 +24,8 @@ class InfoAgent(BaseAgent):
         if request.rag_context:
             user_text = f"Relevant saved memory:\n{request.rag_context}\n\nUser: {user_text}"
 
-        with self.vlm_lock:
-            reply = self.vlm.chat(user_text)
-        if reply and reply.endswith(" ..."):
-            reply = reply[:-4]
+        frame = request.frame
+        reply = self.cloud_vlm.query(user_text, frame)
         return AgentResult(
             agent_name=self.name,
             state="INFO",

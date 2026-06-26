@@ -1,4 +1,3 @@
-import threading
 from typing import Optional
 
 import numpy as np
@@ -13,12 +12,11 @@ _DINO_THRESHOLD = 0.35
 class MemoryAgent(BaseAgent):
     name = "memory"
 
-    def __init__(self, store, rag_store, detector: Optional[IObjectDetector] = None, vlm=None, vlm_lock=None):
+    def __init__(self, store, rag_store, detector: Optional[IObjectDetector] = None, cloud_vlm=None):
         self.store = store
         self.rag_store = rag_store
         self.detector = detector
-        self.vlm = vlm
-        self.vlm_lock = vlm_lock or threading.Lock()
+        self.cloud_vlm = cloud_vlm
 
     def append(self, label: str, text: str, source: str = "ocr") -> tuple[str, str]:
         appended, full_text = self.store.append(label, text, source=source)
@@ -67,7 +65,7 @@ class MemoryAgent(BaseAgent):
                     speak=True,
                 )
             image_to_save, located = self._locate_object(request.frame, label)
-            description = self._describe_object(label)
+            description = self._describe_object(label, image_to_save)
             self.rag_store.add_object(label, image_to_save, description)
             location_note = "" if located else " (object not precisely located in frame)"
             return AgentResult(
@@ -100,14 +98,14 @@ class MemoryAgent(BaseAgent):
             return frame
         return frame[y1:y2, x1:x2]
 
-    def _describe_object(self, label: str) -> str:
-        if self.vlm is None:
-            return f"{label} (no VLM available for description)"
+    def _describe_object(self, label: str, frame: Optional[np.ndarray] = None) -> str:
+        if self.cloud_vlm is None:
+            return f"{label}"
         try:
-            with self.vlm_lock:
-                description = self.vlm.chat(
-                    f"Describe this object briefly for memory storage. What is it? Label hint: {label}"
-                )
-            return description or f"{label} (no description generated)"
+            description = self.cloud_vlm.query(
+                f"Describe this object briefly for memory storage. What is it? Label hint: {label}",
+                frame,
+            )
+            return description or f"{label}"
         except Exception as e:
             return f"{label} (description failed: {e})"

@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", message=".*HTTP_422_UNPROCESSABLE_ENTITY.*")
+
 import cv2
 import json
 import os

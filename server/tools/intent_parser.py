@@ -39,12 +39,12 @@ class GeneralIntentParser(IIntentParser):
         r"read\s+it",
     ]
     _REMEMBER_OBJECT = [
-        r"remember\s+that\s+is\s+(.+)",
-        r"remember\s+that\s+as\s+(.+)",
-        r"remember\s+this\s+is\s+(.+)",
-        r"remember\s+this\s+as\s+(.+)",
-        r"remember\s+this\s+(.+)",
-        r"remember\s+(.+)",
+        r"remember\s+that\s+is\s+(?:the\s+)?(.+)",
+        r"remember\s+that\s+as\s+(?:the\s+)?(.+)",
+        r"remember\s+this\s+is\s+(?:the\s+)?(.+)",
+        r"remember\s+this\s+as\s+(?:the\s+)?(.+)",
+        r"remember\s+this\s+(?:the\s+)?(.+)",
+        r"remember\s+(?:the\s+)?(.+)",
     ]
     _SAVE_MEMORY = [
         r"scan\s+and\s+remember\s+my\s+(.+)",
@@ -52,8 +52,10 @@ class GeneralIntentParser(IIntentParser):
         r"scan\s+remember\s+(.+)",
     ]
     _START_TRACKING = [
-        r"start\s+(?:tracking|track)(?:\s+me)(?:\s+to)?\s+(?:the\s+)?(.+)",
-        r"start\s+navigating?\s+(?:me\s+)?to\s+(?:the\s+)?(.+)",
+        r"(?:start\s+)?track(?:ing)(?:\s+me)?(?:\s+to)?(?:\s+the)?\s+(.+)",
+        r"(?:start\s+)?navigat(?:e|ing)(?:\s+me)?(?:\s+to)?(?:\s+the)?\s+(.+)",
+        r"(?:start\s+)?find(?:ing)?(?:\s+me)?(?:\s+the)?\s+(.+)",
+        r"(?:start\s+)?locat(?:e|ing)(?:\s+me)?(?:\s+to)?(?:\s+the)?\s+(.+)"
     ]
 
     def parse(self, text: str) -> ParsedIntent:
@@ -158,7 +160,11 @@ class TrackingIntentParser(IIntentParser):
         r"cancel",
     ]
     _START = [
-        r"(?:track(?:\s+to)?|find|navigate\s+to|switch\s+to)\s+(?:the\s+)?(.+?)(?:\s+instead)?$",
+        r"switch\s+to(?:\s+the)?\s+(.+)(?:\s+instead)?",
+        r"(?:start\s+)?track(?:ing)(?:\s+me)?(?:\s+to)?(?:\s+the)?\s+(.+)(?:\s+instead)?",
+        r"(?:start\s+)?navigat(?:e|ing)(?:\s+me)?(?:\s+to)?(?:\s+the)?\s+(.+)(?:\s+instead)?",
+        r"(?:start\s+)?find(?:ing)?(?:\s+me)?(?:\s+the)?\s+(.+)(?:\s+instead)?",
+        r"(?:start\s+)?locat(?:e|ing)(?:\s+me)?(?:\s+to)?(?:\s+the)?\s+(.+)(?:\s+instead)?"
     ]
 
     def parse(self, text: str) -> ParsedIntent:
@@ -171,6 +177,46 @@ class TrackingIntentParser(IIntentParser):
         m = _match(self._START, t)
         if m:
             return ParsedIntent(intent=Intent.START_TRACKING, target=_extract(m, 1))
+
+        return ParsedIntent(intent=Intent.INFO, question=original)
+
+
+class NavigationIntentParser(IIntentParser):
+    _START = [
+        r"navigate\s+(?:me\s+)?to\s+(?:the\s+)?(.+?)$",
+        r"take\s+me\s+to\s+(?:the\s+)?(.+?)$",
+        r"go\s+to\s+(?:the\s+)?(.+?)$",
+        r"i\s+(?:want|need)\s+to\s+go\s+to\s+(?:the\s+)?(.+?)$",
+        r"bring\s+me\s+to\s+(?:the\s+)?(.+?)$",
+        r"direct\s+me\s+to\s+(?:the\s+)?(.+?)$",
+    ]
+    _STOP = [
+        r"stop\s+navigation",
+        r"cancel\s+navigation",
+        r"stop\s+navigating",
+        r"end\s+navigation",
+        r"abort\s+navigation",
+    ]
+    _CHANGE = [
+        r"change\s+destination\s+to\s+(?:the\s+)?(.+?)$",
+        r"actually\s+(?:go\s+to|take\s+me\s+to)\s+(?:the\s+)?(.+?)$",
+        r"instead\s+go\s+to\s+(?:the\s+)?(.+?)$",
+    ]
+
+    def parse(self, text: str) -> ParsedIntent:
+        original = text.strip()
+        t = _strip_punct(original)
+
+        if _match(self._STOP, t):
+            return ParsedIntent(intent=Intent.STOP_NAVIGATION)
+
+        m = _match(self._CHANGE, t)
+        if m:
+            return ParsedIntent(intent=Intent.SET_DESTINATION, target=_extract(m, 1))
+
+        m = _match(self._START, t)
+        if m:
+            return ParsedIntent(intent=Intent.START_NAVIGATION, target=_extract(m, 1))
 
         return ParsedIntent(intent=Intent.INFO, question=original)
 

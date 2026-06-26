@@ -16,6 +16,7 @@ class Orchestrator:
         general_parser,
         reading_parser,
         tracking_parser=None,
+        navigation_parser=None,
         router: Optional[RuleRouter] = None,
         rag_store=None,
     ):
@@ -23,6 +24,7 @@ class Orchestrator:
         self.general_parser = general_parser
         self.reading_parser = reading_parser
         self.tracking_parser = tracking_parser
+        self.navigation_parser = navigation_parser
         self.router = router or RuleRouter(self.agents_by_name)
         self.context = SessionContext()
         self.rag_store = rag_store
@@ -37,6 +39,8 @@ class Orchestrator:
         if user_text:
             if self.context.reading_state != "idle":
                 parser = self.reading_parser
+            elif self.navigation_parser and self.context.nav_state != "idle":
+                parser = self.navigation_parser
             elif self.tracking_parser and self.context.active_agent == "tracking":
                 parser = self.tracking_parser
             else:
@@ -120,6 +124,20 @@ class Orchestrator:
         self._update_context(result, frame_tick=frame_tick)
         return result
 
+    def parse_intent(self, user_text: str) -> "ParsedIntent":
+        """Parse intent from text without routing to an agent."""
+        if not user_text:
+            return ParsedIntent()
+        if self.context.reading_state != "idle":
+            parser = self.reading_parser
+        elif self.navigation_parser and self.context.nav_state != "idle":
+            parser = self.navigation_parser
+        elif self.tracking_parser and self.context.active_agent == "tracking":
+            parser = self.tracking_parser
+        else:
+            parser = self.general_parser
+        return parser.parse(user_text)
+
     def reset_context(self):
         self.context = SessionContext()
         print("[Orchestrator] Session context reset.")
@@ -128,6 +146,23 @@ class Orchestrator:
         if self.context.reading_state != "scanning":
             return None
         return self.orchestrate(user_text="", frame=frame, frame_tick=True)
+
+    def on_nav_tick(self, frame: np.ndarray) -> Optional[AgentResult]:
+        if self.context.nav_state != "navigating":
+            return None
+        nav_agent = self.agents_by_name.get("navigation")
+        if not nav_agent:
+            return None
+        request = AgentRequest(
+            user_text="",
+            frame=frame,
+            context=self.context,
+            intent=ParsedIntent(),
+            frame_tick=True,
+        )
+        result = nav_agent.handle(request)
+        self._update_nav_context(result)
+        return result
 
     def _update_context(self, result: AgentResult, frame_tick: bool = False) -> None:
         now = time.time()
@@ -173,3 +208,15 @@ class Orchestrator:
         elif result.agent_name == "info":
             if self.context.active_agent is None:
                 self.context.active_agent = "info"
+
+        elif result.agent_name == "navigation":
+            self._update_nav_context(result)
+
+    def _update_nav_context(self, result: AgentResult) -> None:
+        state = result.state
+        if state == "STARTED":
+            self.context.active_agent = "navigation"
+        elif state in ("STOPPED", "DESTINATION_REACHED"):
+            if state == "STOPPED":
+                self.context.nav_state = "idle"
+            self.context.active_agent = None

@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0etracking.proto\x12\x08tracking\"\"\n\x10\x44\x65tectionRequest\x12\x0e\n\x06prompt\x18\x01 \x01(\t\"4\n\x11\x44\x65tectionResponse\x12\x10\n\x08\x62ox_xyxy\x18\x01 \x03(\x02\x12\r\n\x05score\x18\x02 \x01(\x02\"$\n\x10\x45mbeddingRequest\x12\x10\n\x08\x62ox_xyxy\x18\x01 \x03(\x02\"&\n\x11\x45mbeddingResponse\x12\x11\n\tembedding\x18\x01 \x03(\x02\"\x1e\n\x0b\x43hatRequest\x12\x0f\n\x07message\x18\x01 \x01(\t\"x\n\x0c\x43hatResponse\x12\x10\n\x08response\x18\x01 \x01(\t\x12\x16\n\x0e\x61udio_response\x18\x02 \x01(\x0c\x12\x12\n\nagent_name\x18\x03 \x01(\t\x12\x13\n\x0b\x61gent_state\x18\x04 \x01(\t\x12\x15\n\ragent_payload\x18\x05 \x01(\t\"&\n\x10VoiceChatRequest\x12\x12\n\naudio_data\x18\x01 \x01(\x0c\"\"\n\x0c\x46rameRequest\x12\x12\n\nimage_data\x18\x01 \x01(\x0c\"8\n\rFrameResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x16\n\x0e\x61udio_response\x18\x02 \x01(\x0c\"\xd8\x01\n\x15GuidanceFrameResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x13\n\x0binstruction\x18\x02 \x01(\t\x12\x17\n\x0ftracking_status\x18\x03 \x01(\t\x12\x19\n\x11object_confidence\x18\x04 \x01(\x02\x12\x17\n\x0fobject_box_xyxy\x18\x05 \x03(\x02\x12\x15\n\rhand_box_xyxy\x18\x06 \x03(\x02\x12\x0f\n\x07\x64\x65lta_x\x18\x07 \x01(\x02\x12\x0f\n\x07\x64\x65lta_y\x18\x08 \x01(\x02\x12\x13\n\x0b\x64istance_px\x18\t \x01(\x02\x32\xdb\x02\n\x0fTrackingService\x12G\n\x0c\x44\x65tectObject\x12\x1a.tracking.DetectionRequest\x1a\x1b.tracking.DetectionResponse\x12G\n\x0cGetEmbedding\x12\x1a.tracking.EmbeddingRequest\x1a\x1b.tracking.EmbeddingResponse\x12\x35\n\x04\x43hat\x12\x15.tracking.ChatRequest\x1a\x16.tracking.ChatResponse\x12?\n\tVoiceChat\x12\x1a.tracking.VoiceChatRequest\x1a\x16.tracking.ChatResponse\x12>\n\x0bStreamFrame\x12\x16.tracking.FrameRequest\x1a\x17.tracking.FrameResponse2\xdd\x01\n\x0fMediatorService\x12R\n\x17StreamFrameWithGuidance\x12\x16.tracking.FrameRequest\x1a\x1f.tracking.GuidanceFrameResponse\x12\x35\n\x04\x43hat\x12\x15.tracking.ChatRequest\x1a\x16.tracking.ChatResponse\x12?\n\tVoiceChat\x12\x1a.tracking.VoiceChatRequest\x1a\x16.tracking.ChatResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0etracking.proto\x12\x08tracking\"\"\n\x10\x44\x65tectionRequest\x12\x0e\n\x06prompt\x18\x01 \x01(\t\"4\n\x11\x44\x65tectionResponse\x12\x10\n\x08\x62ox_xyxy\x18\x01 \x03(\x02\x12\r\n\x05score\x18\x02 \x01(\x02\"$\n\x10\x45mbeddingRequest\x12\x10\n\x08\x62ox_xyxy\x18\x01 \x03(\x02\"&\n\x11\x45mbeddingResponse\x12\x11\n\tembedding\x18\x01 \x03(\x02\"\x1e\n\x0b\x43hatRequest\x12\x0f\n\x07message\x18\x01 \x01(\t\"x\n\x0c\x43hatResponse\x12\x10\n\x08response\x18\x01 \x01(\t\x12\x16\n\x0e\x61udio_response\x18\x02 \x01(\x0c\x12\x12\n\nagent_name\x18\x03 \x01(\t\x12\x13\n\x0b\x61gent_state\x18\x04 \x01(\t\x12\x15\n\ragent_payload\x18\x05 \x01(\t\"&\n\x10VoiceChatRequest\x12\x12\n\naudio_data\x18\x01 \x01(\x0c\"\x83\x01\n\x08IMUFrame\x12\x14\n\x0ctimestamp_ns\x18\x01 \x01(\x03\x12\x0f\n\x07\x61\x63\x63\x65l_x\x18\x02 \x01(\x02\x12\x0f\n\x07\x61\x63\x63\x65l_y\x18\x03 \x01(\x02\x12\x0f\n\x07\x61\x63\x63\x65l_z\x18\x04 \x01(\x02\x12\x0e\n\x06gyro_x\x18\x05 \x01(\x02\x12\x0e\n\x06gyro_y\x18\x06 \x01(\x02\x12\x0e\n\x06gyro_z\x18\x07 \x01(\x02\"r\n\x0eVoiceChatChunk\x12\x15\n\x0b\x61udio_chunk\x18\x01 \x01(\x0cH\x00\x12\x15\n\x0bvideo_frame\x18\x02 \x01(\x0cH\x00\x12\'\n\timu_frame\x18\x03 \x01(\x0b\x32\x12.tracking.IMUFrameH\x00\x42\t\n\x07payload\"\x1e\n\nAudioChunk\x12\x10\n\x08pcm_data\x18\x01 \x01(\x0c\"\"\n\x0c\x46rameRequest\x12\x12\n\nimage_data\x18\x01 \x01(\x0c\"8\n\rFrameResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x16\n\x0e\x61udio_response\x18\x02 \x01(\x0c\"\xd8\x01\n\x15GuidanceFrameResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x13\n\x0binstruction\x18\x02 \x01(\t\x12\x17\n\x0ftracking_status\x18\x03 \x01(\t\x12\x19\n\x11object_confidence\x18\x04 \x01(\x02\x12\x17\n\x0fobject_box_xyxy\x18\x05 \x03(\x02\x12\x15\n\rhand_box_xyxy\x18\x06 \x03(\x02\x12\x0f\n\x07\x64\x65lta_x\x18\x07 \x01(\x02\x12\x0f\n\x07\x64\x65lta_y\x18\x08 \x01(\x02\x12\x13\n\x0b\x64istance_px\x18\t \x01(\x02\"\x11\n\x0fListMapsRequest\"(\n\x10ListMapsResponse\x12\x14\n\x0clocation_ids\x18\x01 \x03(\t\"$\n\rGetMapRequest\x12\x13\n\x0blocation_id\x18\x01 \x01(\t\"A\n\x0cZoneMetadata\x12\r\n\x05label\x18\x01 \x01(\t\x12\x10\n\x08\x62\x62ox_min\x18\x02 \x03(\x02\x12\x10\n\x08\x62\x62ox_max\x18\x03 \x03(\x02\"r\n\x0bMapMetadata\x12\x13\n\x0blocation_id\x18\x01 \x01(\t\x12\x12\n\ncreated_at\x18\x02 \x01(\t\x12\x13\n\x0bpoint_count\x18\x03 \x01(\x05\x12%\n\x05zones\x18\x04 \x03(\x0b\x32\x16.tracking.ZoneMetadata\" \n\x10MapGeometryChunk\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\"d\n\x10ScanFrameRequest\x12\x12\n\nimage_data\x18\x01 \x01(\x0c\x12\x13\n\x0blocation_id\x18\x02 \x01(\t\x12\x12\n\nzone_label\x18\x03 \x01(\t\x12\x13\n\x0bzone_radius\x18\x04 \x01(\x02\"R\n\x11ScanFrameResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x13\n\x0bpoint_count\x18\x02 \x01(\x05\x12\x17\n\x0f\x63\x61mera_position\x18\x03 \x03(\x02\"I\n\x13SetZoneLabelRequest\x12\x13\n\x0blocation_id\x18\x01 \x01(\t\x12\r\n\x05label\x18\x02 \x01(\t\x12\x0e\n\x06radius\x18\x03 \x01(\x02\"8\n\x14SetZoneLabelResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"+\n\x14\x45xportScanMapRequest\x12\x13\n\x0blocation_id\x18\x01 \x01(\t\"f\n\x15\x45xportScanMapResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x13\n\x0boutput_path\x18\x02 \x01(\t\x12\x13\n\x0bpoint_count\x18\x03 \x01(\x05\x12\x12\n\nzone_count\x18\x04 \x01(\x05\x32\xa2\x03\n\x0fTrackingService\x12G\n\x0c\x44\x65tectObject\x12\x1a.tracking.DetectionRequest\x1a\x1b.tracking.DetectionResponse\x12G\n\x0cGetEmbedding\x12\x1a.tracking.EmbeddingRequest\x1a\x1b.tracking.EmbeddingResponse\x12\x35\n\x04\x43hat\x12\x15.tracking.ChatRequest\x1a\x16.tracking.ChatResponse\x12?\n\tVoiceChat\x12\x1a.tracking.VoiceChatRequest\x1a\x16.tracking.ChatResponse\x12>\n\x0bStreamFrame\x12\x16.tracking.FrameRequest\x1a\x17.tracking.FrameResponse\x12\x45\n\x0fVoiceChatStream\x12\x18.tracking.VoiceChatChunk\x1a\x14.tracking.AudioChunk(\x01\x30\x01\x32\xdd\x01\n\x0fMediatorService\x12R\n\x17StreamFrameWithGuidance\x12\x16.tracking.FrameRequest\x1a\x1f.tracking.GuidanceFrameResponse\x12\x35\n\x04\x43hat\x12\x15.tracking.ChatRequest\x1a\x16.tracking.ChatResponse\x12?\n\tVoiceChat\x12\x1a.tracking.VoiceChatRequest\x1a\x16.tracking.ChatResponse2\xff\x02\n\nMapService\x12\x41\n\x08ListMaps\x12\x19.tracking.ListMapsRequest\x1a\x1a.tracking.ListMapsResponse\x12G\n\x0eGetMapGeometry\x12\x17.tracking.GetMapRequest\x1a\x1a.tracking.MapGeometryChunk0\x01\x12\x44\n\tScanFrame\x12\x1a.tracking.ScanFrameRequest\x1a\x1b.tracking.ScanFrameResponse\x12M\n\x0cSetZoneLabel\x12\x1d.tracking.SetZoneLabelRequest\x1a\x1e.tracking.SetZoneLabelResponse\x12P\n\rExportScanMap\x12\x1e.tracking.ExportScanMapRequest\x1a\x1f.tracking.ExportScanMapResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -45,14 +45,46 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_CHATRESPONSE']._serialized_end=348
   _globals['_VOICECHATREQUEST']._serialized_start=350
   _globals['_VOICECHATREQUEST']._serialized_end=388
-  _globals['_FRAMEREQUEST']._serialized_start=390
-  _globals['_FRAMEREQUEST']._serialized_end=424
-  _globals['_FRAMERESPONSE']._serialized_start=426
-  _globals['_FRAMERESPONSE']._serialized_end=482
-  _globals['_GUIDANCEFRAMERESPONSE']._serialized_start=485
-  _globals['_GUIDANCEFRAMERESPONSE']._serialized_end=701
-  _globals['_TRACKINGSERVICE']._serialized_start=704
-  _globals['_TRACKINGSERVICE']._serialized_end=1051
-  _globals['_MEDIATORSERVICE']._serialized_start=1054
-  _globals['_MEDIATORSERVICE']._serialized_end=1275
+  _globals['_IMUFRAME']._serialized_start=391
+  _globals['_IMUFRAME']._serialized_end=522
+  _globals['_VOICECHATCHUNK']._serialized_start=524
+  _globals['_VOICECHATCHUNK']._serialized_end=638
+  _globals['_AUDIOCHUNK']._serialized_start=640
+  _globals['_AUDIOCHUNK']._serialized_end=670
+  _globals['_FRAMEREQUEST']._serialized_start=672
+  _globals['_FRAMEREQUEST']._serialized_end=706
+  _globals['_FRAMERESPONSE']._serialized_start=708
+  _globals['_FRAMERESPONSE']._serialized_end=764
+  _globals['_GUIDANCEFRAMERESPONSE']._serialized_start=767
+  _globals['_GUIDANCEFRAMERESPONSE']._serialized_end=983
+  _globals['_LISTMAPSREQUEST']._serialized_start=985
+  _globals['_LISTMAPSREQUEST']._serialized_end=1002
+  _globals['_LISTMAPSRESPONSE']._serialized_start=1004
+  _globals['_LISTMAPSRESPONSE']._serialized_end=1044
+  _globals['_GETMAPREQUEST']._serialized_start=1046
+  _globals['_GETMAPREQUEST']._serialized_end=1082
+  _globals['_ZONEMETADATA']._serialized_start=1084
+  _globals['_ZONEMETADATA']._serialized_end=1149
+  _globals['_MAPMETADATA']._serialized_start=1151
+  _globals['_MAPMETADATA']._serialized_end=1265
+  _globals['_MAPGEOMETRYCHUNK']._serialized_start=1267
+  _globals['_MAPGEOMETRYCHUNK']._serialized_end=1299
+  _globals['_SCANFRAMEREQUEST']._serialized_start=1301
+  _globals['_SCANFRAMEREQUEST']._serialized_end=1401
+  _globals['_SCANFRAMERESPONSE']._serialized_start=1403
+  _globals['_SCANFRAMERESPONSE']._serialized_end=1485
+  _globals['_SETZONELABELREQUEST']._serialized_start=1487
+  _globals['_SETZONELABELREQUEST']._serialized_end=1560
+  _globals['_SETZONELABELRESPONSE']._serialized_start=1562
+  _globals['_SETZONELABELRESPONSE']._serialized_end=1618
+  _globals['_EXPORTSCANMAPREQUEST']._serialized_start=1620
+  _globals['_EXPORTSCANMAPREQUEST']._serialized_end=1663
+  _globals['_EXPORTSCANMAPRESPONSE']._serialized_start=1665
+  _globals['_EXPORTSCANMAPRESPONSE']._serialized_end=1767
+  _globals['_TRACKINGSERVICE']._serialized_start=1770
+  _globals['_TRACKINGSERVICE']._serialized_end=2188
+  _globals['_MEDIATORSERVICE']._serialized_start=2191
+  _globals['_MEDIATORSERVICE']._serialized_end=2412
+  _globals['_MAPSERVICE']._serialized_start=2415
+  _globals['_MAPSERVICE']._serialized_end=2798
 # @@protoc_insertion_point(module_scope)

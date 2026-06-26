@@ -80,3 +80,5 @@ kokoro
 soundfile
 decord
 gradio
+open3d
+PyQt5

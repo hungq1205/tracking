@@ -42,3 +42,10 @@ docs/_build/
 Thumbs.db
 
 block_sparse_attention.egg/
+
+scan_server/uploads/
+scan_server/data/
+
+ros2-depth-anything-v3-trt/
+
+DA3METRIC-LARGE.onnx

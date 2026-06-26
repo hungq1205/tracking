@@ -26,6 +26,8 @@ sentence-transformers
 # VLM / Streaming
 qwen-vl-utils
 decord
+anthropic
+google-genai
 
 # Server / UI
 gradio

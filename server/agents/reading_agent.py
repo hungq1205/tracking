@@ -37,6 +37,8 @@ class ReadingAgent(BaseAgent):
     def __init__(self, ocr, rag_store=None):
         self.ocr = ocr
         self.rag_store = rag_store
+        self.last_ocr_blocks: list = []
+        self.last_ocr_frame = None  # BGR numpy array of the frame that produced last_ocr_blocks
 
     def handle(self, request: AgentRequest) -> AgentResult:
         intent = request.intent.intent
@@ -159,6 +161,8 @@ class ReadingAgent(BaseAgent):
             return AgentResult(agent_name=self.name, state=state, reply_text="", speak=False)
 
         blocks = self.ocr.read_blocks(request.frame, direction=ctx.reading_direction)
+        self.last_ocr_blocks = blocks
+        self.last_ocr_frame = request.frame.copy() if request.frame is not None else None
         if not blocks:
             return AgentResult(agent_name=self.name, state=state, reply_text="", speak=False)
 

@@ -3,6 +3,7 @@ from typing import Dict, Optional
 
 from domain.intents import (
     MEMORY_INTENTS,
+    NAVIGATE_INTENTS,
     READING_INTENTS,
     TRACKING_INTENTS,
     Intent,
@@ -27,6 +28,8 @@ class RuleRouter:
         now = now if now is not None else time.time()
 
         # Explicit intent routing — always takes priority
+        if intent.intent in NAVIGATE_INTENTS:
+            return "navigation"
         if intent.intent in TRACKING_INTENTS:
             return "tracking"
         if intent.intent in MEMORY_INTENTS:
