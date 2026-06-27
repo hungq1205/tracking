@@ -38,6 +38,12 @@ class Detection:
     box_xyxy: Tuple[float, float, float, float]
     score: float
 
+@dataclass
+class LabeledDetection:
+    label: str
+    box_xyxy: Tuple[float, float, float, float]
+    score: float
+
 class IObjectTracker(ABC):
     @abstractmethod
     def initialize(self, frame: np.ndarray, prompt: str) -> ObjectTrack:

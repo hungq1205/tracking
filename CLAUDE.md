@@ -304,8 +304,10 @@ scan_server/
     defaults.py                  Sensor noise model constants (accel/gyro sigmas)
     imu_preintegrator.py         GTSAM PreintegratedCombinedMeasurements; gravity/bias init
     vio_estimator.py             GTSAM ISAM2 + CombinedImuFactor + BetweenFactor<Pose3>
-  zone_labeler.py                Zone AABB management
-  map_exporter.py                PLY + JSON export
+  zone_labeler.py                Zone AABB management (Zone dataclass has landmarks: List[Landmark])
+  map_exporter.py                PLY + JSON export; map_labels.json includes zone_type, landmarks[], occupancy_grid per area
+  semantic_mapper.py             SemanticMapper — VLM (OpenRouter) + GroundingDINO landmark extraction;
+                                   Landmark dataclass; cluster_landmarks(); only active when OPENROUTER_API_KEY is set
 
 server/
   vio → ../scan_server/vio       Symlink so server/ can import the same VIO module
@@ -428,9 +430,10 @@ Environment variables:
 - `SCAN_DEVICE` — `cpu` or `cuda` for scan server (unused since DA3 removal)
 - `DEPTH_MODEL` — `sparse` (default, ORB relative depth), `stereo` (plane sweep MVS), or `da3` (Depth Anything 3 + VIO scale alignment)
 - `DA3_MODEL_ID` — DA3 model name (default `depth-anything/da3-large`; also `da3-giant`, `da3metric-large`)
-- `CLOUD_VLM_VENDOR` — cloud VLM provider (`stub` default; `anthropic`, `gemini` for live)
+- `CLOUD_VLM_VENDOR` — cloud VLM provider (`stub` default; `anthropic`, `gemini`, `openrouter` for live)
 - `CLOUD_VLM_API_KEY` — API key for the selected vendor (Anthropic)
 - `GEMINI_API_KEY` — API key for Gemini Flash (used when `CLOUD_VLM_VENDOR=gemini`)
+- `OPENROUTER_API_KEY` — API key for OpenRouter (scan server offline semantic mapping; when absent, semantic mapping is silently skipped)
 
 ---
 

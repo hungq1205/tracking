@@ -18,6 +18,13 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Add server/ to sys.path so scan_server modules can import server/tools/*
+_SERVER_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server")
+)
+if _SERVER_ROOT not in sys.path:
+    sys.path.insert(0, _SERVER_ROOT)
+
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
@@ -36,10 +43,29 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 print(f"[SCAN SERVER] Loading DA3 model on {_DEVICE}…")
 # estimator = DA3Estimator(model_id="depth-anything/da3-small", device=_DEVICE)
-estimator = DA3OnnxEstimator(onnx_path="/home/hungq/projects/tracking/DA3METRIC-LARGE.onnx", device=_DEVICE)
+estimator = DA3OnnxEstimator(onnx_path="../DA3METRIC-LARGE.onnx", device=_DEVICE)
 print("[SCAN SERVER] DA3 model ready.")
 
-scan_manager = ScanSessionManager(estimator=estimator)
+# ── Semantic Mapper (optional — requires OPENROUTER_API_KEY) ──────────────────
+_semantic_mapper = None
+_OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
+if _OPENROUTER_KEY:
+    try:
+        from tools.cloud_vlm import OpenRouterVLMClient
+        from tools.detector import GroundingDINODetector
+        from semantic_mapper import SemanticMapper
+
+        print("[SCAN SERVER] Loading GroundingDINO for semantic mapping…")
+        _detector = GroundingDINODetector()
+        _vlm = OpenRouterVLMClient(api_key=_OPENROUTER_KEY)
+        _semantic_mapper = SemanticMapper(_vlm, _detector)
+        print("[SCAN SERVER] SemanticMapper ready.")
+    except Exception as _sem_init_err:
+        print(f"[SCAN SERVER] SemanticMapper init failed (semantic mapping disabled): {_sem_init_err}")
+else:
+    print("[SCAN SERVER] OPENROUTER_API_KEY not set — semantic mapping disabled.")
+
+scan_manager = ScanSessionManager(estimator=estimator, semantic_mapper=_semantic_mapper)
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 

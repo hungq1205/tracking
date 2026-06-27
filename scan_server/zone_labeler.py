@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 import open3d as o3d
@@ -10,6 +10,7 @@ class Zone:
     label: str
     bbox_min: List[float]
     bbox_max: List[float]
+    landmarks: List[Any] = field(default_factory=list)  # List[Landmark] from semantic_mapper
 
 
 class ZoneLabeler:

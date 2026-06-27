@@ -41,6 +41,8 @@ docs/_build/
 .DS_Store
 Thumbs.db
 
+server/.env
+
 block_sparse_attention.egg/
 
 scan_server/uploads/

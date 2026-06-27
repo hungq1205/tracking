@@ -156,9 +156,85 @@ class GeminiVLMClient(CloudVLMClient):
         return buf.tobytes()
 
 
+class OpenRouterVLMClient(CloudVLMClient):
+    """
+    VLM client for OpenRouter API (used for offline semantic mapping).
+    Env: OPENROUTER_API_KEY
+    Default model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+    """
+
+    DEFAULT_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+    _SYSTEM_PROMPT = (
+        "You are a scene understanding assistant for a navigation system designed for "
+        "vision-impaired users. Your task is NOT to describe every visible object. "
+        "Instead, identify only the static landmarks, facilities, and functional objects "
+        "that are important for navigation within the specified zone/area. "
+        "The generated object names will be passed directly to Grounding DINO for object grounding. "
+        "Requirements: Prefer permanent landmarks over movable objects. "
+        "Ignore people, animals, decorations, bags, clothing, food, shadows, reflections, "
+        "and temporary clutter. Only include objects that are actually visible or can be "
+        "confidently inferred from the image. Choose objects that are useful as navigation "
+        "landmarks or destinations. Return only JSON."
+    )
+
+    def __init__(self, api_key: str = "", model: str = DEFAULT_MODEL):
+        self._api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
+        self._model = model
+
+    def query(self, text: str, image: Optional[np.ndarray] = None) -> str:
+        import requests as _requests
+        content: list
+        if image is not None:
+            b64 = self._encode_image(image)
+            content = [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": text},
+            ]
+        else:
+            content = [{"type": "text", "text": text}]
+
+        payload = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": self._SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+        }
+        resp = _requests.post(
+            self.API_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+    def describe_obstacle(self, frame: np.ndarray, depth_info: str = "") -> str:
+        prompt = "Describe the nearest obstacle in 5 words or fewer."
+        if depth_info:
+            prompt += f" Depth sensor reads approximately {depth_info} ahead."
+        return self.query(prompt, image=frame)
+
+    def query_stream(self, text: str, image: Optional[np.ndarray] = None) -> Iterator[bytes]:
+        raise NotImplementedError("OpenRouterVLMClient does not support audio streaming")
+
+    @staticmethod
+    def _encode_image(frame_bgr: np.ndarray) -> str:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        _, buf = cv2.imencode(".jpg", rgb, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        return base64.b64encode(buf.tobytes()).decode()
+
+
 def create_cloud_vlm_client(vendor: str = "stub", **kwargs) -> CloudVLMClient:
     if vendor == "anthropic":
         return AnthropicVLMClient(**kwargs)
     if vendor == "gemini":
         return GeminiVLMClient(**kwargs)
+    if vendor == "openrouter":
+        return OpenRouterVLMClient(**kwargs)
     return StubVLMClient()

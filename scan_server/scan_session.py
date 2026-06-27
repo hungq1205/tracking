@@ -28,6 +28,7 @@ from feature_tracker import FeatureTracker
 from map_exporter import export_map
 from occupancy_map import OccupancyMap
 from pose_graph import PoseGraph
+from semantic_mapper import Landmark, SemanticMapper
 from zone_labeler import Zone, ZoneLabeler
 
 _MAPS_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "data", "maps"))
@@ -226,9 +227,17 @@ class ScanSession:
     while set_label / export are called from another.
     """
 
-    def __init__(self, location_id: str, estimator: BaseDepthEstimator) -> None:
+    def __init__(
+        self,
+        location_id: str,
+        estimator: BaseDepthEstimator,
+        semantic_mapper: Optional[SemanticMapper] = None,
+        zone_type: str = "",
+    ) -> None:
         self.location_id = location_id
         self.estimator = estimator
+        self.semantic_mapper = semantic_mapper
+        self.zone_type = zone_type
         self.labeler = ZoneLabeler()
 
         self.tracker = FeatureTracker(n_features=2000)
@@ -246,6 +255,10 @@ class ScanSession:
         self._camera_K: Optional[list] = None
         self._imu: Optional[ImuIntegrator] = None
         self._lock = threading.Lock()
+
+        # Per-area semantic landmark accumulation
+        self._raw_landmarks: List[Landmark] = []
+        self._current_area_name: str = ""
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -422,13 +435,37 @@ class ScanSession:
                 result = _back_project_frame(rgb, df, pose, max_depth=10.0)
                 if result is None:
                     _bp_counts.append(0)
-                    continue
-                pts, cols = result
-                _bp_counts.append(len(pts))
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(pts)
-                pcd.colors = o3d.utility.Vector3dVector(cols)
-                new_cloud += pcd
+                else:
+                    pts, cols = result
+                    _bp_counts.append(len(pts))
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(pts)
+                    pcd.colors = o3d.utility.Vector3dVector(cols)
+                    new_cloud += pcd
+
+                # Semantic landmark extraction on sampled frames
+                if (
+                    self.semantic_mapper is not None
+                    and self._current_area_name
+                    and self._frame_count % SemanticMapper.SAMPLE_EVERY_N == 0
+                ):
+                    K_eff = (
+                        df.intrinsics if df.intrinsics is not None
+                        else _estimate_K(*rgb.shape[:2])
+                    )
+                    try:
+                        new_lms = self.semantic_mapper.extract_landmarks(
+                            frame_bgr=cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                            depth_map=df.depth_map,
+                            world_pose=pose,
+                            K=K_eff,
+                            zone_type=self.zone_type,
+                            area_name=self._current_area_name,
+                            frame_idx=self._frame_count,
+                        )
+                        self._raw_landmarks.extend(new_lms)
+                    except Exception as _sem_err:
+                        print(f"[ScanSession] Semantic extraction error: {_sem_err}")
 
             print(
                 f"  [batch] infer {infer_ms:.0f} ms ({infer_ms/len(frames_rgb):.0f} ms/f)  "
@@ -483,16 +520,27 @@ class ScanSession:
         """
         Create a zone AABB covering all camera positions visited during a segment,
         expanded outward by `margin` metres in each axis.
+        Clusters any accumulated semantic landmarks and attaches them to the zone.
         """
         with self._lock:
             arr = np.array(positions, dtype=np.float32)
             bbox_min = (arr.min(axis=0) - margin).tolist()
             bbox_max = (arr.max(axis=0) + margin).tolist()
-            zone = Zone(label=label, bbox_min=bbox_min, bbox_max=bbox_max)
+
+            area_landmarks: List[Landmark] = []
+            if self.semantic_mapper is not None and self._raw_landmarks:
+                area_landmarks = self.semantic_mapper.cluster_landmarks(
+                    list(self._raw_landmarks)
+                )
+                self._raw_landmarks = []
+
+            zone = Zone(label=label, bbox_min=bbox_min, bbox_max=bbox_max,
+                        landmarks=area_landmarks)
             self.labeler.zones.append(zone)
+
         print(
             f"[ScanSession:{self.location_id}] Zone '{label}' from path: "
-            f"{bbox_min} → {bbox_max}"
+            f"{bbox_min} → {bbox_max}  ({len(area_landmarks)} landmarks)"
         )
         return zone
 
@@ -504,7 +552,11 @@ class ScanSession:
             keyframes = list(self.pose_graph.keyframes)
             camera_K = self._camera_K
 
-        out_dir = export_map(cloud, zones, self.location_id)
+        out_dir = export_map(
+            cloud, zones, self.location_id,
+            zone_type=self.zone_type,
+            occupancy_map=self.occupancy_map,
+        )
 
         if keyframes and camera_K is not None:
             kf_dir = os.path.join(out_dir, "keyframes")
@@ -547,16 +599,28 @@ class ScanSession:
 class ScanSessionManager:
     """Thread-safe registry mapping location_id → ScanSession."""
 
-    def __init__(self, estimator: BaseDepthEstimator) -> None:
+    def __init__(
+        self,
+        estimator: BaseDepthEstimator,
+        semantic_mapper: Optional[SemanticMapper] = None,
+    ) -> None:
         self._estimator = estimator
+        self._semantic_mapper = semantic_mapper
         self._sessions: dict[str, ScanSession] = {}
         self._lock = threading.Lock()
 
-    def get_or_create(self, location_id: str) -> ScanSession:
+    def get_or_create(self, location_id: str, zone_type: str = "") -> ScanSession:
         with self._lock:
             if location_id not in self._sessions:
                 print(f"[ScanSessionManager] Creating session for '{location_id}'")
-                self._sessions[location_id] = ScanSession(location_id, self._estimator)
+                self._sessions[location_id] = ScanSession(
+                    location_id,
+                    self._estimator,
+                    semantic_mapper=self._semantic_mapper,
+                    zone_type=zone_type,
+                )
+            elif zone_type:
+                self._sessions[location_id].zone_type = zone_type
             return self._sessions[location_id]
 
     def get(self, location_id: str) -> Optional[ScanSession]:
