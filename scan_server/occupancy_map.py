@@ -28,11 +28,84 @@ Height above ground = ground_y − point_y  (positive = further from ground).
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
 from scipy.ndimage import maximum_filter
+
+# Palette matching scan_gui._ZONE_RGBA — css strings for Plotly
+_ZONE_COLORS_CSS = [
+    "rgba(255,80,80,0.86)",
+    "rgba(80,210,80,0.86)",
+    "rgba(80,130,255,0.86)",
+    "rgba(255,200,50,0.86)",
+    "rgba(200,80,200,0.86)",
+    "rgba(50,210,210,0.86)",
+    "rgba(255,140,0,0.86)",
+    "rgba(160,100,200,0.86)",
+]
+
+
+def _overlay_zones(fig: go.Figure, zones) -> None:
+    """
+    Overlay zone AABB outlines and semantic landmark markers onto a Plotly figure.
+    zones: list of Zone objects (zone_labeler.Zone), may be None or empty.
+    """
+    if not zones:
+        return
+    for z_idx, zone in enumerate(zones):
+        color = _ZONE_COLORS_CSS[z_idx % len(_ZONE_COLORS_CSS)]
+        label = zone.label or f"Zone {z_idx + 1}"
+
+        # Zone bounding box footprint (X-Z plane)
+        xmin, xmax = float(zone.bbox_min[0]), float(zone.bbox_max[0])
+        zmin, zmax = float(zone.bbox_min[2]), float(zone.bbox_max[2])
+        cx, cz = (xmin + xmax) * 0.5, (zmin + zmax) * 0.5
+
+        fig.add_trace(go.Scatter(
+            x=[xmin, xmax, xmax, xmin, xmin],
+            y=[zmin, zmin, zmax, zmax, zmin],
+            mode="lines",
+            line=dict(color=color, width=2, dash="dash"),
+            name=label,
+            showlegend=True,
+            legendgroup=label,
+            hoverinfo="name",
+        ))
+
+        # Zone label annotation at centre
+        fig.add_annotation(
+            x=cx, y=cz,
+            text=f"<b>{label}</b>",
+            showarrow=False,
+            font=dict(color=color, size=11),
+            bgcolor="rgba(0,0,0,0.55)",
+            borderpad=3,
+        )
+
+        # Landmark markers with text
+        landmarks = getattr(zone, "landmarks", [])
+        if landmarks:
+            fig.add_trace(go.Scatter(
+                x=[float(lm.x) for lm in landmarks],
+                y=[float(lm.z) for lm in landmarks],
+                mode="markers+text",
+                marker=dict(
+                    symbol="star",
+                    size=11,
+                    color=color,
+                    line=dict(color="white", width=1),
+                ),
+                text=[lm.name for lm in landmarks],
+                textposition="top center",
+                textfont=dict(size=9, color="white"),
+                customdata=[[round(lm.confidence, 3)] for lm in landmarks],
+                hovertemplate="%{text}<br>conf=%{customdata[0]}<br>x=%{x:.2f} z=%{y:.2f}<extra></extra>",
+                showlegend=False,
+                legendgroup=label,
+            ))
 
 
 class OccupancyMap:
@@ -87,7 +160,7 @@ class OccupancyMap:
                 slot = int(np.random.randint(0, cap))
                 self._cells[key][slot] = y
 
-    def render_plotly(self) -> go.Figure:
+    def render_plotly(self, zones=None) -> go.Figure:
         """
         Return a Plotly Heatmap where each cell is coloured by the height
         of its tallest point above the ground plane.
@@ -103,7 +176,10 @@ class OccupancyMap:
                 template="plotly_dark",
                 title=dict(text="Traversability Map (no data yet)", font=dict(size=13)),
                 margin=dict(l=40, r=10, b=40, t=28),
+                xaxis=dict(title="X (m)", color="#888"),
+                yaxis=dict(title="Z (m)", color="#888", scaleanchor="x", scaleratio=1),
             )
+            _overlay_zones(fig, zones)
             return fig
 
         keys = np.array(list(self._cells.keys()), dtype=np.int32)
@@ -194,4 +270,64 @@ class OccupancyMap:
             yaxis=dict(title="Z (m)", color="#888"),
             uirevision="occ",
         )
+        _overlay_zones(fig, zones)
         return fig
+
+    def extract_subgrid(self, bbox_min: List[float], bbox_max: List[float]) -> dict:
+        """
+        Extract the occupancy cells that fall within a 3D AABB (only X and Z axes used).
+
+        Returns a dict suitable for JSON serialisation:
+          resolution, origin_x, origin_z, width, height,
+          data: List[List[float]]  — rows=Z, cols=X
+                0.0 = ground, 0.0–1.0 = obstacle, -1.0 = unknown/ceiling
+        """
+        res = self.resolution
+        ix_lo = int(math.floor(bbox_min[0] / res))
+        ix_hi = int(math.ceil(bbox_max[0] / res))
+        iz_lo = int(math.floor(bbox_min[2] / res))
+        iz_hi = int(math.ceil(bbox_max[2] / res))
+
+        width = max(1, ix_hi - ix_lo)
+        height = max(1, iz_hi - iz_lo)
+        grid = [[-1.0] * width for _ in range(height)]
+
+        gy = self._ground_y
+        if gy is None or not self._cells:
+            return {
+                "resolution": res,
+                "origin_x": float(ix_lo * res),
+                "origin_z": float(iz_lo * res),
+                "width": width,
+                "height": height,
+                "data": grid,
+            }
+
+        for iz in range(iz_lo, iz_hi):
+            for ix in range(ix_lo, ix_hi):
+                key = (ix, iz)
+                if key not in self._cells:
+                    continue
+                y_samples = self._cells[key]
+                top_y = float(np.percentile(y_samples, self.HEIGHT_PERCENTILE))
+                h_above = gy - top_y
+                row = iz - iz_lo
+                col = ix - ix_lo
+                if h_above >= self.OBSTACLE_MAX_H:
+                    grid[row][col] = -1.0
+                elif h_above < self.OBSTACLE_MIN_H:
+                    grid[row][col] = 0.0
+                else:
+                    grid[row][col] = min(
+                        (h_above - self.OBSTACLE_MIN_H) / (self.OBSTACLE_MAX_H - self.OBSTACLE_MIN_H),
+                        1.0,
+                    )
+
+        return {
+            "resolution": res,
+            "origin_x": float(ix_lo * res),
+            "origin_z": float(iz_lo * res),
+            "width": width,
+            "height": height,
+            "data": grid,
+        }

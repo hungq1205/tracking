@@ -1,6 +1,7 @@
 import cv2
 import torch
 import logging
+from typing import List
 from PIL import Image
 
 from interfaces import Detection, IObjectDetector
@@ -56,3 +57,54 @@ class GroundingDINODetector(IObjectDetector):
             box_xyxy=(float(box[0]), float(box[1]), float(box[2]), float(box[3])),
             score=float(results["scores"][best_idx].item()),
         )
+
+    def detect_all(
+        self,
+        frame,
+        prompt: str,
+        box_threshold: float = 0.35,
+        text_threshold: float = 0.25,
+    ) -> List:
+        """Return all detections above threshold, each with its decoded text label."""
+        from interfaces import LabeledDetection
+
+        image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        width, height = image.size
+        clean_prompt = prompt.lower().strip()
+        if not clean_prompt.endswith("."):
+            clean_prompt += "."
+
+        inputs = self.processor(images=image, text=clean_prompt, return_tensors="pt").to(self.device)
+        if self.device.type == "cuda":
+            inputs = {k: v.half() if torch.is_floating_point(v) else v for k, v in inputs.items()}
+
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
+        ):
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+
+        results = self.processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=box_threshold,
+            text_threshold=text_threshold,
+            target_sizes=[(height, width)],
+        )[0]
+
+        if len(results["boxes"]) == 0:
+            return []
+
+        boxes = results["boxes"].cpu().numpy()
+        scores = results["scores"].cpu().numpy()
+        labels = results["text_labels"]
+
+        return [
+            LabeledDetection(
+                label=lbl.strip(),
+                box_xyxy=(float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                score=float(sc),
+            )
+            for box, sc, lbl in zip(boxes, scores, labels)
+        ]

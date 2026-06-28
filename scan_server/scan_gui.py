@@ -27,7 +27,7 @@ matplotlib.use("Agg")
 from scan_css import SCAN_CSS, SCAN_DESCRIPTION_HTML, SCAN_HEADER_HTML, get_scan_theme
 
 _DEFAULT_SEGMENTS = pd.DataFrame(
-    {"start_s": [0.0], "end_s": [0.0], "zone_name": [""]}
+    {"start_s": [0.0], "end_s": [0.0], "area_name": [""]}
 )
 
 
@@ -64,10 +64,58 @@ def _build_depth_data(
     }
 
 
+# ── Zone / landmark rendering helpers ─────────────────────────────────────────
+
+_ZONE_RGBA = [
+    (255,  80,  80, 220),   # red
+    ( 80, 210,  80, 220),   # green
+    ( 80, 130, 255, 220),   # blue
+    (255, 200,  50, 220),   # yellow
+    (200,  80, 200, 220),   # magenta
+    ( 50, 210, 210, 220),   # cyan
+    (255, 140,   0, 220),   # orange
+    (160, 100, 200, 220),   # purple
+]
+
+def _zone_color_css(idx: int) -> str:
+    r, g, b, a = _ZONE_RGBA[idx % len(_ZONE_RGBA)]
+    return f"rgba({r},{g},{b},{a/255:.2f})"
+
+def _make_stick(p1, p2, radius: float = 0.03, color=(255, 80, 80, 220)):
+    """Return a thin box mesh along the p1→p2 edge, or None on failure."""
+    try:
+        import trimesh
+        d = np.asarray(p2, dtype=np.float64) - np.asarray(p1, dtype=np.float64)
+        length = float(np.linalg.norm(d))
+        if length < 1e-4:
+            return None
+        mid = (np.asarray(p1) + np.asarray(p2)) * 0.5
+        d_norm = d / length
+        z_axis = np.array([0.0, 0.0, 1.0])
+        cross = np.cross(z_axis, d_norm)
+        cross_len = float(np.linalg.norm(cross))
+        dot_val = float(np.dot(z_axis, d_norm))
+        if cross_len > 1e-6:
+            angle = np.arctan2(cross_len, dot_val)
+            R = trimesh.transformations.rotation_matrix(angle, cross / cross_len)
+        elif dot_val < 0:
+            R = trimesh.transformations.rotation_matrix(np.pi, [1.0, 0.0, 0.0])
+        else:
+            R = np.eye(4)
+        T = np.eye(4)
+        T[:3, 3] = mid
+        box = trimesh.creation.box(extents=[radius * 2, radius * 2, length])
+        box.apply_transform(T @ R)
+        box.visual.face_colors = np.array(color, dtype=np.uint8)
+        return box
+    except Exception:
+        return None
+
+
 # ── Point cloud → Model3D ──────────────────────────────────────────────────────
 
 
-def _cloud_to_glb(cloud_or_pts) -> Optional[str]:
+def _cloud_to_glb(cloud_or_pts, zones=None, ground_y=None) -> Optional[str]:
     """
     Export point cloud to a temp GLB file for gr.Model3D.
     Uses trimesh (same as DA3 app): PointCloud → Scene → .glb
@@ -100,6 +148,35 @@ def _cloud_to_glb(cloud_or_pts) -> Optional[str]:
         pc = trimesh.points.PointCloud(vertices=pts, colors=rgba)
         scene = trimesh.Scene()
         scene.add_geometry(pc)
+
+        # ── Zone bounding boxes + landmark spheres ────────────────────────────
+        if zones:
+            # Floor Y: use provided ground_y or estimate from point cloud centroid
+            gy = float(ground_y) if ground_y is not None else float(pts[:, 1].max())
+            for z_idx, zone in enumerate(zones):
+                color = _ZONE_RGBA[z_idx % len(_ZONE_RGBA)]
+                mn = np.array(zone.bbox_min, dtype=np.float64)
+                mx = np.array(zone.bbox_max, dtype=np.float64)
+
+                # Draw the floor rectangle of the AABB as 4 edge sticks
+                floor_y = gy
+                fc = np.array([
+                    [mn[0], floor_y, mn[2]],
+                    [mx[0], floor_y, mn[2]],
+                    [mx[0], floor_y, mx[2]],
+                    [mn[0], floor_y, mx[2]],
+                ])
+                for a, b in ((0, 1), (1, 2), (2, 3), (3, 0)):
+                    stick = _make_stick(fc[a], fc[b], radius=0.04, color=color)
+                    if stick:
+                        scene.add_geometry(stick)
+
+                # Landmark spheres placed at floor level
+                for lm in getattr(zone, "landmarks", []):
+                    sph = trimesh.creation.icosphere(subdivisions=1, radius=0.18)
+                    sph.apply_translation([float(lm.x), floor_y, float(lm.z)])
+                    sph.visual.face_colors = np.array(color, dtype=np.uint8)
+                    scene.add_geometry(sph)
 
         # Top-down initial camera: camera placed above centroid looking down (-Y).
         # In trimesh camera space: +X=right, +Y=up, -Z=forward (toward scene).
@@ -305,7 +382,10 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             try:
                 start_s = float(row.get("start_s") or 0.0)
                 end_s = float(row.get("end_s") or 9999.0)
-                zone = str(row.get("zone_name") or "").strip()
+                # Support both new "area_name" and old "zone_name" column names
+                zone = str(
+                    row.get("area_name") or row.get("zone_name") or ""
+                ).strip()
                 if end_s > start_s:
                     segments.append((start_s, end_s, zone))
             except (ValueError, TypeError):
@@ -416,7 +496,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         approx = max(1, int(total / max(interval, 1)))
         msg = f"Video: {duration:.1f}s — ~{approx} sampled frames at {fps_val} FPS"
         default_df = pd.DataFrame(
-            {"start_s": [0.0], "end_s": [round(duration, 1)], "zone_name": [""]}
+            {"start_s": [0.0], "end_s": [round(duration, 1)], "area_name": [""]}
         )
         return frames, msg, default_df
 
@@ -430,6 +510,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         resolution: str,
         pose_src: str = "Auto",
         extra_rotation: int = 0,
+        zone_type: str = "",
     ) -> Generator[Dict[str, Any], None, None]:
         if not video_path:
             yield {log_output: "Upload a video first."}
@@ -437,8 +518,9 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
         max_dim = int(resolution.split("×")[0]) if resolution != "Original" else 0
         location_id = (location_id or "").strip() or "default"
+        zone_type = (zone_type or "").strip()
         segments = _parse_segments(segments_df)
-        session = scan_manager.get_or_create(location_id)
+        session = scan_manager.get_or_create(location_id, zone_type=zone_type)
 
         # Resolve effective pose source
         _use_imu  = pose_src in ("Auto", "IMU + VO")
@@ -482,6 +564,10 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             if not frames_rgb:
                 yield {log_output: f"Segment {seg_i}: no frames in range, skipping."}
                 continue
+
+            # Set area context for semantic landmark accumulation
+            session._current_area_name = zone_name
+            session._raw_landmarks = []
 
             n_total = len(frames_rgb)
             segment_positions: list = []
@@ -547,9 +633,11 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
                 pos_str = f"x={cam_pos[0]:.2f}  y={cam_pos[1]:.2f}  z={cam_pos[2]:.2f}"
 
+                _cur_zones = session.zones  # zones completed so far
+                _cur_gy = session.occupancy_map._ground_y
                 yield {
-                    live_cloud_plot: _cloud_to_glb(session._cloud),
-                    occupancy_plot:  session.occupancy_map.render_plotly(),
+                    live_cloud_plot: _cloud_to_glb(session._cloud, zones=_cur_zones, ground_y=_cur_gy),
+                    occupancy_plot:  session.occupancy_map.render_plotly(zones=_cur_zones),
                     scan_status:     (
                         f"Seg {seg_i}/{len(segments)} "
                         f"[{f_lo}–{f_hi}/{n_total}] | {point_count:,} pts | "
@@ -568,6 +656,13 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
             if zone_name and segment_positions:
                 session.set_label_from_positions(zone_name, segment_positions, margin=0.3)
+                # Refresh displays immediately so the new area label/landmarks appear
+                _seg_zones = session.zones
+                _seg_gy = session.occupancy_map._ground_y
+                yield {
+                    live_cloud_plot: _cloud_to_glb(session._cloud, zones=_seg_zones, ground_y=_seg_gy),
+                    occupancy_plot:  session.occupancy_map.render_plotly(zones=_seg_zones),
+                }
 
         accum_rgb   = [x[0] for x in depth_accum]
         accum_df    = [x[1] for x in depth_accum]
@@ -592,8 +687,8 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                 f"Total inference: {total_infer_ms/1000:.1f} s "
                 f"({total_infer_ms / max(total_frames_processed, 1):.0f} ms/f avg)"
             ),
-            live_cloud_plot:      _cloud_to_glb(session._cloud),
-            occupancy_plot:       session.occupancy_map.render_plotly(),
+            live_cloud_plot:      _cloud_to_glb(session._cloud, zones=session.zones, ground_y=session.occupancy_map._ground_y),
+            occupancy_plot:       session.occupancy_map.render_plotly(zones=session.zones),
             depth_data_state:     depth_data,
             depth_view_selector:  gr.Dropdown(choices=depth_choices, value=depth_choices[0]),
             depth_rgb_image:      first_rgb,
@@ -695,19 +790,24 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                         refresh_uploads_btn = gr.Button("Refresh", size="sm", scale=1)
                     load_upload_btn = gr.Button("Load Selected", variant="secondary", size="sm")
 
+                zone_type_input = gr.Textbox(
+                    label="Venue Type (optional)",
+                    placeholder='e.g. "hospital", "supermarket", "home" — leave blank if unknown',
+                    value="",
+                )
                 gr.Markdown(
-                    "**Segment Table** — one row per zone. "
+                    "**Segment Table** — one row per area. "
                     "`start_s` / `end_s` in seconds. "
-                    "Leave `zone_name` blank for unlabelled sections."
+                    "Leave `area_name` blank for unlabelled sections."
                 )
                 segment_table = gr.Dataframe(
                     value=_DEFAULT_SEGMENTS,
-                    headers=["start_s", "end_s", "zone_name"],
+                    headers=["start_s", "end_s", "area_name"],
                     datatype=["number", "number", "str"],
                     row_count=(1, "dynamic"),
                     col_count=(3, "fixed"),
                     interactive=True,
-                    label="Zone Segments",
+                    label="Area Segments",
                 )
 
                 frame_gallery = gr.Gallery(
@@ -849,7 +949,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             fn=_run_local_scan,
             inputs=[input_video, imu_file_input, s_fps, batch_size_input,
                     location_id_input, segment_table, resolution_input,
-                    pose_src_radio, video_rotation_state],
+                    pose_src_radio, video_rotation_state, zone_type_input],
             outputs=[
                 live_cloud_plot, occupancy_plot,
                 scan_status, scan_position, log_output,
