@@ -1,500 +1,541 @@
-import cv2
-import json
-import time
+"""
+Desktop client for the Vision Assistant — uses VoiceChatStream gRPC.
+
+Streams mic audio (16 kHz PCM) + camera frames (JPEG) to the server.
+Server runs a Gemini Live session and streams 24 kHz PCM audio back.
+
+Local tracking overlay (ORB + GroundingDINO re-ID) and hand detection
+run in parallel using the same server's DetectObject / GetEmbedding RPCs.
+
+Use headphones to avoid microphone echo.
+"""
+from __future__ import annotations
+
+import base64
+import queue
 import threading
-import gradio as gr
-import os
-import tempfile
-import io
+import time
+from typing import Optional
+
+import cv2
+import grpc
 import numpy as np
 import sounddevice as sd
-import soundfile as sf
-from typing import Dict, Any, Generator, Optional, Callable
-from concurrent.futures import ThreadPoolExecutor
+import torch
+import gradio as gr
 
+import json
+
+from proto import tracking_pb2, tracking_pb2_grpc
 from rpc_client.grpc_client import RemoteGroundingDINO, RemoteEmbedder
 from core.local_models import LocalHandDetector
 from core.object_tracker import GPUVIOAnchorBackend
 from core.guidance_engine import GuidanceEngine
-from core.helpers import CameraEmulator
 from core.renderer import GUIRenderer
-from core.interfaces import IClientApp
 
-global_executor = ThreadPoolExecutor(max_workers=4)
+AUDIO_IN_RATE  = 16_000
+AUDIO_IN_CHUNK = 1024        # ~64 ms per chunk
+AUDIO_OUT_RATE = 24_000
+VIDEO_FPS      = 5           # camera frames per second sent to server
+JPEG_QUALITY   = 70
 
-SAMPLE_RATE = 16000
-VAD_CHUNK = 512          # frames per chunk (~32 ms at 16kHz)
-VAD_THRESHOLD = 0.01     # RMS threshold to consider speech (0.0–1.0 float32 range)
-VAD_SILENCE_CHUNKS = 47  # consecutive silent chunks before submitting (~1500 ms)
-VAD_MIN_SPEECH_CHUNKS = 5  # minimum speech chunks to avoid noise triggers
+_EMB_DIM = 1280  # EfficientNetLite embedding dimension
 
 
-class VoiceActivityDetector:
-    """Always-on VAD: listens, detects speech by RMS, submits on silence."""
+# ── Local tracking ───────────────────────────────────────────────────────────
 
-    def __init__(self, on_audio: Callable[[bytes], None]):
-        self._on_audio = on_audio
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+class LocalTracker:
+    """
+    ORB-based object tracker + hand detector running entirely on the client.
+    Uses server's DetectObject / GetEmbedding RPCs for initialization and re-ID
+    but does local ORB tracking between keyframes.
+    """
 
-    def start(self):
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+    def __init__(self):
+        self._backend: Optional[GPUVIOAnchorBackend] = None
+        self._hand: Optional[LocalHandDetector] = None
+        self._engine: Optional[GuidanceEngine] = None
+        self._target: str = ""
+        self._description: str = ""
+        self._ref_embedding: Optional[torch.Tensor] = None
+        self._ref_image_bgr: Optional[np.ndarray] = None  # BGR, for display
+        self._initialized: bool = False
+        self._last_init_at: float = 0.0
+        self._active: bool = False
+        self._last_fps_t: float = time.perf_counter()
+        self.last_state = None        # GuidanceState for GUIRenderer
+        self.status: str = ""
 
-    def stop(self):
-        self._stop_event.set()
+    def setup(self, server_addr: str) -> None:
+        detector = RemoteGroundingDINO(server_addr)
+        embedder = RemoteEmbedder(server_addr)
+        self._backend = GPUVIOAnchorBackend(
+            detector=detector,
+            embedder=embedder,
+            nfeatures=800,
+            renewal_interval=2.0,
+        )
+        self._hand = LocalHandDetector()
+        self._engine = GuidanceEngine(
+            object_tracker=self._backend,
+            hand_detector=self._hand,
+        )
 
-    def _run(self):
-        buffer: list[np.ndarray] = []
-        silent_chunks = 0
-        speech_chunks = 0
-        in_speech = False
+    @property
+    def reid_threshold(self) -> float:
+        if self._backend:
+            return self._backend.reid_threshold
+        return 0.4
 
-        def callback(indata, frames, time_info, status):
-            nonlocal buffer, silent_chunks, speech_chunks, in_speech
-            chunk = indata[:, 0].copy()
-            rms = float(np.sqrt(np.mean(chunk ** 2)))
+    @reid_threshold.setter
+    def reid_threshold(self, value: float) -> None:
+        if self._backend:
+            self._backend.reid_threshold = float(value)
 
-            if rms >= VAD_THRESHOLD:
-                buffer.append(chunk)
-                speech_chunks += 1
-                silent_chunks = 0
-                if not in_speech and speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
-                    in_speech = True
-            else:
-                if in_speech:
-                    buffer.append(chunk)
-                    silent_chunks += 1
-                    if silent_chunks >= VAD_SILENCE_CHUNKS:
-                        self._submit(buffer[:])
-                        buffer.clear()
-                        silent_chunks = 0
-                        speech_chunks = 0
-                        in_speech = False
-                else:
-                    speech_chunks = max(0, speech_chunks - 1)
+    @property
+    def ref_image(self) -> Optional[np.ndarray]:
+        """Return reference image as RGB ndarray for Gradio display."""
+        img = None
+        if self._backend and self._backend._ref_image is not None:
+            img = self._backend._ref_image
+        elif self._ref_image_bgr is not None:
+            img = self._ref_image_bgr
+        if img is None:
+            return None
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=VAD_CHUNK,
-            callback=callback,
-        ):
-            while not self._stop_event.is_set():
+    def start(
+        self,
+        target: str,
+        description: str = "",
+        ref_embedding: Optional[torch.Tensor] = None,
+        ref_image_bgr: Optional[np.ndarray] = None,
+    ) -> None:
+        if not self._backend:
+            return
+        self._target = target
+        self._description = description or target
+        self._ref_embedding = ref_embedding
+        self._ref_image_bgr = ref_image_bgr
+        self._initialized = False
+        self._last_init_at = 0.0
+        self._active = True
+        self.last_state = None
+        self.status = f"Searching for '{target}'..."
+
+    def stop(self) -> None:
+        self._active = False
+        self._initialized = False
+        self._ref_embedding = None
+        self._ref_image_bgr = None
+        self.last_state = None
+        self.status = ""
+        if self._backend:
+            try:
+                self._backend.stop()
+                # clear ref image on backend too
+                self._backend._ref_image = None
+            except Exception:
+                pass
+
+    def update(self, frame: np.ndarray) -> None:
+        if not self._active or not self._engine:
+            return
+        now_t = time.perf_counter()
+        fps = 1.0 / max(now_t - self._last_fps_t, 1e-6)
+        self._last_fps_t = now_t
+
+        if not self._initialized:
+            now = time.time()
+            if now - self._last_init_at >= 1.0:
+                self._last_init_at = now
+                try:
+                    obj = self._backend.initialize(
+                        frame,
+                        self._target,
+                        description=self._description,
+                        ref_embedding=self._ref_embedding,
+                        ref_image=self._ref_image_bgr,
+                    )
+                    if obj.visible:
+                        self._initialized = True
+                        self.status = f"Tracking '{self._target}'"
+                except Exception as e:
+                    self.status = f"Init error: {e}"
+        else:
+            try:
+                self.last_state = self._engine.update(frame, fps=fps)
+                if self.last_state:
+                    s = self.last_state.object_track
+                    self.status = (
+                        f"Tracking '{self._target}'  "
+                        f"Conf: {s.confidence:.2f}  "
+                        f"{self.last_state.instruction}"
+                    )
+            except Exception as e:
+                self.status = f"Track error: {e}"
+                self._initialized = False
+
+
+# ── Gemini Live stream client ─────────────────────────────────────────────────
+
+class LiveStreamClient:
+    """
+    Manages one VoiceChatStream gRPC connection with four daemon threads:
+      _cam_loop   — reads camera/file, stores latest_frame, enqueues JPEG chunks
+      _mic_loop   — reads mic at 16 kHz, enqueues int16 PCM chunks
+      _grpc_loop  — opens VoiceChatStream, forwards chunks in, receives PCM out
+      _play_loop  — drains play queue into 24 kHz sounddevice OutputStream
+    """
+
+    def __init__(self, tracker: "LocalTracker"):
+        self._tracker = tracker
+        self._stop = threading.Event()
+        self._send_q: queue.Queue = queue.Queue(maxsize=300)
+        self._play_q: queue.Queue = queue.Queue(maxsize=300)
+        self.latest_frame: Optional[np.ndarray] = None  # BGR
+        self.status: str = "Idle"
+        self.is_running: bool = False
+
+    def start(self, server_addr: str, video_source) -> None:
+        self._stop.clear()
+        self.status = "Connecting..."
+        self.is_running = True
+        for target, args in [
+            (self._cam_loop,  (video_source,)),
+            (self._mic_loop,  ()),
+            (self._play_loop, ()),
+            (self._grpc_loop, (server_addr,)),
+        ]:
+            threading.Thread(target=target, args=args, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.is_running = False
+        self.status = "Disconnected"
+
+    def _cam_loop(self, video_source) -> None:
+        cap = cv2.VideoCapture(video_source)
+        send_interval = 1.0 / VIDEO_FPS
+        last_sent = 0.0
+
+        is_file = isinstance(video_source, str)
+        native_fps = cap.get(cv2.CAP_PROP_FPS) if is_file else 0.0
+        frame_interval = 1.0 / native_fps if native_fps > 0 else 0.0
+        last_frame_t = 0.0
+
+        while not self._stop.is_set():
+            if is_file and frame_interval > 0:
+                now = time.time()
+                wait = frame_interval - (now - last_frame_t)
+                if wait > 0:
+                    time.sleep(wait)
+                last_frame_t = time.time()
+
+            ret, frame = cap.read()
+            if not ret:
+                if is_file:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    last_frame_t = 0.0
+                    continue
+                break
+            self.latest_frame = frame
+            now = time.time()
+            if now - last_sent >= send_interval:
+                ok, jpeg = cv2.imencode(".jpg", frame,
+                                        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                if ok:
+                    try:
+                        self._send_q.put_nowait(
+                            tracking_pb2.VoiceChatChunk(video_frame=jpeg.tobytes())
+                        )
+                    except queue.Full:
+                        pass
+                last_sent = now
+            if not is_file:
+                time.sleep(0.01)
+        cap.release()
+
+    def _mic_loop(self) -> None:
+        def _cb(indata, _frames, _time_info, _status):
+            if self._stop.is_set():
+                return
+            pcm = (indata[:, 0] * 32767).astype(np.int16).tobytes()
+            try:
+                self._send_q.put_nowait(
+                    tracking_pb2.VoiceChatChunk(audio_chunk=pcm)
+                )
+            except queue.Full:
+                pass
+
+        with sd.InputStream(samplerate=AUDIO_IN_RATE, channels=1, dtype="float32",
+                            blocksize=AUDIO_IN_CHUNK, callback=_cb):
+            while not self._stop.is_set():
                 time.sleep(0.05)
 
-    def _submit(self, chunks: list):
-        audio = np.concatenate(chunks)
-        buf = io.BytesIO()
-        sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
-        self._on_audio(buf.getvalue())
-
-
-class DesktopVideoStreamGUI(IClientApp):
-    def __init__(self):
-        self.remote_detector = None
-        self.remote_embedder = None
-        self.local_hand = None
-        self.backend = None
-        self.engine = None
-        self.emulator = None
-        self.last_gui_send = 0
-        self.initialized = False
-        self.server_addr = None
-        self.stream_to_server_flag = False
-        self.latest_frame = None
-        self.auto_target = None
-        self.tracking_active = False
-
-        self._agent_state: str = ""
-        self._reading_timer: Optional[threading.Timer] = None
-        self._pending_audio: Optional[str] = None
-        self._pending_voice_result: Optional[tuple] = None  # (response_text, audio_path)
-        self._chat_history: list = []
-        self._vad = VoiceActivityDetector(on_audio=self._on_vad_audio)
-        self._vad.start()
-
-    def _initialize_backend_services(self, server_ip, grpc_port, nfeatures, renewal_interval):
-        self.server_addr = f"{server_ip}:{grpc_port}"
-        print(f"[DESKTOP GUI] Connecting to Server at {self.server_addr}...")
-        self.remote_detector = RemoteGroundingDINO(self.server_addr)
-        self.remote_embedder = RemoteEmbedder(self.server_addr)
-        self.local_hand = LocalHandDetector()
-
-        self.backend = GPUVIOAnchorBackend(
-            detector=self.remote_detector,
-            embedder=self.remote_embedder,
-            nfeatures=int(nfeatures),
-            renewal_interval=float(renewal_interval),
+    def _play_loop(self) -> None:
+        stream = sd.RawOutputStream(
+            samplerate=AUDIO_OUT_RATE, channels=1, dtype="int16"
         )
-        self.engine = GuidanceEngine(object_tracker=self.backend, hand_detector=self.local_hand)
-
-    def _handle_tracking_logic(self, frame, text_prompt, fps, last_init_attempt):
-        if not self.initialized:
-            now = time.time()
-            if (now - last_init_attempt) >= 1.0:
-                print(f"[DESKTOP GUI] Attempting initialization for: {text_prompt}")
-                obj_track = self.backend.initialize(frame, text_prompt)
-                if obj_track.visible:
-                    self.initialized = True
-                    return self.engine._build_state(obj_track, self.local_hand.detect(frame), fps=fps), now
-                print(f"[DESKTOP GUI] Not found: {text_prompt}")
-                return None, now
-            return None, last_init_attempt
-
-        return self.engine.update(frame, fps=fps), last_init_attempt
-
-    def _maybe_stream_to_server(self, frame, stream_fps):
-        if self.stream_to_server_flag:
-            now = time.time()
-            if (now - self.last_gui_send) > (1.0 / float(stream_fps)):
-                self.remote_detector.send_gui_frame(frame)
-                self.last_gui_send = now
-
-    def _handle_agent_response(self, res) -> None:
-        state = res.agent_state
-        self._agent_state = state
-
+        stream.start()
         try:
-            payload = json.loads(res.agent_payload) if res.agent_payload else {}
-        except (json.JSONDecodeError, ValueError):
-            payload = {}
+            while not self._stop.is_set():
+                try:
+                    pcm = self._play_q.get(timeout=0.1)
+                    stream.write(pcm)
+                except queue.Empty:
+                    continue
+        finally:
+            stream.stop()
+            stream.close()
 
-        if state == "INITIALIZING":
-            self.auto_target = payload.get("target", "")
-        elif state == "STOPPED":
-            self.tracking_active = False
-            self.initialized = False
-            if self.backend:
-                self.backend.stop()
-        elif state in ("DONE_READING", "STOPPED"):
-            self._cancel_reading_timer()
+    def _handle_state(self, agent_state: str, agent_payload: str) -> None:
+        """React to state-only AudioChunk notifications from the server."""
+        if agent_state == "TRACKING":
+            try:
+                payload = json.loads(agent_payload) if agent_payload else {}
+            except Exception:
+                payload = {}
+            target = payload.get("target", "")
+            description = payload.get("description", target)
+            ref_embedding: Optional[torch.Tensor] = None
+            ref_image_bgr: Optional[np.ndarray] = None
 
-    def _agent_status_text(self, res) -> str:
-        state = res.agent_state
-        try:
-            payload = json.loads(res.agent_payload) if res.agent_payload else {}
-        except Exception:
-            payload = {}
+            # Decode reference embedding (float32 bytes, base64)
+            emb_b64 = payload.get("ref_embedding")
+            if emb_b64:
+                try:
+                    raw = base64.b64decode(emb_b64)
+                    arr = np.frombuffer(raw, dtype=np.float32).reshape(1, _EMB_DIM).copy()
+                    ref_embedding = torch.from_numpy(arr)
+                except Exception:
+                    pass
 
-        if state == "SCANNING":
-            char_count = payload.get("char_count", 0)
-            label = payload.get("label", "")
-            return f"Status: Scanning... {char_count} characters saved" + (f" [{label}]" if label else "")
-        if state == "READING_ALOUD":
-            idx = payload.get("sentence_index", 0)
-            total = payload.get("total", 0)
-            return f"Status: Reading sentence {idx + 1} of {total}"
-        if state == "PAUSED":
-            idx = payload.get("sentence_index", 0)
-            total = payload.get("total", 0)
-            return f"Status: Paused at sentence {idx + 1} of {total}"
-        if state == "DONE_READING":
-            return "Status: Finished reading"
-        if state == "OBJECT_SAVED":
-            label = payload.get("label", "")
-            return f"Status: Object saved to memory '{label}'"
-        if state == "SAVE_STARTED":
-            label = payload.get("label", "")
-            return f"Status: Ready to scan for '{label}'"
-        return f"Status: {state}"
+            # Decode reference image (JPEG bytes, base64)
+            img_b64 = payload.get("ref_image_b64")
+            if img_b64:
+                try:
+                    raw = base64.b64decode(img_b64)
+                    nparr = np.frombuffer(raw, dtype=np.uint8)
+                    ref_image_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                except Exception:
+                    pass
 
-    # ── reading auto-continue ─────────────────────────────────────────────────
+            if target:
+                print(f"[CLIENT] Server started tracking: '{target}' (desc: '{description}')", flush=True)
+                self._tracker.start(target, description, ref_embedding, ref_image_bgr)
+                self.status = f"Tracking '{target}' (server-initiated)"
+        elif agent_state == "IDLE":
+            if self._tracker._active:
+                print("[CLIENT] Server stopped tracking.", flush=True)
+                self._tracker.stop()
+                self.status = "Listening..."
 
-    def _schedule_reading_continue(self, audio_bytes: bytes) -> None:
-        self._cancel_reading_timer()
-        if self._agent_state != "READING_ALOUD":
-            return
-        if not audio_bytes:
-            return
-        # Kokoro: 24kHz 16-bit PCM WAV; header is 44 bytes
-        audio_data_bytes = max(0, len(audio_bytes) - 44)
-        duration_sec = audio_data_bytes / (24000 * 2)
-        delay = max(0.1, duration_sec + 0.3)
-        self._reading_timer = threading.Timer(delay, self._auto_continue_reading)
-        self._reading_timer.daemon = True
-        self._reading_timer.start()
-
-    def _cancel_reading_timer(self) -> None:
-        if self._reading_timer and self._reading_timer.is_alive():
-            self._reading_timer.cancel()
-        self._reading_timer = None
-
-    def _auto_continue_reading(self) -> None:
-        if self._agent_state != "READING_ALOUD":
-            return
-        if self.remote_detector is None:
-            return
-        try:
-            res = self.remote_detector.chat(self.latest_frame, "continue reading")
-            self._handle_agent_response(res)
-            if res.audio_response:
-                audio_path = os.path.join(tempfile.gettempdir(), "auto_continue.wav")
-                with open(audio_path, "wb") as f:
-                    f.write(res.audio_response)
-                self._pending_audio = audio_path
-            if self._agent_state == "READING_ALOUD":
-                self._schedule_reading_continue(res.audio_response or b"")
-        except Exception as e:
-            print(f"[DESKTOP GUI] Auto-continue error: {e}")
-
-    def _poll_pending_audio(self):
-        if self._pending_audio:
-            path = self._pending_audio
-            self._pending_audio = None
-            return path
-        return None
-
-    def _poll_pending_audio_stream(self):
-        while True:
-            time.sleep(0.5)
-            yield self._poll_pending_audio()
-
-    # ── experiment generator ──────────────────────────────────────────────────
-
-    def _run_experiment_generator(self, video_file, server_ip, grpc_port, stream_to_server_toggle, nfeatures, renewal_interval, stream_fps) -> Generator[Dict[str, Any], None, None]:
-        if video_file is None:
-            yield {ui_status: "Status: Please upload a video file."}
-            return
-
-        self._initialize_backend_services(server_ip, grpc_port, nfeatures, renewal_interval)
-        self.stream_to_server_flag = stream_to_server_toggle
-        self.emulator = CameraEmulator(video_file, target_fps=15)
-
-        self.initialized = False
-        self.last_gui_send = 0
-        last_init_attempt = 0
-        last_loop_time = time.perf_counter()
-        self.tracking_active = False
-        effective_prompt = ""
-
-        for frame, _ in self.emulator.stream():
-            self.latest_frame = frame.copy()
-            t_start = time.perf_counter()
-
-            if self.auto_target:
-                print(f"[DESKTOP GUI] Orchestrator triggered tracking for: {self.auto_target}")
-                effective_prompt = self.auto_target
-                self.auto_target = None
-                self.initialized = False
-                self.tracking_active = True
-
-            current_time = time.perf_counter()
-            fps = 1.0 / (current_time - last_loop_time) if current_time > last_loop_time else 0.0
-            last_loop_time = current_time
-
-            self._maybe_stream_to_server(frame, stream_fps)
-
-            if not self.tracking_active:
-                yield {
-                    ui_image: cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    ui_status: "Status: Idle (Awaiting Voice/Chat Intent)",
-                }
+    def _request_iter(self):
+        while not self._stop.is_set():
+            try:
+                yield self._send_q.get(timeout=0.1)
+            except queue.Empty:
                 continue
 
-            state, last_init_attempt = self._handle_tracking_logic(frame, effective_prompt, fps, last_init_attempt)
-
-            if state is None:
-                yield {
-                    ui_image: cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    ui_status: f"Status: Searching for '{effective_prompt}'...\n(Retrying every 1s)",
-                }
-                continue
-
-            latency = (time.perf_counter() - t_start) * 1000
-            vis_frame = GUIRenderer.render(frame, state)
-            active_anchors = (
-                len(state.object_track.debug.get("anchor_pts", []))
-                if "anchor_pts" in state.object_track.debug
-                else state.object_track.debug.get("total_anchors", 0)
-            )
-            status_text = (
-                f"Status: {state.object_track.status}\n"
-                f"FPS: {state.fps:.1f} | Conf: {state.object_track.confidence:.2f} | Anchors: {active_anchors}\n"
-                f"Latency: {latency:.1f}ms\nInstruction: {state.instruction}"
-            )
-            yield {ui_image: cv2.cvtColor(vis_frame, cv2.COLOR_BGR2RGB), ui_status: status_text}
-
-    # ── chat handlers ─────────────────────────────────────────────────────────
-
-    def _handle_chat(self, message, history):
-        history = history or []
-        message = message or ""
-        if self.remote_detector is None:
-            return history + [{"role": "assistant", "content": "Error: Click 'Run' first."}], None
-        if not self.stream_to_server_flag:
-            return history + [{"role": "assistant", "content": "Error: Enable 'Stream to Server'."}], None
-        if self.latest_frame is None:
-            return history + [{"role": "assistant", "content": "Error: No frames."}], None
-
-        res = self.remote_detector.chat(self.latest_frame, message)
-        self._handle_agent_response(res)
-
-        audio_path = None
-        if res.audio_response:
-            audio_path = os.path.join(tempfile.gettempdir(), "response.wav")
-            with open(audio_path, "wb") as f:
-                f.write(res.audio_response)
-            if self._agent_state == "READING_ALOUD":
-                self._schedule_reading_continue(res.audio_response)
-
-        history.append({"role": "user", "content": message})
-        history.append({"role": "assistant", "content": res.response})
-        self._chat_history = list(history)
-        return history, audio_path
-
-    def _handle_voice_chat(self, audio_path, history):
-        history = history or []
-        if audio_path is None:
-            return history, None
-        if self.remote_detector is None:
-            return history + [{"role": "assistant", "content": "Error: Click 'Run' first."}], None
-        if not self.stream_to_server_flag:
-            return history + [{"role": "assistant", "content": "Error: Enable 'Stream to Server'."}], None
-        if self.latest_frame is None:
-            return history + [{"role": "assistant", "content": "Error: No frames."}], None
-
-        with open(audio_path, "rb") as f:
-            audio_data = f.read()
-
-        res = self.remote_detector.voice_chat(audio_data)
-        self._handle_agent_response(res)
-
-        out_audio = None
-        if res.audio_response:
-            out_audio = os.path.join(tempfile.gettempdir(), "voice_response.wav")
-            with open(out_audio, "wb") as f:
-                f.write(res.audio_response)
-            if self._agent_state == "READING_ALOUD":
-                self._schedule_reading_continue(res.audio_response)
-
-        history.append({"role": "assistant", "content": res.response})
-        self._chat_history = list(history)
-        return history, out_audio
-
-    def _on_vad_audio(self, audio_bytes: bytes) -> None:
-        """Called from VAD background thread when a speech segment is ready."""
-        if self.remote_detector is None or not self.stream_to_server_flag or self.latest_frame is None:
-            return
+    def _grpc_loop(self, server_addr: str) -> None:
+        channel = None
         try:
-            res = self.remote_detector.voice_chat(audio_bytes)
-            self._handle_agent_response(res)
-            out_audio = None
-            if res.audio_response:
-                out_audio = os.path.join(tempfile.gettempdir(), "vad_response.wav")
-                with open(out_audio, "wb") as f:
-                    f.write(res.audio_response)
-                if self._agent_state == "READING_ALOUD":
-                    self._schedule_reading_continue(res.audio_response)
-            self._chat_history.append({"role": "assistant", "content": f"[Voice] {res.response}"})
-            self._pending_voice_result = (list(self._chat_history), out_audio)
+            channel = grpc.insecure_channel(server_addr)
+            stub = tracking_pb2_grpc.TrackingServiceStub(channel)
+            responses = stub.VoiceChatStream(self._request_iter())
+            self.status = "Connected — Listening..."
+            for chunk in responses:
+                if self._stop.is_set():
+                    break
+                if chunk.pcm_data:
+                    self.status = "AI responding..."
+                    try:
+                        self._play_q.put(chunk.pcm_data, timeout=0.2)
+                    except queue.Full:
+                        pass
+                elif chunk.agent_state:
+                    self._handle_state(chunk.agent_state, chunk.agent_payload)
+                else:
+                    self.status = "Listening..."
+        except grpc.RpcError as e:
+            self.status = f"gRPC error: {e.code().name}"
         except Exception as e:
-            print(f"[VAD] Error submitting audio: {e}")
+            self.status = f"Error: {e}"
+        finally:
+            self.is_running = False
+            if self.status in ("Connected — Listening...", "AI responding...", "Listening..."):
+                self.status = "Disconnected"
+            if channel:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
 
-    def _poll_vad_result(self):
+
+# ── Gradio UI ────────────────────────────────────────────────────────────────
+
+def build_ui() -> gr.Blocks:
+    tracker = LocalTracker()
+    stream_client = LiveStreamClient(tracker)
+
+    # ── Callbacks ─────────────────────────────────────────────────────────
+
+    def _connect(server_ip: str, port: str, source: str, video_path: str):
+        addr = f"{server_ip.strip()}:{port.strip()}"
+        src = 0 if source == "Webcam" else (video_path.strip() or 0)
+        tracker.setup(addr)
+        stream_client.start(addr, src)
+        return "Connecting..."
+
+    def _disconnect():
+        stream_client.stop()
+        tracker.stop()
+        return "Disconnected."
+
+    def _start_tracking(prompt: str):
+        if not prompt.strip():
+            return "Enter a tracking target first."
+        tracker.start(prompt.strip())
+        return f"Searching for '{prompt.strip()}'..."
+
+    def _stop_tracking():
+        tracker.stop()
+        return "Tracking stopped."
+
+    def _set_threshold(value: float):
+        tracker.reid_threshold = value
+
+    def _frame_stream():
+        """Streaming generator: runs at ~20 fps, yields annotated frame + ref image + status."""
         while True:
-            time.sleep(0.3)
-            result = self._pending_voice_result
-            if result is not None:
-                self._pending_voice_result = None
-                history, audio_path = result
-                yield history, audio_path
+            frame = stream_client.latest_frame
+            if frame is not None:
+                tracker.update(frame)
+                if tracker._active and tracker.last_state is not None:
+                    vis = GUIRenderer.render(frame, tracker.last_state)
+                else:
+                    vis = frame
+                rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
             else:
-                yield gr.update(), None
+                rgb = None
 
-    # ── UI ────────────────────────────────────────────────────────────────────
+            ref_img = tracker.ref_image  # RGB or None
 
-    def run(self, video_source: str, prompt: str, server_ip: str, stream_to_server: bool):
-        global ui_image, ui_status, ui_chatbot
-        ui_image = gr.Image(label="Processed GPU Output Pipeline View")
-        ui_status = gr.Textbox(label="Framework Metrics & Connection Status", lines=3, interactive=False)
-        ui_chatbot = gr.Chatbot(label="VLM Conversation History")
+            live_status = stream_client.status
+            track_status = tracker.status
+            combined = live_status
+            if track_status:
+                combined = f"{live_status}\n{track_status}"
 
-        with gr.Blocks(title="Desktop Object Tracker Client") as app:
-            gr.Markdown("## Reactive Intent-Orchestrated Tracker")
+            yield rgb, ref_img, combined
+            time.sleep(0.05)
 
-            with gr.Row():
-                with gr.Column(scale=1):
-                    ui_video = gr.Video(label="Video Input Stream")
-                    with gr.Row():
-                        ui_server_ip = gr.Textbox(value=server_ip, label="gRPC Server IP", scale=3)
-                        ui_grpc_port = gr.Textbox(value="50051", label="gRPC Port", scale=1)
+    # ── Layout ────────────────────────────────────────────────────────────
 
-                    with gr.Accordion("Engine Settings", open=False):
-                        ui_nfeatures = gr.Slider(minimum=100, maximum=3000, step=100, value=800, label="ORB Anchors")
-                        ui_renewal = gr.Slider(minimum=0.5, maximum=10.0, step=0.5, value=1.5, label="Renewal Interval (s)")
-                        ui_stream_toggle = gr.Checkbox(value=stream_to_server, label="Stream to Server GUI")
-                        ui_stream_fps = gr.Slider(minimum=1, maximum=30, step=1, value=3, label="Server Stream FPS")
+    with gr.Blocks(title="Vision Assistant — Desktop") as app:
+        gr.Markdown(
+            "## Vision Assistant — Desktop Client\n"
+            "Voice + camera stream to Gemini Live.  "
+            "**Use headphones** to avoid echo."
+        )
 
-                    btn_start = gr.Button("Run", variant="primary")
-                    btn_stop = gr.Button("Stop", variant="stop")
-                with gr.Column(scale=2):
-                    ui_image.render()
+        with gr.Row():
+            # Left: controls
+            with gr.Column(scale=1):
+                gr.Markdown("### Connection")
+                ui_server_ip = gr.Textbox(value="127.0.0.1", label="Server IP")
+                ui_port      = gr.Textbox(value="50051",     label="gRPC Port")
 
-                    with gr.Group():
-                        ui_chatbot.render()
-                        with gr.Row(equal_height=True):
-                            ui_chat_input = gr.Textbox(
-                                placeholder="Ask something about the current view...",
-                                label=None,
-                                scale=4,
-                                container=False,
-                            )
-                            ui_audio_input = gr.Audio(
-                                sources=["microphone"],
-                                type="filepath",
-                                show_label=False,
-                                scale=3,
-                                container=False,
-                            )
-                            btn_chat = gr.Button("Ask", variant="secondary", scale=1)
-                        ui_vad_status = gr.Textbox(
-                            value="VAD: listening...",
-                            label=None,
-                            interactive=False,
-                            container=False,
-                            lines=1,
-                        )
-                        ui_status.render()
-                        ui_audio_playback = gr.Audio(visible=False, autoplay=True)
+                ui_source = gr.Radio(
+                    ["Webcam", "Video File"], value="Webcam", label="Video Source"
+                )
+                ui_video_path = gr.Textbox(
+                    placeholder="/path/to/video.mp4",
+                    label="Video File Path",
+                    visible=False,
+                )
+                ui_source.change(
+                    fn=lambda s: gr.update(visible=(s == "Video File")),
+                    inputs=[ui_source],
+                    outputs=[ui_video_path],
+                )
 
-            run_event = btn_start.click(
-                fn=self._run_experiment_generator,
-                inputs=[ui_video, ui_server_ip, ui_grpc_port, ui_stream_toggle, ui_nfeatures, ui_renewal, ui_stream_fps],
-                outputs=[ui_image, ui_status],
-            )
-            btn_stop.click(fn=None, cancels=[run_event])
+                btn_connect    = gr.Button("Connect & Stream", variant="primary")
+                btn_disconnect = gr.Button("Disconnect",       variant="stop")
 
-            btn_chat.click(
-                fn=self._handle_chat,
-                inputs=[ui_chat_input, ui_chatbot],
-                outputs=[ui_chatbot, ui_audio_playback],
-            )
+                gr.Markdown("### Local Object Tracking")
+                ui_track_prompt = gr.Textbox(
+                    placeholder="e.g. bottle, person, keys...",
+                    label="Tracking Target",
+                )
+                with gr.Row():
+                    btn_track_start = gr.Button("Start Tracking", variant="secondary")
+                    btn_track_stop  = gr.Button("Stop Tracking")
 
-            ui_audio_input.stop_recording(
-                fn=self._handle_voice_chat,
-                inputs=[ui_audio_input, ui_chatbot],
-                outputs=[ui_chatbot, ui_audio_playback],
-            )
+                ui_threshold = gr.Slider(
+                    minimum=0.0, maximum=1.0, value=0.4, step=0.05,
+                    label="Re-ID Threshold",
+                    info="Minimum embedding similarity to accept a detection as the same object",
+                )
 
-            # Poll for auto-continue audio pushed from background reading timer
-            app.load(
-                fn=self._poll_pending_audio_stream,
-                outputs=[ui_audio_playback],
-            )
+                gr.Markdown("### Reference Object")
+                ui_ref_image = gr.Image(
+                    label="Reference Image",
+                    type="numpy",
+                    height=160,
+                    interactive=False,
+                )
 
-            # Poll for VAD voice results (always-on microphone)
-            app.load(
-                fn=self._poll_vad_result,
-                outputs=[ui_chatbot, ui_audio_playback],
-            )
+                ui_status = gr.Textbox(
+                    label="Status", lines=3, interactive=False
+                )
 
-        print("[DESKTOP GUI] Launching Gradio app...")
-        app.queue().launch(server_name="0.0.0.0", server_port=7861, theme=gr.themes.Monochrome())
+            # Right: camera feed with overlay
+            with gr.Column(scale=2):
+                ui_frame = gr.Image(label="Camera Feed", type="numpy")
+
+        # ── Events ────────────────────────────────────────────────────────
+
+        stream_event = btn_connect.click(
+            fn=_connect,
+            inputs=[ui_server_ip, ui_port, ui_source, ui_video_path],
+            outputs=[ui_status],
+        ).then(
+            fn=_frame_stream,
+            inputs=[],
+            outputs=[ui_frame, ui_ref_image, ui_status],
+        )
+
+        btn_disconnect.click(
+            fn=_disconnect,
+            inputs=[],
+            outputs=[ui_status],
+            cancels=[stream_event],
+        )
+
+        btn_track_start.click(
+            fn=_start_tracking,
+            inputs=[ui_track_prompt],
+            outputs=[ui_status],
+        )
+
+        btn_track_stop.click(
+            fn=_stop_tracking,
+            inputs=[],
+            outputs=[ui_status],
+        )
+
+        ui_threshold.change(
+            fn=_set_threshold,
+            inputs=[ui_threshold],
+            outputs=[],
+        )
+
+    return app
 
 
 if __name__ == "__main__":
-    client_app = DesktopVideoStreamGUI()
-    client_app.run(video_source="test_video.mp4", prompt="Calculator", server_ip="127.0.0.1", stream_to_server=True)
+    build_ui().queue().launch(
+        server_name="0.0.0.0", server_port=7861, theme=gr.themes.Monochrome()
+    )

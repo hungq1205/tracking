@@ -30,6 +30,7 @@ class GroundingDINODetector(IObjectDetector):
             clean_prompt += "."
 
         inputs = self.processor(images=image, text=clean_prompt, return_tensors="pt").to(self.device)
+        input_ids = inputs["input_ids"]
         if self.device.type == "cuda":
             inputs = {k: v.half() if torch.is_floating_point(v) else v for k, v in inputs.items()}
 
@@ -42,7 +43,7 @@ class GroundingDINODetector(IObjectDetector):
 
         results = self.processor.post_process_grounded_object_detection(
             outputs,
-            inputs.input_ids,
+            input_ids,
             threshold=box_threshold,
             text_threshold=text_threshold,
             target_sizes=[(height, width)],
@@ -75,6 +76,7 @@ class GroundingDINODetector(IObjectDetector):
             clean_prompt += "."
 
         inputs = self.processor(images=image, text=clean_prompt, return_tensors="pt").to(self.device)
+        input_ids = inputs["input_ids"]
         if self.device.type == "cuda":
             inputs = {k: v.half() if torch.is_floating_point(v) else v for k, v in inputs.items()}
 
@@ -87,7 +89,7 @@ class GroundingDINODetector(IObjectDetector):
 
         results = self.processor.post_process_grounded_object_detection(
             outputs,
-            inputs.input_ids,
+            input_ids,
             threshold=box_threshold,
             text_threshold=text_threshold,
             target_sizes=[(height, width)],

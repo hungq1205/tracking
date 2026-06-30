@@ -1,14 +1,8 @@
 package com.tracking.client.ui
 
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -45,7 +39,6 @@ fun ChatPanel(
     chatHistory: List<ChatMessage>,
     micVolume: Float,
     isRecording: Boolean,
-    isWaitingResponse: Boolean,
     agentState: String,
     isTtsPlaying: Boolean,
     onStartRecording: () -> Unit,
@@ -54,7 +47,7 @@ fun ChatPanel(
 ) {
     val listState = rememberLazyListState()
 
-    LaunchedEffect(chatHistory.size, isWaitingResponse) {
+    LaunchedEffect(chatHistory.size) {
         if (chatHistory.isNotEmpty()) listState.scrollToItem(chatHistory.size - 1)
     }
 
@@ -83,11 +76,6 @@ fun ChatPanel(
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             items(chatHistory) { msg -> ChatBubble(msg) }
-        }
-
-        // Loading indicator
-        if (isWaitingResponse) {
-            TypingIndicator()
         }
 
         // Push-to-talk button
@@ -135,49 +123,6 @@ fun ChatPanel(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(top = 72.dp)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun TypingIndicator() {
-    val transition = rememberInfiniteTransition(label = "typing")
-    val delays = listOf(0, 160, 320)
-    val alphas = delays.map { delay ->
-        transition.animateFloat(
-            initialValue = 0.3f,
-            targetValue = 1f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(600, delayMillis = delay, easing = FastOutSlowInEasing),
-                repeatMode = RepeatMode.Reverse
-            ),
-            label = "dot$delay"
-        )
-    }
-
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        contentAlignment = Alignment.CenterStart
-    ) {
-        Row(
-            modifier = Modifier
-                .background(Color(0xFF1A1A2E), RoundedCornerShape(12.dp))
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            alphas.forEach { alpha ->
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .background(
-                            Color(0xFF00E5FF).copy(alpha = alpha.value),
-                            CircleShape
-                        )
                 )
             }
         }

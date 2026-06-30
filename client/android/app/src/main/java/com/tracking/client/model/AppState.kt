@@ -10,7 +10,7 @@ data class ChatMessage(
 
 data class AppUiState(
     val connectionState: ConnectionState = ConnectionState.DISCONNECTED,
-    val guidanceData: GuidanceData = GuidanceData(),
+    val guidanceData: ObjectTrack = ObjectTrack(),
     val chatHistory: List<ChatMessage> = emptyList(),
     val agentState: String = "",
     val agentName: String = "",
@@ -19,5 +19,7 @@ data class AppUiState(
     val isRecording: Boolean = false,
     val micVolume: Float = 0f,
     val error: String? = null,
-    val isWaitingResponse: Boolean = false,
+    val guidingDestination: String = "",
+    val guidingRoute: List<String> = emptyList(),
+    val isWalkingMode: Boolean = false,
 )

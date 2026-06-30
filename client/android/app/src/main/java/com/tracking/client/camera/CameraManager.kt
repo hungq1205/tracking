@@ -4,8 +4,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.util.Log
-import android.util.Size
 import androidx.camera.core.*
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
@@ -46,6 +48,10 @@ class CameraManager(private val context: Context) {
 
     fun bind(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
         boundLifecycleOwner = lifecycleOwner
+        // FIT_CENTER: shows the full camera frame without cropping.
+        // The overlay transform uses the same min-scale fit so boxes align exactly.
+        previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
+
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener({
             val provider = future.get()
@@ -58,8 +64,13 @@ class CameraManager(private val context: Context) {
                 .setTargetAspectRatio(AspectRatio.RATIO_4_3)
                 .build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
+            val resolutionSelector = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                .build()
+
             val imageAnalysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(1920, 1080))
+                .setResolutionSelector(resolutionSelector)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
                 .also { analysis ->
@@ -153,7 +164,7 @@ class CameraManager(private val context: Context) {
                     Log.d("CameraManager", "toBitmap: ${bitmap.width}x${bitmap.height}")
                 }
 
-                val jpeg = bitmapToByteArray(bitmap, imageProxy.imageInfo.rotationDegrees)
+                val jpeg = bitmapToJpeg(bitmap, imageProxy.imageInfo.rotationDegrees)
 
                 if (!loggedOnce) {
                     Log.d("CameraManager", "JPEG sent: ${jpeg.size} bytes")
@@ -169,22 +180,30 @@ class CameraManager(private val context: Context) {
         imageProxy.close()
     }
 
-    private fun bitmapToByteArray(src: Bitmap, rotationDegrees: Int): ByteArray {
+    private fun bitmapToJpeg(src: Bitmap, rotationDegrees: Int): ByteArray {
         val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
         val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
 
-        Log.d("CameraManager", "rotated: ${rotated.width}x${rotated.height}")
+        // Downscale to max 640px on the long edge, preserving full frame (no crop)
+        val maxLongEdge = 640
+        val longEdge = maxOf(rotated.width, rotated.height)
+        val scaled = if (longEdge > maxLongEdge) {
+            val scale = maxLongEdge.toFloat() / longEdge
+            Bitmap.createScaledBitmap(
+                rotated,
+                (rotated.width * scale).toInt(),
+                (rotated.height * scale).toInt(),
+                true
+            )
+        } else rotated
 
-        val scale = minOf(1920f / rotated.width, 1080f / rotated.height, 1f)
-        val outW = (rotated.width * scale).toInt()
-        val outH = (rotated.height * scale).toInt()
-        val scaled = Bitmap.createScaledBitmap(rotated, outW, outH, true)
+        Log.d("CameraManager", "sending: ${scaled.width}x${scaled.height}")
 
         val baos = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 75, baos)
+        scaled.compress(Bitmap.CompressFormat.JPEG, 50, baos)
 
+        if (scaled !== rotated) scaled.recycle()
         if (rotated !== src) rotated.recycle()
-        scaled.recycle()
 
         return baos.toByteArray()
     }

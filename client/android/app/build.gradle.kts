@@ -46,10 +46,18 @@ android {
 val grpcVersion = "1.68.1"
 val protobufVersion = "4.28.3"
 val cameraxVersion = "1.3.4"
+val opencvVersion = "4.11.0"
+val mediapipeVersion = "0.10.14"
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.09.03")
     implementation(composeBom)
+    
+    // OpenCV for local feature tracking
+    implementation("org.opencv:opencv:$opencvVersion")
+
+    // MediaPipe for hand landmark detection
+    implementation("com.google.mediapipe:tasks-vision:$mediapipeVersion")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")

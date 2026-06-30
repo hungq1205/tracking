@@ -5,29 +5,26 @@ import grpc
 import os
 from concurrent import futures
 import queue
-import threading
 
 import torch
-import whisper
-from kokoro import KPipeline
 
 import tracking_pb2_grpc
 from map_service import MapServiceServicer
-from agents import TrackingAgent, ReadingAgent, MemoryAgent, NavigationAgent, InfoAgent
-from orchestrator import Orchestrator
 from services.servicer import TrackingServiceServicer
 from server_gui import create_ui
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scan_server"))
+
+from live_session import ToolsBundle, WalkingConfig
 from tools import (
     GroundingDINODetector,
     OCRTool,
     JsonMemoryStore,
     RagStore,
-    KokoroTTS,
-    WhisperASR,
-    create_cloud_vlm_client,
+    DummyRagStore,
+    ObjectStore,
 )
 from tools.depth import SparseObstacleDetector
-from tools.intent_parser import GeneralIntentParser, ReadingIntentParser, TrackingIntentParser, NavigationIntentParser
 from tools.embedder import EfficientNetLiteEmbedder
 
 memory_base_dir = os.getenv("MEMORY_STORE_DIR", os.path.join(os.path.dirname(__file__), "data", "memory"))
@@ -35,9 +32,7 @@ maps_root_dir = os.path.join(os.path.dirname(__file__), "data", "maps")
 rag_model_id = os.getenv("RAG_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
 rag_clip_model_id = os.getenv("RAG_CLIP_MODEL_ID", "clip-ViT-B-32")
 ocr_server_url = os.getenv("OCR_SERVER_URL", "http://localhost:8100")
-cloud_vlm_vendor = os.getenv("CLOUD_VLM_VENDOR", "stub")
-cloud_vlm_api_key = os.getenv("CLOUD_VLM_API_KEY", "")
-gemini_api_key = os.getenv("GEMINI_API_KEY", cloud_vlm_api_key)
+gemini_api_key = os.getenv("GEMINI_API_KEY", "")
 
 gui_frame_queue = queue.Queue(maxsize=10)
 print("[SERVER] Initializing models...")
@@ -59,50 +54,44 @@ else:
     depth_detector = SparseObstacleDetector()
     print("[SERVER] Depth detector: SparseObstacleDetector (ORB triangulation, relative depth)")
 
-_vlm_key = gemini_api_key if cloud_vlm_vendor == "gemini" else cloud_vlm_api_key
-cloud_vlm = create_cloud_vlm_client(vendor=cloud_vlm_vendor, api_key=_vlm_key)
-print(f"[SERVER] Cloud VLM: vendor={cloud_vlm_vendor}.")
-
-general_parser = GeneralIntentParser()
-reading_parser = ReadingIntentParser()
-tracking_parser = TrackingIntentParser()
-navigation_parser = NavigationIntentParser()
 memory_store = JsonMemoryStore(base_dir=memory_base_dir)
-rag_store = RagStore(base_dir=memory_base_dir, model_id=rag_model_id, clip_model_id=rag_clip_model_id)
+object_store = ObjectStore(base_dir=memory_base_dir)
+# rag_store = RagStore(base_dir=memory_base_dir, model_id=rag_model_id, clip_model_id=rag_clip_model_id)
+rag_store = DummyRagStore()
 ocr = OCRTool(url=ocr_server_url)
-asr_model = WhisperASR()
-tts = KokoroTTS()
 
-memory_agent = MemoryAgent(
-    store=memory_store,
-    rag_store=rag_store,
+_da3_onnx_path = os.getenv("DA3_ONNX_PATH", os.path.join(os.path.dirname(__file__), "..", "DA3METRIC-LARGE.onnx"))
+da3_onnx = None
+try:
+    from da3_wrapper import DA3OnnxEstimator
+    if os.path.exists(_da3_onnx_path):
+        da3_onnx = DA3OnnxEstimator(onnx_path=_da3_onnx_path, device=device)
+        print(f"[SERVER] DA3 ONNX loaded from {_da3_onnx_path} — walking mode enabled")
+    else:
+        print(f"[SERVER] DA3 ONNX not found at {_da3_onnx_path} — walking mode disabled")
+except Exception as e:
+    print(f"[SERVER] DA3 ONNX load failed ({e}) — walking mode disabled")
+
+walking_config = WalkingConfig()
+
+tools_bundle = ToolsBundle(
     detector=detector,
-    cloud_vlm=cloud_vlm,
-)
-reading_agent = ReadingAgent(ocr=ocr, rag_store=rag_store)
-tracking_agent = TrackingAgent(detector=detector)
-navigation_agent = NavigationAgent(
     depth_detector=depth_detector,
-    cloud_vlm=cloud_vlm,
-    maps_root_dir=maps_root_dir,
-)
-info_agent = InfoAgent(cloud_vlm=cloud_vlm)
-
-orchestrator = Orchestrator(
-    agents=[tracking_agent, reading_agent, memory_agent, navigation_agent, info_agent],
-    general_parser=general_parser,
-    reading_parser=reading_parser,
-    tracking_parser=tracking_parser,
-    navigation_parser=navigation_parser,
+    ocr=ocr,
     rag_store=rag_store,
+    memory_store=memory_store,
+    maps_root_dir=maps_root_dir,
+    gemini_api_key=gemini_api_key,
+    embedder=embedder,
+    object_store=object_store,
+    da3_onnx=da3_onnx,
+    walking_config=walking_config,
 )
 
 servicer = TrackingServiceServicer(
-    orchestrator=orchestrator,
+    tools_bundle=tools_bundle,
     detector=detector,
     embedder=embedder,
-    asr=asr_model,
-    tts=tts,
     frame_queue=gui_frame_queue,
 )
 
@@ -119,6 +108,6 @@ def _start_grpc_server(servicer_instance):
 
 if __name__ == "__main__":
     grpc_thread = futures.ThreadPoolExecutor(max_workers=1).submit(_start_grpc_server, servicer)
-    app = create_ui(gui_frame_queue, None, orchestrator, servicer)
+    app = create_ui(gui_frame_queue, None, None, servicer)
     print("[SERVER] Launching Gradio app...")
     app.queue().launch(server_name="0.0.0.0", server_port=7860, theme="monochrome")

@@ -206,3 +206,28 @@ class RagStore:
     def get_full_text(self, label: str) -> str:
         meta = self._load_meta(label)
         return "\n".join(c["text"] for c in meta.get("chunks", []))
+
+
+class DummyRagStore:
+    """
+    No-op RAG store that replicates RagStore interface but stores nothing and returns empty results.
+    Useful for testing or when semantic search is disabled.
+    """
+
+    def add_text(self, label: str, text: str, source: str = "ocr") -> None:
+        pass
+
+    def add_image(self, label: str, image: np.ndarray, description: str) -> None:
+        pass
+
+    def add_object(self, label: str, image: np.ndarray, description: str) -> None:
+        pass
+
+    def query_global(self, question: str, top_k: int = 5) -> List[Tuple[str, str, float]]:
+        return []
+
+    def query(self, label: str, question: str, top_k: int = 3) -> List[str]:
+        return []
+
+    def get_full_text(self, label: str) -> str:
+        return ""

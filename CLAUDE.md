@@ -54,19 +54,18 @@ Note that python env is at: server/.venv/
 │    stereo: StereoDepthDetector — plane sweep MVS, metric depth (m)   │
 │  • GroundingDINO   — open-vocab object detection                     │
 │  • EfficientNetLite — re-ID embeddings (cosine ≥ 0.75 = same target)│
-│  • Whisper ASR     — speech-to-text                                  │
-│  • Kokoro TTS      — text-to-speech                                  │
 │  • DocLayoutRapidOCR (remote, paddle_ocr_server port 8100)           │
-│  Cloud VLM (server/tools/cloud_vlm.py) — obstacle ID + scene Q&A   │
-│  • GeminiVLMClient — Gemini Flash with streaming AUDIO output        │
+│  Orchestration: LiveAPISession (live_session.py)                     │
+│  • Gemini Live API (gemini-3.1-flash-live-preview) — ASR + LLM + TTS│
+│  • Per-user WebSocket session; Gemini calls tools via function calls  │
 │  Gradio monitor dashboard (port 7860)                                │
 └───────────┬─────────────────────────────────────────────────────────┘
             │
       ┌─────┴─────┐
       │           │
       ▼           ▼
- Agent system   MapService static
- (below)        server/map_service.py
+ LiveAPISession  MapService static
+ (below)         server/map_service.py
 
 
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -105,10 +104,10 @@ Generated stubs are copied to `server/`, `client/proto/`, `test_module/`.
 |-----|-------|--------|--------------|
 | `DetectObject` | prompt string | box_xyxy + score | GroundingDINO detection |
 | `GetEmbedding` | box_xyxy | float vector | EfficientNetLite embedding for re-ID |
-| `Chat` | text message | text + audio + agent metadata | Text chat → Orchestrator → TTS reply |
-| `VoiceChat` | raw audio bytes | text + audio + agent metadata | Whisper ASR then same as Chat |
-| `StreamFrame` | JPEG bytes | success + optional audio | Real-time frame ingestion; VLM obstacle alerts |
-| `VoiceChatStream` | stream VoiceChatChunk (audio+frames+IMUFrame) | stream AudioChunk (raw PCM) | PTT streaming: accumulate audio+frames+IMU while button held → ASR → intent → INFO: Gemini Flash audio stream; other: Kokoro TTS; IMU frames feed VIOEstimator → `ctx.current_pose` |
+| `Chat` | text message | text response | One-shot Gemini generate (not Live); simple text stub |
+| `VoiceChat` | raw audio bytes | text response | Stub — redirects user to VoiceChatStream |
+| `StreamFrame` | JPEG bytes | success | Stores latest frame for DetectObject/GetEmbedding; no ticks |
+| `VoiceChatStream` | stream VoiceChatChunk (audio+frames) | stream AudioChunk (raw PCM) | Creates LiveAPISession; forwards mic audio to Gemini Live; frame stored server-side; Gemini decides tool calls; PCM audio streamed back |
 
 ### MediatorService (port 50052 on mediator host)
 
@@ -129,62 +128,73 @@ The scan server has **no gRPC**. Map creation is done entirely in-process via `s
 
 ---
 
-## Agent System
+## Live Session / Tool System
 
-**Orchestrator:** `server/orchestrator/orchestrator.py`  
-**Router:** `server/orchestrator/router.py` — picks agent based on detected intent  
-**Session:** `server/orchestrator/session.py` — per-user state (active_agent, scan_buffer, reading_state, …)
+**Entry:** `server/live_session.py` — `LiveAPISession` (one per user `VoiceChatStream` call)  
+**Tool declarations:** `server/live_tools/tool_declarations.py` — all `FunctionDeclaration` dicts + `SYSTEM_PROMPT`  
+**Tool implementations:** `server/live_tools/` — dispatched when Gemini makes function calls
 
-### Intent → Agent routing
+### Architecture
 
 ```
-user utterance / frame
-      │
-      ▼
-Intent parsers (server/tools/intent_parser.py)
-  GeneralIntentParser  · ReadingIntentParser  · TrackingIntentParser
-      │                  NavigationIntentParser (new)
-      ▼
-Intent enum (server/domain/intents.py)
-  START_TRACKING, STOP_TRACKING
-  START_READING, SCAN_PAGE, READ_ALOUD, PAUSE, CONTINUE, BACK, FORWARD,
-  FLIP_DIRECTION
-  SAVE_MEMORY, READ_MEMORY
-  START_NAVIGATION, STOP_NAVIGATION, SET_DESTINATION   ← NAVIGATE_INTENTS
-  INFO, ALERT, …
-      │
-      ▼
-Router selects agent
-      │
-    ┌─┴──────────────────────────────────────────────────────────┐
-    ▼                ▼               ▼            ▼               ▼
-TrackingAgent   ReadingAgent   MemoryAgent  NavigationAgent   InfoAgent
+Android mic audio + JPEG frames
+        │
+  VoiceChatStream RPC (gRPC)
+        │
+  LiveAPISession
+   ├── send_audio_sync(pcm)  ──►  Gemini Live WebSocket  ──►  PCM audio out
+   ├── receive_frame_sync(jpeg) → stored as latest_frame + background ticks
+   │       • OCR tick (1.5 s, if mode=reading)
+   │       • Depth tick (0.5 s, if mode=navigation) → [SYSTEM] obstacle warning
+   │       • Localize tick (2.0 s, if mode=navigation) → proximity check
+   └── _dispatch_tool(name, args) → live_tools/*.py → local models
 ```
 
-### Agents
+### Tools (Gemini calls these as function calls)
 
-| Agent | File | Purpose |
-|-------|------|---------|
-| **TrackingAgent** | `server/agents/tracking_agent.py` | GroundingDINO detect → cosine re-ID verify → spatial guidance payload |
-| **ReadingAgent** | `server/agents/reading_agent.py` | OCR accumulation (SCANNING) → tokenize sentences → sentence-by-sentence TTS (READ_ALOUD); supports direction toggle (LTR/RTL) |
-| **MemoryAgent** | `server/agents/memory_agent.py` | SAVE: OCR buffer → `JsonMemoryStore`; RECALL: RAG semantic search → top-3 hits |
-| **NavigationAgent** | `server/agents/navigation_agent.py` | Online navigation: SET_DESTINATION → route to zone; depth-obstacle loop fires cloud VLM to identify obstacle + alert user; proximity alert on arrival |
-| **InfoAgent** | `server/agents/info_agent.py` | Scene Q&A via `CloudVLMClient`; no local VLM |
+| Tool | File | What it does |
+|------|------|-------------|
+| `get_latest_frame()` | scene_tools | Send stored JPEG to Gemini via `send_realtime_input(video=...)` |
+| `start_vision_stream(reason?)` | scene_tools | 1 fps frame stream to Gemini, auto-stops after 15 s |
+| `stop_vision_stream()` | scene_tools | Cancel vision stream |
+| `run_detection(desc)` | scene_tools | GroundingDINO on latest_frame |
+| `check_obstacle()` | scene_tools | depth_detector on latest_frame |
+| `enter_reading_mode(label?)` | reading_tools | Set mode=reading, reset buffer; passive OCR accumulation begins |
+| `scan_current_view()` | reading_tools | OCR on latest_frame → dedup-append to reading_buffer |
+| `get_reading_section(query)` | reading_tools | Keyword/semantic search over reading_buffer (never feeds full buffer to Gemini) |
+| `flip_reading_direction()` | reading_tools | Toggle ltr/rtl |
+| `exit_reading_mode()` | reading_tools | Clear reading state |
+| `start_tracking(target)` | tracking_tools | GroundingDINO detect, set mode=tracking |
+| `stop_tracking()` | tracking_tools | Clear tracking state |
+| `get_object_from_memory(query)` | tracking_tools | rag_store semantic search, threshold 0.5 |
+| `query_memory(question)` | memory_tools | rag_store semantic search over all labels, threshold 0.5 |
+| `save_memory(label, note)` | memory_tools | memory_store.append + rag_store.add_text |
+| `remember_object(label)` | memory_tools | Detect crop + rag_store.add_object |
+| `list_memory_labels()` | memory_tools | List known memory labels |
+| `start_guiding(dest)` | navigation_tools | Load map, compute route, set mode=guiding; route injected into response |
+| `stop_guiding()` | navigation_tools | Clear guiding state |
+| `get_current_location()` | navigation_tools | PnP localize against map keyframes |
+| `start_walking()` | walking_tools | Set mode=walking; DINO+DA3 ONNX ticks begin at WalkingConfig.detection_interval |
+| `stop_walking()` | walking_tools | Clear walking state |
+| `quick_label_obstacle(label)` | walking_tools | Store label in walking_obstacle_cache with 6 s TTL; included in next DINO prompt |
 
-All agents share the signature:
-```python
-def handle(self, request: AgentRequest) -> AgentResult
-```
-`AgentResult` carries: `agent_name`, `state`, `payload` (JSON), `reply_text`, `speak` flag.
+### LiveSessionState
 
-### Navigation Modes
+Per-user state held in `LiveAPISession.state` (not in Gemini context window):
+- `mode`: idle | reading | tracking | guiding
+- `reading_buffer`: full OCR text (server-side only; accessed via `get_reading_section`)
+- `page_summaries`: brief summaries per scanned page (returned by `scan_current_view`)
+- `nav_route`, `nav_route_idx`, `nav_last_position`: guiding mode progress
+- `walking_obstacle_cache`: list of `{label, expires_at}` with 6 s TTL; used to suppress duplicate obstacle alerts
+- `live_vision_active`: whether 1 fps frame stream is running
 
-Navigation has two distinct modes — see `navigation-state.md` for the full state machine.
+### Navigation / Walking Modes
 
 | Mode | Entry point | Who operates it | What it does |
 |------|------------|-----------------|--------------|
 | **Offline (Scanning)** | `scan_server/` | Our team, pre-deployment | ORB + VIO/GTSAM → dense point cloud via Plane Sweep MVS per keyframe; label zones; Android ScanScreen records video + IMU CSV for upload |
-| **Online (Navigation)** | `server/` — NavigationAgent | End user | Continuous depth obstacle detection → cloud VLM obstacle ID → TTS alert; zone proximity tracking → destination arrival alert |
+| **Online Guiding** | `server/` — LiveAPISession + `start_guiding` tool | End user | Gemini calls `start_guiding(dest)` → route loaded; depth/localize ticks inject `[SYSTEM]` messages to Gemini → Gemini warns user via audio |
+| **Online Walking** | `server/` — LiveAPISession + `start_walking` tool | End user | `start_walking()` = guiding mode with no destination; same DINO+DA3 ONNX obstacle detection, no localization tick |
 
 ---
 
@@ -254,32 +264,34 @@ tracking.proto                   gRPC + protobuf definitions (edit here, regener
 tracking_pb2{,_grpc}.py          Generated — DO NOT EDIT (exists in server/, client/proto/, test_module/)
 
 server/
-  grpc_server.py                 Main server entry point; loads all models; starts gRPC + Gradio
-  services/servicer.py           TrackingServiceServicer — all main-server RPCs
+  grpc_server.py                 Main server entry point; loads models; wires ToolsBundle; starts gRPC + Gradio
+  services/servicer.py           TrackingServiceServicer — gRPC RPCs; VoiceChatStream creates LiveAPISession
   map_service.py                 MapServiceServicer — static map retrieval
-  orchestrator/
-    orchestrator.py              Routes request to agent; manages session
-    router.py                    Intent → agent selection logic
-    session.py                   Per-user session state
-  agents/
-    base.py                      AgentRequest / AgentResult types
-    tracking_agent.py            Object tracking
-    reading_agent.py             OCR + TTS reading
-    memory_agent.py              JsonMemoryStore + RAG save/recall
-    navigation_agent.py          Online navigation: destination routing, depth-obstacle loop, proximity alerts
-    info_agent.py                Scene Q&A via CloudVLMClient
-  domain/intents.py              Intent enum + TRACKING/READING/MEMORY/NAVIGATE_INTENTS sets
+  live_session.py                LiveAPISession + ToolsBundle + LiveSessionState
+                                   One session per VoiceChatStream call; manages Gemini Live WebSocket
+  live_tools/
+    tool_declarations.py         All FunctionDeclaration dicts + SYSTEM_PROMPT
+    scene_tools.py               get_latest_frame, start/stop_vision_stream, run_detection, check_obstacle
+    reading_tools.py             enter/exit_reading_mode, scan_current_view, get_reading_section, flip_reading_direction
+    tracking_tools.py            start_tracking, stop_tracking, get_object_from_memory
+    memory_tools.py              query_memory, save_memory, remember_object, list_memory_labels
+    navigation_tools.py          start_guiding, stop_guiding, get_current_location (mode=guiding)
+    walking_tools.py             start_walking, stop_walking, quick_label_obstacle (mode=walking)
+  ARCHITECTURE.md                Detailed server internals (component map, data flows, tool→function map)
+  domain/types.py                MemoryDocument + MemoryEntry dataclasses (used by memory_store)
   tools/
     detector.py                  GroundingDINO wrapper
     ocr.py                       Remote OCR client
-    tts.py                       Kokoro TTS
-    asr.py                       Whisper ASR
     depth.py                     Obstacle detectors: SparseObstacleDetector (ORB, relative depth, default)
                                    + StereoDepthDetector (plane sweep MVS, metric metres; set DEPTH_MODEL=stereo)
-    cloud_vlm.py                 CloudVLMClient abstract base + vendor impls; GeminiVLMClient.query_stream() yields raw PCM chunks
-    intent_parser.py             LLM-based intent classifiers (incl. NavigationIntentParser)
-    memory_store.py              JSON per-label memory
-    rag_store.py                 Sentence-transformer + CLIP embeddings
+    memory_store.py              JSON per-label memory; filter_new_sentences()
+    rag_store.py                 Sentence-transformer + CLIP embeddings; query_global()
+    localization.py              LocalizationEngine — PnP against map keyframes
+    route_planner.py             RoutePlanner — zone-based path planning
+    embedder.py                  EfficientNetLiteEmbedder — visual re-ID embeddings
+    tts.py                       KokoroTTS — kept for non-Live stubs (optional)
+    asr.py                       WhisperASR — kept for non-Live stubs (optional)
+  _archived/                     Old orchestrator/, agents/, cloud_vlm, intent_parser (reference only)
   data/
     memory/                      {label}.json memory files
     maps/{location_id}/          map_geometry.ply + map_labels.json
@@ -363,27 +375,30 @@ Pi camera → mediator_gui.py (ORB track, hand detect)
 
 ### Online navigation (user walking through a mapped venue)
 ```
-User: "navigate to kitchen" → NavigationAgent (SET_DESTINATION → NAVIGATING)
-  │
-  ├─ Depth loop (each StreamFrame):
-  │    depth.py → forward corridor depth map
-  │    → obstacle below threshold → cloud_vlm.py → describe obstacle
-  │    → Kokoro TTS alert (15 s cooldown per unique obstacle)
-  │
-  └─ Proximity check (each StreamFrame when map loaded):
-       user position vs zone centroids
-       → distance < arrival_radius → "You have arrived at the kitchen"
-       → NavigationAgent state → DESTINATION_REACHED
+User says "navigate to kitchen"
+  → Gemini Live detects intent → calls start_navigation("kitchen")
+  → route computed, injected into Gemini context as function response
+  → Gemini announces route in audio
+
+Each received JPEG frame triggers background ticks:
+  depth tick (0.5 s): SparseObstacleDetector → if obstacle:
+    inject "[SYSTEM] Obstacle ~Xm ahead. Warn user immediately."
+    → Gemini responds in audio (15 s cooldown)
+  localize tick (2.0 s): PnP → check proximity → if at waypoint/destination:
+    inject "[SYSTEM] Passed X, now heading to Y."
+    → Gemini announces in audio
 ```
 
 ### Reading a document aloud
 ```
-"read this" → Whisper ASR → Chat RPC → Orchestrator
-  → Intent: START_READING → ReadingAgent (SCANNING)
-  → each StreamFrame: OCR accumulates into scan_buffer
-  → "continue" → Intent: READ_ALOUD → tokenize sentences
-  → TTS sentence 1 → ChatResponse (audio_response)
-  → auto-continue timer → next sentence …
+User says "read this" or "enter reading mode"
+  → Gemini Live calls enter_reading_mode()
+  → User points camera at text; OCR tick (1.5 s) accumulates text in reading_buffer
+  → User says "scan this" → Gemini calls scan_current_view()
+    → OCR on latest_frame → returns new text → Gemini reads it aloud
+  → User asks question about content → Gemini calls get_reading_section(query)
+    → keyword search over reading_buffer → returns relevant passage
+    → Gemini answers from passage
 ```
 
 ### Environment scanning (offline, team-operated)
@@ -425,14 +440,13 @@ Docker: `docker-compose up` (requires NVIDIA runtime; mounts model volume).
 | Android client | — | Gradle project root: `client/android/`; run `./gradlew build` from there |
 
 Environment variables:
+- `GEMINI_API_KEY` — **required** — API key for Gemini Live API (used by `LiveAPISession`)
 - `OCR_SERVER_URL` — default `http://localhost:8100`
-- `SCAN_GRADIO_PORT` — scan server Gradio port (default 7861)
-- `SCAN_DEVICE` — `cpu` or `cuda` for scan server (unused since DA3 removal)
 - `DEPTH_MODEL` — `sparse` (default, ORB relative depth), `stereo` (plane sweep MVS), or `da3` (Depth Anything 3 + VIO scale alignment)
 - `DA3_MODEL_ID` — DA3 model name (default `depth-anything/da3-large`; also `da3-giant`, `da3metric-large`)
-- `CLOUD_VLM_VENDOR` — cloud VLM provider (`stub` default; `anthropic`, `gemini`, `openrouter` for live)
-- `CLOUD_VLM_API_KEY` — API key for the selected vendor (Anthropic)
-- `GEMINI_API_KEY` — API key for Gemini Flash (used when `CLOUD_VLM_VENDOR=gemini`)
+- `DA3_ONNX_PATH` — path to DA3METRIC ONNX file for walking mode (default `../DA3METRIC-LARGE.onnx`); walking mode is silently disabled if file not found
+- `SCAN_GRADIO_PORT` — scan server Gradio port (default 7861)
+- `SCAN_DEVICE` — `cpu` or `cuda` for scan server (unused since DA3 removal)
 - `OPENROUTER_API_KEY` — API key for OpenRouter (scan server offline semantic mapping; when absent, semantic mapping is silently skipped)
 
 ---

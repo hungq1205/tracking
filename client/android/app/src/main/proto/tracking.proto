@@ -66,12 +66,32 @@ message VoiceChatChunk {
 }
 
 // Single raw-PCM chunk streamed back by the server (24 kHz, 16-bit LE, mono).
+// The final chunk in a VoiceChatStream response has empty pcm_data and carries
+// session metadata so the client can update its agent state.
 message AudioChunk {
   bytes pcm_data = 1;
+  string agent_name = 2;
+  string agent_state = 3;
+  string agent_payload = 4;
+}
+
+message HandData {
+  repeated float landmarks_x = 1;
+  repeated float landmarks_y = 2;
+}
+
+message TrackingData {
+  repeated float box_xyxy = 1;
+  repeated float keypoints_x = 2;
+  repeated float keypoints_y = 3;
+  float confidence = 4;
+  string status = 5;
+  repeated HandData hand_data = 6;
 }
 
 message FrameRequest {
   bytes image_data = 1;
+  TrackingData tracking_data = 2;
 }
 
 message FrameResponse {

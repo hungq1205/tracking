@@ -7,12 +7,25 @@ from typing import Tuple, Optional, Any
 from .interfaces import IObjectTracker, ObjectTrack
 from .helpers import clamp_box_xyxy, box_center, to_gray
 
+_DEFAULT_REID_THRESHOLD = 0.4
+_REFERENCE_DINO_THRESHOLD = 0.6  # min DINO score to capture a reference for non-saved objects
+
+
 class GPUVIOAnchorBackend(IObjectTracker):
     """
-    Lightweight tracking backend for Edge Devices. 
+    Lightweight tracking backend for Edge Devices.
     Runs ORB feature detection and Homography locally.
+    Re-identifies using EfficientNetLite embeddings every 2 seconds.
     """
-    def __init__(self, detector: Any, embedder: Any, nfeatures: int = 1000, max_total_anchors: int = 2000, renewal_interval: float = 1.5):
+    def __init__(
+        self,
+        detector: Any,
+        embedder: Any,
+        nfeatures: int = 1000,
+        max_total_anchors: int = 2000,
+        renewal_interval: float = 2.0,
+        reid_threshold: float = _DEFAULT_REID_THRESHOLD,
+    ):
         self.detector = detector
         self.embedder = embedder
         self.lock = threading.Lock()
@@ -21,48 +34,75 @@ class GPUVIOAnchorBackend(IObjectTracker):
         self.max_total_anchors = max_total_anchors
 
         self.renewal_interval = renewal_interval
+        self.reid_threshold = reid_threshold
         self.last_renewal_time = 0
         self._renewal_running = False
         self._active = False
         self.prompt = None
-        
+        self._description: Optional[str] = None  # appearance description for DINO
+
         self._ref_kp = None
         self._ref_desc = None
-        self._ref_center_cpu = None  
+        self._ref_center_cpu = None
         self._init_wh = (0, 0)
         self._last_box = None
-        self._ref_crop_emb = None
+        self._ref_crop_emb = None   # reference EfficientNetLite embedding (torch.Tensor)
+        self._ref_image: Optional[np.ndarray] = None  # reference crop (BGR) for display
         self._last_H = None
 
     def stop(self):
         self._active = False
 
-    def initialize(self, first_frame_bgr: np.ndarray, prompt: str) -> ObjectTrack:
+    def initialize(
+        self,
+        first_frame_bgr: np.ndarray,
+        prompt: str,
+        description: Optional[str] = None,
+        ref_embedding: Optional[torch.Tensor] = None,
+        ref_image: Optional[np.ndarray] = None,
+    ) -> ObjectTrack:
         self._active = True
         self.prompt = prompt
-        # Calls RemoteGroundingDINO via gRPC
-        det = self.detector.detect(first_frame_bgr, prompt)
-        
+        self._description = description or prompt
+
+        if ref_image is not None:
+            self._ref_image = ref_image
+
+        # Detect using appearance description for better accuracy
+        det = self.detector.detect(first_frame_bgr, self._description)
+
         if det.score == 0.0:
-            return ObjectTrack((0,0,0,0), (0,0), 0.0, False, "DETECTION_FAILED")
+            return ObjectTrack((0, 0, 0, 0), (0, 0), 0.0, False, "DETECTION_FAILED")
 
         h, w = first_frame_bgr.shape[:2]
         self._last_box = clamp_box_xyxy(det.box_xyxy, w, h)
         self._init_wh = (self._last_box[2] - self._last_box[0], self._last_box[3] - self._last_box[1])
-        
+
         cx, cy = box_center(self._last_box)
         self._ref_center_cpu = np.array([[cx, cy, 1.0]], dtype=np.float32).T
 
         gray = to_gray(first_frame_bgr)
         kp, desc = self._orb.detectAndCompute(gray, None)
-        
-        # Calls RemoteEmbedder via gRPC
-        self._ref_crop_emb = self.embedder.get_embedding(first_frame_bgr, self._last_box)
+
+        if ref_embedding is not None:
+            # Saved object: use the pre-computed reference embedding
+            self._ref_crop_emb = ref_embedding
+        elif det.score >= _REFERENCE_DINO_THRESHOLD:
+            # Non-saved, confident detection: compute fresh embedding as reference
+            self._ref_crop_emb = self.embedder.get_embedding(first_frame_bgr, self._last_box)
+            # Capture reference image from the current detection crop
+            if self._ref_image is None:
+                x1, y1, x2, y2 = (int(max(0, v)) for v in self._last_box)
+                x2, y2 = min(x2, w), min(y2, h)
+                if x2 > x1 and y2 > y1:
+                    self._ref_image = first_frame_bgr[y1:y2, x1:x2].copy()
+        else:
+            self._ref_crop_emb = self.embedder.get_embedding(first_frame_bgr, self._last_box)
 
         self._ref_kp = list(kp)
         self._ref_desc = np.array(desc)
         self.last_renewal_time = time.time()
-        
+
         return ObjectTrack(
             box_xyxy=self._last_box,
             center_xy=box_center(self._last_box),
@@ -74,28 +114,47 @@ class GPUVIOAnchorBackend(IObjectTracker):
 
     def _renewal_worker(self, renewal_frame: np.ndarray):
         """
-        Validates tracking against server detection using the frame captured at request time.
-        Replaces anchors if the object is confirmed via embedding similarity.
+        Runs every 2 s: re-detects with DINO (using description), compares embedding
+        similarity to reference. Updates ORB anchors only if similarity >= reid_threshold.
         """
         try:
             if not self._active:
                 return
-            det = self.detector.detect(renewal_frame, self.prompt)
-            if det.score < 0.2: return
+            dino_query = self._description or self.prompt
+            det = self.detector.detect(renewal_frame, dino_query)
+            print(
+                f"[TRACKER] Renewal DINO '{dino_query}' → score={det.score:.3f}",
+                flush=True,
+            )
+            if det.score < 0.2:
+                print("[TRACKER] Renewal skipped: DINO score too low", flush=True)
+                return
 
             new_emb = self.embedder.get_embedding(renewal_frame, det.box_xyxy)
-            if new_emb is None or self._ref_crop_emb is None: return
+            if new_emb is None or self._ref_crop_emb is None:
+                print("[TRACKER] Renewal skipped: missing embedding", flush=True)
+                return
 
-            # Similarity check (> 0.75) against initial embedding
-            similarity = torch.nn.functional.cosine_similarity(self._ref_crop_emb, new_emb).item()
-            
-            if similarity > 0.75:
+            similarity = torch.nn.functional.cosine_similarity(
+                self._ref_crop_emb, new_emb
+            ).item()
+            accepted = similarity > self.reid_threshold
+            print(
+                f"[TRACKER] Re-ID similarity={similarity:.3f}  threshold={self.reid_threshold:.2f}  "
+                f"→ {'ACCEPTED — anchors updated' if accepted else 'REJECTED'}",
+                flush=True,
+            )
+
+            if accepted:
                 gray = to_gray(renewal_frame)
                 kp, desc = self._orb.detectAndCompute(gray, None)
                 if desc is not None:
                     with self.lock:
                         self._last_box = det.box_xyxy
-                        self._init_wh = (self._last_box[2] - self._last_box[0], self._last_box[3] - self._last_box[1])
+                        self._init_wh = (
+                            self._last_box[2] - self._last_box[0],
+                            self._last_box[3] - self._last_box[1],
+                        )
                         cx, cy = box_center(self._last_box)
                         self._ref_center_cpu = np.array([[cx, cy, 1.0]], dtype=np.float32).T
                         self._ref_kp = list(kp)
@@ -105,17 +164,21 @@ class GPUVIOAnchorBackend(IObjectTracker):
             self._renewal_running = False
 
     def update(self, frame_bgr: np.ndarray) -> ObjectTrack:
-        # Trigger periodic renewal in background
-        if self.prompt and not self._renewal_running and (time.time() - self.last_renewal_time > self.renewal_interval):
+        if self.prompt and not self._renewal_running and (
+            time.time() - self.last_renewal_time > self.renewal_interval
+        ):
             self._renewal_running = True
-            threading.Thread(target=self._renewal_worker, args=(frame_bgr.copy(),), daemon=True).start()
+            threading.Thread(
+                target=self._renewal_worker, args=(frame_bgr.copy(),), daemon=True
+            ).start()
 
         with self.lock:
-            if self._ref_desc is None: return ObjectTrack((0,0,0,0),(0,0),0,False,"NOT_INIT")
+            if self._ref_desc is None:
+                return ObjectTrack((0, 0, 0, 0), (0, 0), 0, False, "NOT_INIT")
 
             gray = to_gray(frame_bgr)
             kp, desc = self._orb.detectAndCompute(gray, None)
-            
+
             if desc is None or len(kp) < 10:
                 return ObjectTrack(self._last_box, box_center(self._last_box), 0.0, False, "LOST")
 
@@ -130,7 +193,7 @@ class GPUVIOAnchorBackend(IObjectTracker):
             self._last_H = H
             if H is None:
                 return ObjectTrack(self._last_box, box_center(self._last_box), 0.0, False, "LOST")
-            
+
             transformed_homogeneous = np.dot(H, self._ref_center_cpu)
             new_center = (transformed_homogeneous[:2] / transformed_homogeneous[2]).flatten()
 
@@ -144,8 +207,7 @@ class GPUVIOAnchorBackend(IObjectTracker):
 
             h, w = frame_bgr.shape[:2]
             self._last_box = clamp_box_xyxy(new_box, w, h)
-            
-            # Extract anchor points for the renderer
+
             anchor_pts = dst_pts[inliers.ravel() == 1].reshape(-1, 2).tolist()
 
             return ObjectTrack(
