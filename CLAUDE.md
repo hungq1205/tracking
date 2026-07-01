@@ -469,6 +469,7 @@ Environment variables:
 - `SCAN_GRADIO_PORT` — scan server Gradio port (default 7861)
 - `SCAN_DEVICE` — `cpu` or `cuda` for scan server (unused since DA3 removal)
 - `OPENROUTER_API_KEY` — API key for OpenRouter (scan server offline semantic mapping; when absent, semantic mapping is silently skipped)
+- `YTDLP_COOKIES_FILE` — path to a Netscape-format cookies file passed as `--cookies` to all `yt-dlp` calls in `live_tools/music_tools.py`; needed when YouTube blocks a request with "Sign in to confirm you're not a bot" (export cookies from a logged-in browser session). When unset, `yt-dlp` runs unauthenticated as before.
 
 ---
 

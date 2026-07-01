@@ -1,0 +1,32 @@
+# Applies to `docker build -f server/Dockerfile .` (repo root context) —
+# without this, the build would tar up the whole 13+ GB monorepo (server/.venv/
+# alone is ~12 GB; DA3METRIC-LARGE.onnx is 698 MB; client/ is 754 MB).
+
+.git
+client
+depth-anything-3
+onnx_models
+paddle_ocr_server
+test_module
+ros2-depth-anything-v3-trt
+DA3METRIC-LARGE.onnx
+docker-compose.yml
+Dockerfile
+setup.sh
+navigation-state.md
+CLAUDE.md
+
+# Only server/tools/depth.py's optional DEPTH_MODEL=da3 path and
+# server/grpc_server.py's DA3-ONNX walking mode need anything from scan_server/,
+# and only da3_wrapper.py — the rest (VIO/GTSAM, mvs.py, map exporting) is
+# Scan Server-only tooling, never imported by the live server.
+scan_server/*
+!scan_server/da3_wrapper.py
+
+server/.venv
+server/__pycache__
+server/**/__pycache__
+server/.env
+server/gt.py
+server/_archived
+server/data

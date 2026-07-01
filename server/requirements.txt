@@ -1,0 +1,39 @@
+# Runtime dependencies for server/grpc_server.py (Main Server).
+# Derived from the actual import graph of server/, not a full `pip freeze` of the
+# shared dev venv (server/.venv/ also serves the Mediator and Scan Server, which
+# pull in much heavier packages — gtsam, open3d, evo, pycolmap, mediapipe, xformers —
+# that this process never imports).
+#
+# PyTorch wheels built for CUDA 12.4 (matches the dev venv; the host's NVIDIA driver
+# just needs to support >=12.4, which CUDA 13 drivers do backwards-compatibly).
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# gRPC service
+grpcio==1.81.1
+grpcio-status==1.71.2
+protobuf==5.29.6
+
+# Vision / ML
+# numpy==1.26.4
+opencv-contrib-python==4.13.0.92
+pillow==12.2.0
+transformers==5.12.1
+sentence-transformers==5.6.0
+onnxruntime-gpu==1.17.1
+
+# Gemini Live API (ASR + LLM + TTS orchestration)
+google-genai==2.9.0
+
+# Local read-aloud TTS (bypasses Gemini Live's voice)
+kokoro==0.9.4
+
+# Monitor dashboard (server_gui.py)
+gradio==6.19.0
+matplotlib==3.11.0
+
+# tools/ocr.py (remote OCR client) + live_tools/music_tools.py (shells out to the
+# yt-dlp CLI installed by this package)
+requests==2.34.2
+yt-dlp==2026.6.9

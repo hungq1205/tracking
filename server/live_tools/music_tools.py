@@ -1,11 +1,18 @@
 import asyncio
 import json
+import os
+
+_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "")
+
+
+def _cookie_args() -> list:
+    return ["--cookies", _COOKIES_FILE] if _COOKIES_FILE else []
 
 
 async def search_youtube(session, query: str):
     cmd = [
         "yt-dlp", "--dump-json", "--flat-playlist",
-        f"ytsearch5:{query}", "--no-warnings",
+        f"ytsearch5:{query}", "--no-warnings", *_cookie_args(),
     ]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -40,7 +47,7 @@ async def get_video_info(session, video_ids: list):
     async def _fetch(vid):
         cmd = [
             "yt-dlp", "--dump-json", "--no-warnings",
-            f"https://www.youtube.com/watch?v={vid}",
+            f"https://www.youtube.com/watch?v={vid}", *_cookie_args(),
         ]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -71,18 +78,19 @@ async def extract_stream_url(video_id: str) -> str:
         "yt-dlp", "--get-url",
         "--format", "bestaudio[ext=m4a]/bestaudio/best",
         "--no-warnings",
-        f"https://www.youtube.com/watch?v={video_id}",
+        f"https://www.youtube.com/watch?v={video_id}", *_cookie_args(),
     ]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-    url = stdout.decode().strip().splitlines()[0]
-    if not url:
-        raise RuntimeError(f"yt-dlp returned no URL for video {video_id}")
-    return url
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+    lines = stdout.decode().strip().splitlines()
+    if not lines:
+        err = stderr.decode().strip()
+        raise RuntimeError(f"yt-dlp returned no URL for video {video_id}: {err or 'no output'}")
+    return lines[0]
 
 
 def _fmt_dur(s):
