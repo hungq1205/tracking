@@ -56,23 +56,39 @@ message IMUFrame {
   float gyro_z = 7;
 }
 
+// A device-native tool call routed from Gemini → server → client.
+message DeviceToolCall {
+  string call_id   = 1;   // unique ID; echoed back in DeviceToolResult
+  string name      = 2;   // tool name, e.g. "make_phone_call"
+  string args_json = 3;   // JSON-encoded arguments dict
+}
+
+// Result of a device-native tool execution, sent client → server.
+message DeviceToolResult {
+  string call_id    = 1;  // matches DeviceToolCall.call_id
+  string result_json = 2; // JSON-encoded result dict, e.g. {"status":"dialing"}
+}
+
 // Multiplexed stream sent by client while PTT button is held.
+// capabilities is populated ONLY on the first chunk (handshake); empty thereafter.
 message VoiceChatChunk {
   oneof payload {
-    bytes audio_chunk = 1;  // raw PCM 16-bit LE, 16 kHz mono
-    bytes video_frame = 2;  // JPEG-encoded camera frame
-    IMUFrame imu_frame = 3; // IMU measurement (accelerometer + gyroscope)
+    bytes            audio_chunk  = 1;  // raw PCM 16-bit LE, 16 kHz mono
+    bytes            video_frame  = 2;  // JPEG-encoded camera frame
+    IMUFrame         imu_frame    = 3;  // IMU measurement (accelerometer + gyroscope)
+    DeviceToolResult tool_result  = 4;  // result of a device tool call
   }
+  repeated string capabilities = 5;    // advertised device capabilities (first chunk only)
 }
 
 // Single raw-PCM chunk streamed back by the server (24 kHz, 16-bit LE, mono).
-// The final chunk in a VoiceChatStream response has empty pcm_data and carries
-// session metadata so the client can update its agent state.
+// Chunks with empty pcm_data carry either agent state metadata or a device tool call.
 message AudioChunk {
-  bytes pcm_data = 1;
-  string agent_name = 2;
-  string agent_state = 3;
-  string agent_payload = 4;
+  bytes          pcm_data      = 1;
+  string         agent_name    = 2;
+  string         agent_state   = 3;
+  string         agent_payload = 4;
+  DeviceToolCall tool_call     = 5;  // non-empty when server routes a tool call to the client
 }
 
 message HandData {

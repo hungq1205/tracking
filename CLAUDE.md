@@ -132,7 +132,9 @@ The scan server has **no gRPC**. Map creation is done entirely in-process via `s
 
 **Entry:** `server/live_session.py` — `LiveAPISession` (one per user `VoiceChatStream` call)  
 **Tool declarations:** `server/live_tools/tool_declarations.py` — all `FunctionDeclaration` dicts + `SYSTEM_PROMPT`  
-**Tool implementations:** `server/live_tools/` — dispatched when Gemini makes function calls
+**Device tool declarations:** `server/live_tools/device_tools.py` — `DEVICE_TOOL_DECLARATIONS` + `DEVICE_TOOL_NAMES`; merged into session config only for tools advertised by the client's `capabilities` field  
+**Tool implementations:** `server/live_tools/` — dispatched when Gemini makes function calls  
+**Device tool routing:** Gemini calls a device tool → `_dispatch_tool` queues it in `_device_tool_q` → servicer yields `AudioChunk(tool_call=...)` to Android → Android executes and sends `VoiceChatChunk(tool_result=...)` → servicer calls `receive_tool_result_sync` → Future resolved → result sent back to Gemini
 
 ### Architecture
 
@@ -154,6 +156,9 @@ Android mic audio + JPEG frames
 
 | Tool | File | What it does |
 |------|------|-------------|
+| `make_phone_call(contact_name_or_number)` | device_tools (client) | Routed to Android; fires `Intent.ACTION_CALL` |
+| `set_alarm(time, label?)` | device_tools (client) | Routed to Android; fires `AlarmClock.ACTION_SET_ALARM` |
+| `create_calendar_event(title, start_time, end_time?, description?)` | device_tools (client) | Routed to Android; fires `Intent.ACTION_INSERT` on CalendarContract |
 | `get_latest_frame()` | scene_tools | Send stored JPEG to Gemini via `send_realtime_input(video=...)` |
 | `start_vision_stream(reason?)` | scene_tools | 1 fps frame stream to Gemini, auto-stops after 15 s |
 | `stop_vision_stream()` | scene_tools | Cancel vision stream |
@@ -271,6 +276,7 @@ server/
                                    One session per VoiceChatStream call; manages Gemini Live WebSocket
   live_tools/
     tool_declarations.py         All FunctionDeclaration dicts + SYSTEM_PROMPT
+    device_tools.py              DEVICE_TOOL_DECLARATIONS + DEVICE_TOOL_NAMES (phone/alarm/calendar)
     scene_tools.py               get_latest_frame, start/stop_vision_stream, run_detection, check_obstacle
     reading_tools.py             enter/exit_reading_mode, scan_current_view, get_reading_section, flip_reading_direction
     tracking_tools.py            start_tracking, stop_tracking, get_object_from_memory
@@ -344,8 +350,13 @@ client/
     sensors/
       ImuSensor.kt                 SensorManager wrapper; emits ImuReading Flow at SENSOR_DELAY_FASTEST
       ImuRecorder.kt               Writes imu_data.csv alongside video for offline scan upload
+    device/
+      DeviceToolHandler.kt         Interface for executing device-native tool calls (phone/alarm/calendar)
+      AndroidDeviceToolHandler.kt  Implementation: Intent.ACTION_CALL, AlarmClock, CalendarContract
     ui/
       MainViewModel.kt             doVoiceChatStream() — merges audio+frame+IMU Flow → VoiceChatStream RPC
+                                     Sends capabilities handshake on first chunk; handles AudioChunk.tool_call
+                                     by delegating to DeviceToolHandler and returning VoiceChatChunk.tool_result
       ScanViewModel.kt             Live gRPC scan stream + offline recording (startRecording/stopRecording/uploadToScanServer)
       ScanScreen.kt                3D Scan UI — Record section (video+IMU to file, upload) + Live Stream section
       ScanUiState.kt               State for both live-stream and offline recording modes

@@ -10,11 +10,13 @@ Thread model:
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from google import genai
 from google.genai import types
@@ -108,15 +110,23 @@ class LiveAPISession:
       session.close_sync()                  — graceful teardown
     """
 
-    def __init__(self, tools: ToolsBundle):
+    def __init__(self, tools: ToolsBundle, device_capabilities: Set[str] = frozenset()):
         self.tools = tools
         self.state = LiveSessionState()
+
+        # Device capabilities advertised by the connected client on first chunk
+        self.device_capabilities: Set[str] = set(device_capabilities)
 
         # Latest JPEG frame from Android (updated from gRPC thread, read in async loop)
         self.latest_frame: Optional[bytes] = None
 
         # Thread-safe output queue: PCM bytes or _SENTINEL
         self._output_q: queue.Queue = queue.Queue()
+
+        # Device tool routing: async → sync (servicer drains this to yield AudioChunk.tool_call)
+        self._device_tool_q: queue.Queue = queue.Queue()
+        # Pending futures waiting for client's DeviceToolResult: call_id → asyncio.Future
+        self._device_result_futures: Dict[str, asyncio.Future] = {}
 
         # Async internals (set up in _run)
         self._input_q: Optional[asyncio.Queue] = None
@@ -204,17 +214,46 @@ class LiveAPISession:
             self._loop.call_soon_threadsafe(self._input_q.put_nowait, ("close", None))
         self._done_event.wait(timeout=8)
 
+    def receive_tool_result_sync(self, call_id: str, result_json: str) -> None:
+        """Called from gRPC feed thread when Android sends back a DeviceToolResult."""
+        future = self._device_result_futures.pop(call_id, None)
+        if future and not future.done() and self._loop:
+            try:
+                result = json.loads(result_json)
+            except Exception:
+                result = {"raw": result_json}
+            self._loop.call_soon_threadsafe(future.set_result, result)
+
+    def pop_device_tool_calls(self) -> list:
+        """Drain pending device tool calls to be forwarded to the client."""
+        items = []
+        while True:
+            try:
+                items.append(self._device_tool_q.get_nowait())
+            except queue.Empty:
+                break
+        return items
+
     # ── Async core ────────────────────────────────────────────────────────────
 
     async def _run(self, ready_event: threading.Event) -> None:
         from live_tools.tool_declarations import TOOL_DECLARATIONS, SYSTEM_PROMPT
+        from live_tools.device_tools import DEVICE_TOOL_DECLARATIONS, DEVICE_TOOL_NAMES
 
         self._input_q = asyncio.Queue()
         client = genai.Client(api_key=self.tools.gemini_api_key)
 
+        # Merge base declarations with whichever device tools the client advertised
+        active_device_decls = [
+            d for d in DEVICE_TOOL_DECLARATIONS if d["name"] in self.device_capabilities
+        ]
+        merged_declarations = [
+            {"function_declarations": TOOL_DECLARATIONS[0]["function_declarations"] + active_device_decls}
+        ]
+
         config = types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
-            tools=TOOL_DECLARATIONS,
+            tools=merged_declarations,
             system_instruction=types.Content(parts=[types.Part(text=SYSTEM_PROMPT)]),
             context_window_compression=types.ContextWindowCompressionConfig(
                 trigger_tokens=25600,
@@ -528,14 +567,28 @@ class LiveAPISession:
     # ── Tool dispatcher ───────────────────────────────────────────────────────
 
     async def _dispatch_tool(self, name: str, args: Dict[str, Any]) -> Any:
+        # Device tools are routed to the connected client, not executed server-side
+        if name in self.device_capabilities:
+            call_id = str(uuid.uuid4())
+            future: asyncio.Future = self._loop.create_future()
+            self._device_result_futures[call_id] = future
+            self._device_tool_q.put_nowait({"call_id": call_id, "name": name, "args": args})
+            try:
+                return await asyncio.wait_for(asyncio.shield(future), timeout=30.0)
+            except asyncio.TimeoutError:
+                self._device_result_futures.pop(call_id, None)
+                print(f"[LiveSession] Device tool {name} timed out after 30s", flush=True)
+                return {"error": "Device did not respond in time"}
+
         from live_tools.scene_tools import HANDLERS as SCENE
         from live_tools.reading_tools import HANDLERS as READING
         from live_tools.tracking_tools import HANDLERS as TRACKING
         from live_tools.memory_tools import HANDLERS as MEMORY
         from live_tools.navigation_tools import HANDLERS as NAV
         from live_tools.walking_tools import HANDLERS as WALKING
+        from live_tools.time_tools import HANDLERS as TIME
 
-        ALL = {**SCENE, **READING, **TRACKING, **MEMORY, **NAV, **WALKING}
+        ALL = {**SCENE, **READING, **TRACKING, **MEMORY, **NAV, **WALKING, **TIME}
         handler = ALL.get(name)
         if handler is None:
             return {"error": f"Unknown tool: {name}"}

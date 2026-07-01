@@ -1,3 +1,5 @@
+import itertools
+import json
 import queue as _queue
 import traceback
 
@@ -107,11 +109,19 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         """
         Bidirectional streaming RPC.
 
-        Receives VoiceChatChunk stream (audio PCM + video JPEG + IMU) from Android.
+        Receives VoiceChatChunk stream (audio PCM + video JPEG + IMU + tool results) from Android.
         Creates a LiveAPISession, forwards audio/video to Gemini Live, and yields
-        24 kHz PCM AudioChunk responses back to the client.
+        24 kHz PCM AudioChunk responses (and device tool calls) back to the client.
+
+        The first chunk is consumed before the session starts to extract device capabilities.
         """
-        session = LiveAPISession(tools=self.tools_bundle)
+        # Read first chunk for capability negotiation (capabilities field, non-oneof)
+        first_chunk = next(iter(request_iterator), None)
+        caps = set(first_chunk.capabilities) if first_chunk else set()
+        if caps:
+            print(f"[VoiceChatStream] Device capabilities: {caps}", flush=True)
+
+        session = LiveAPISession(tools=self.tools_bundle, device_capabilities=caps)
         try:
             session.start_sync()
         except Exception as e:
@@ -122,23 +132,31 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
 
         self.current_session = session
 
+        def _process_chunk(chunk):
+            which = chunk.WhichOneof("payload")
+            if which == "audio_chunk":
+                pcm = bytes(chunk.audio_chunk)
+                if pcm:
+                    session.send_audio_sync(pcm)
+                else:
+                    # Empty chunk = PTT released → flush Gemini's audio buffer
+                    session.send_audio_end_sync()
+            elif which == "video_frame":
+                jpeg = bytes(chunk.video_frame)
+                self.latest_frame = self._decode_image(jpeg)  # keep for DetectObject
+                session.receive_frame_sync(jpeg)
+            elif which == "tool_result":
+                tr = chunk.tool_result
+                session.receive_tool_result_sync(tr.call_id, tr.result_json)
+            # IMU frames ignored in Live path (VIO not used in Live session)
+
         # Background thread reads from Android and feeds the session
         def _feed_session():
             try:
-                for chunk in request_iterator:
-                    which = chunk.WhichOneof("payload")
-                    if which == "audio_chunk":
-                        pcm = bytes(chunk.audio_chunk)
-                        if pcm:
-                            session.send_audio_sync(pcm)
-                        else:
-                            # Empty chunk = PTT released → flush Gemini's audio buffer
-                            session.send_audio_end_sync()
-                    elif which == "video_frame":
-                        jpeg = bytes(chunk.video_frame)
-                        self.latest_frame = self._decode_image(jpeg)  # keep for DetectObject
-                        session.receive_frame_sync(jpeg)
-                    # IMU frames ignored in Live path (VIO not used in Live session)
+                # Replay first chunk if it had a payload (capabilities-only chunks have no payload)
+                chunks = itertools.chain([first_chunk], request_iterator) if first_chunk else request_iterator
+                for chunk in chunks:
+                    _process_chunk(chunk)
             except Exception as exc:
                 print(f"[VoiceChatStream] Feed error: {exc}", flush=True)
             finally:
@@ -148,7 +166,7 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         feed_thread = threading.Thread(target=_feed_session, daemon=True, name="gRPC-feed")
         feed_thread.start()
 
-        # Yield PCM audio chunks and state-update notifications to the client
+        # Yield PCM audio chunks, state-update notifications, and device tool calls to the client
         try:
             while not session.is_done():
                 try:
@@ -169,6 +187,16 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
                         )
                 except _queue.Empty:
                     pass
+                # Forward pending device tool calls to the client
+                for tc in session.pop_device_tool_calls():
+                    print(f"[VoiceChatStream] Routing device tool: {tc['name']} id={tc['call_id']}", flush=True)
+                    yield tracking_pb2.AudioChunk(
+                        tool_call=tracking_pb2.DeviceToolCall(
+                            call_id=tc["call_id"],
+                            name=tc["name"],
+                            args_json=json.dumps(tc["args"]),
+                        )
+                    )
         except Exception as e:
             print(f"[VoiceChatStream] Yield error: {e}", flush=True)
         finally:

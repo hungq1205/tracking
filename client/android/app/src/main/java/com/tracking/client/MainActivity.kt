@@ -28,7 +28,14 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         permissionLauncher.launch(
-            arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+            arrayOf(
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.CALL_PHONE,
+                Manifest.permission.READ_CONTACTS,
+                Manifest.permission.READ_CALENDAR,
+                Manifest.permission.WRITE_CALENDAR,
+            )
         )
 
         setContent {

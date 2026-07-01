@@ -9,6 +9,8 @@ import com.google.protobuf.ByteString
 import com.tracking.client.audio.PushToTalkRecorder
 import com.tracking.client.audio.StreamingAudioPlayer
 import com.tracking.client.camera.CameraManager
+import com.tracking.client.device.AndroidDeviceToolHandler
+import com.tracking.client.device.DeviceToolHandler
 import com.tracking.client.edge.LocalEdgeDevice
 import com.tracking.client.edge.SessionResult
 import com.tracking.client.grpc.GrpcClientManager
@@ -47,6 +49,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val streamingPlayer = StreamingAudioPlayer()
     private val trackingBackend by lazy { TrackingBackend(grpcManager) }
     private val handTracker by lazy { HandTracker(getApplication()) }
+    private val deviceToolHandler: DeviceToolHandler = AndroidDeviceToolHandler(app)
 
     val edgeDevice: LocalEdgeDevice = LocalEdgeDevice(cameraManager)
 
@@ -240,10 +243,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
+        // Channel for injecting DeviceToolResult chunks back into the request stream
+        val toolResultChannel = Channel<Tracking.VoiceChatChunk>(Channel.BUFFERED)
+
         // requestFlow stays open until audioChannel is closed (on disconnect).
         // Video uses send() — suspends if gRPC is backpressured, conflate() keeps only latest.
         // Audio uses send() — suspends to guarantee delivery.
         val requestFlow = channelFlow<Tracking.VoiceChatChunk> {
+            // Handshake: advertise device capabilities on the very first chunk
+            send(
+                Tracking.VoiceChatChunk.newBuilder()
+                    .addAllCapabilities(deviceToolHandler.capabilities)
+                    .build()
+            )
+
             val videoJob = launch {
                 edgeDevice.frameFlow.conflate().collect { jpeg ->
                     send(Tracking.VoiceChatChunk.newBuilder()
@@ -264,6 +277,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } else null
 
+            // Forward tool results from the local handler back to the server
+            val toolResultJob = launch {
+                toolResultChannel.receiveAsFlow().collect { resultChunk -> send(resultChunk) }
+            }
+
             audioChannel.receiveAsFlow().collect { pcm ->
                 send(Tracking.VoiceChatChunk.newBuilder()
                     .setAudioChunk(ByteString.copyFrom(pcm)).build())
@@ -271,19 +289,39 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // Reaches here only when audioChannel is closed (disconnect)
             videoJob.cancel()
             imuJob?.cancel()
+            toolResultJob.cancel()
         }
 
         streamingPlayer.start()
         try {
             stub.voiceChatStream(requestFlow).collect { chunk ->
                 val pcm = chunk.pcmData.toByteArray()
-                if (pcm.isNotEmpty()) {
-                    streamingPlayer.writeChunk(pcm)
-                    edgeDevice.emitAudio(pcm)
-                }
-                if (pcm.isEmpty() && chunk.agentState.isNotEmpty()) {
-                    Log.d(TAG, "state chunk: state=${chunk.agentState} payload=${chunk.agentPayload}")
-                    applySessionResult(SessionResult("", chunk.agentState, chunk.agentPayload))
+                when {
+                    pcm.isNotEmpty() -> {
+                        streamingPlayer.writeChunk(pcm)
+                        edgeDevice.emitAudio(pcm)
+                    }
+                    chunk.agentState.isNotEmpty() -> {
+                        Log.d(TAG, "state chunk: state=${chunk.agentState} payload=${chunk.agentPayload}")
+                        applySessionResult(SessionResult("", chunk.agentState, chunk.agentPayload))
+                    }
+                    chunk.hasToolCall() -> {
+                        val call = chunk.toolCall
+                        Log.d(TAG, "device tool call: ${call.name} id=${call.callId}")
+                        // Execute off the main collection coroutine so we don't block audio
+                        viewModelScope.launch(Dispatchers.IO) {
+                            val resultJson = deviceToolHandler.execute(call)
+                            val resultChunk = Tracking.VoiceChatChunk.newBuilder()
+                                .setToolResult(
+                                    Tracking.DeviceToolResult.newBuilder()
+                                        .setCallId(call.callId)
+                                        .setResultJson(resultJson)
+                                        .build()
+                                )
+                                .build()
+                            toolResultChannel.trySend(resultChunk)
+                        }
+                    }
                 }
             }
         } catch (e: CancellationException) {
@@ -292,6 +330,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             Log.e(TAG, "liveSession error: ${e.message}")
             appendSystemMessage("[Session] Reconnecting…")
         } finally {
+            toolResultChannel.close()
             streamingPlayer.stop()
             _uiState.update { it.copy(isTtsPlaying = false) }
         }

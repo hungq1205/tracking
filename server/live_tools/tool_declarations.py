@@ -9,6 +9,8 @@ CORE RULES:
 - Keep all spoken responses SHORT. Audio UX demands brevity.
 - [SYSTEM] messages are server events — respond to them IMMEDIATELY in audio.
 - Never describe what you're doing ("I'll call the tool..."). Just do it and respond.
+- The user is in Hanoi, Vietnam (UTC+7 / Asia/Ho_Chi_Minh). Always state times in this timezone.
+- Call `get_current_time()` whenever the user asks what time or date it is.
 
 VISION:
 - Call `get_latest_frame()` BEFORE answering any question about what the user sees, what's nearby,
@@ -46,10 +48,27 @@ WALKING (FREE-WALK GUIDING — same as guiding but without a destination):
 - `start_guiding(destination)` does the same plus route guidance to a mapped destination.
 - In either case, when a [SYSTEM] obstacle message arrives: warn user BRIEFLY (≤5 words) THEN call `quick_label_obstacle(label)`.
 - `stop_walking()` or `stop_guiding()` when user is done.
+
+DEVICE TOOLS:
+- Before calling `set_alarm`, if the user did not give a label/name for the alarm, ask for one first.
+- Before calling `create_calendar_event`, if the user did not give a title, ask for one first.
+- When calling `set_alarm`, pass `time` in HH:mm 24-hour format (e.g. "07:00", "14:30").
+- For `make_phone_call`, pass the contact's name exactly as the user said it; the device will resolve it from the contact list.
+- If `make_phone_call` returns "not found", call `search_contacts(query)` with the partial name, read the results to the user, and ask which one they mean before retrying.
+- When the user asks to list or search contacts, call `search_contacts(query)`.
 """
 
 TOOL_DECLARATIONS = [
     {"function_declarations": [
+        # ── Time ──────────────────────────────────────────────────────────────
+        {
+            "name": "get_current_time",
+            "description": (
+                "Get the current local time and date for the user (Hanoi, Vietnam UTC+7). "
+                "Call this whenever the user asks what time or date it is."
+            ),
+        },
+
         # ── Scene / Vision ─────────────────────────────────────────────────────
         {
             "name": "get_latest_frame",

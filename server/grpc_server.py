@@ -32,7 +32,7 @@ maps_root_dir = os.path.join(os.path.dirname(__file__), "data", "maps")
 rag_model_id = os.getenv("RAG_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
 rag_clip_model_id = os.getenv("RAG_CLIP_MODEL_ID", "clip-ViT-B-32")
 ocr_server_url = os.getenv("OCR_SERVER_URL", "http://localhost:8100")
-gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+gemini_api_key = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6Lr2C7-ZasjbHtX-BC7QST_uR73D_sWOn-6D84SAzdQ4A")
 
 gui_frame_queue = queue.Queue(maxsize=10)
 print("[SERVER] Initializing models...")
