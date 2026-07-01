@@ -27,7 +27,7 @@ tools/
   memory_store.py       JsonMemoryStore — per-label JSON files; filter_new_sentences()
   localization.py       LocalizationEngine — PnP against map keyframes
   route_planner.py      RoutePlanner — zone-based path planning from map_labels.json
-  embedder.py           EfficientNetLiteEmbedder — visual re-ID embeddings
+  embedder.py           DINOv2Embedder (ViT-S/14) — visual re-ID embeddings
 
 map_service.py          MapServiceServicer — streams PLY files from data/maps/
 interfaces.py           IObjectDetector abstract base

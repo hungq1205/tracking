@@ -18,17 +18,13 @@ class DocLayoutRapidOCRTool:
         if not ok:
             return []
 
-        try:
-            resp = requests.post(
-                f"{self._url}/ocr",
-                files={"image": ("frame.jpg", buf.tobytes(), "image/jpeg")},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            return resp.json().get("blocks", [])
-        except Exception as e:
-            print(f"[OCR] request failed: {e}")
-            return []
+        resp = requests.post(
+            f"{self._url}/ocr",
+            files={"image": ("frame.jpg", buf.tobytes(), "image/jpeg")},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("blocks", [])
 
     def beat_blocks(self, frame: np.ndarray, direction: str = "ltr") -> list:
         blocks = self.read_blocks(frame, direction)
@@ -64,4 +60,4 @@ class DocLayoutRapidOCRTool:
         return sorted(blocks, key=lambda b: b["box"][0], reverse=reverse)
 
     def read_text(self, frame: np.ndarray, direction: str = "ltr") -> str:
-        return " ".join(self.read_blocks(frame, direction))
+        return " ".join(b["text"] for b in self.read_blocks(frame, direction))

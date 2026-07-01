@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.ContactsContract
@@ -16,7 +17,7 @@ import java.util.Calendar
 
 class AndroidDeviceToolHandler(private val context: Context) : DeviceToolHandler {
 
-    override val capabilities = listOf("make_phone_call", "set_alarm", "create_calendar_event", "search_contacts")
+    override val capabilities = listOf("make_phone_call", "set_alarm", "create_calendar_event", "search_contacts", "play_video", "stop_music")
 
     override suspend fun execute(toolCall: Tracking.DeviceToolCall): String {
         val args = try { JSONObject(toolCall.argsJson) } catch (e: Exception) { JSONObject() }
@@ -27,6 +28,8 @@ class AndroidDeviceToolHandler(private val context: Context) : DeviceToolHandler
                 "set_alarm"             -> setAlarm(args)
                 "create_calendar_event" -> createCalendarEvent(args)
                 "search_contacts"       -> searchContacts(args)
+                "play_video"            -> playVideo(args)
+                "stop_music"            -> stopMusic()
                 else -> """{"error":"Unknown device tool: ${toolCall.name}"}"""
             }
         } catch (e: Exception) {
@@ -192,6 +195,30 @@ class AndroidDeviceToolHandler(private val context: Context) : DeviceToolHandler
         } catch (e: Exception) {
             null
         }
+    }
+
+    private fun stopMusic(): String {
+        context.stopService(Intent(context, PlaybackService::class.java))
+        return """{"status":"stopped"}"""
+    }
+
+    private fun playVideo(args: JSONObject): String {
+        val videoId   = args.optString("video_id", "")
+        val streamUrl = args.optString("stream_url", "")
+        val title     = args.optString("title", "")
+        val channel   = args.optString("channel", "")
+        if (streamUrl.isBlank()) return """{"error":"No stream URL provided"}"""
+        val intent = Intent(context, PlaybackService::class.java).apply {
+            putExtra("stream_url", streamUrl)
+            putExtra("video_id", videoId)
+            putExtra("title", title)
+            putExtra("channel", channel)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            context.startForegroundService(intent)
+        else
+            context.startService(intent)
+        return """{"status":"playing","video_id":"$videoId"}"""
     }
 
     companion object {

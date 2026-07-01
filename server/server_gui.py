@@ -24,15 +24,24 @@ def _current_tab_id(mode: str) -> str:
     }.get(mode, "tab_info")
 
 
-def _annotate_tracking(frame_bgr: np.ndarray, detection: Optional[dict]) -> np.ndarray:
+def _annotate_tracking(
+    frame_bgr: np.ndarray, detection: Optional[dict], hand_box: Optional[list] = None,
+) -> np.ndarray:
     vis = frame_bgr.copy()
-    if detection and detection.get("score", 0) > 0.3:
+    if detection and detection.get("box_xyxy"):
         x1, y1, x2, y2 = map(int, detection["box_xyxy"])
-        label = f"{detection.get('target', '?')}: {detection['score']:.2f}"
+        label = f"{detection.get('target', '?')}"
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 2)
         cv2.putText(
             vis, label, (x1, max(y1 - 8, 14)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2, cv2.LINE_AA,
+        )
+    if hand_box and len(hand_box) == 4:
+        hx1, hy1, hx2, hy2 = map(int, hand_box)
+        cv2.rectangle(vis, (hx1, hy1), (hx2, hy2), (255, 140, 0), 2)
+        cv2.putText(
+            vis, "hand", (hx1, max(hy1 - 8, 14)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 140, 0), 2, cv2.LINE_AA,
         )
     return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
 
@@ -49,6 +58,17 @@ def _reading_html(state) -> str:
         items = "".join(f"<li style='color:#ccc;margin:3px 0'>{s}</li>" for s in summaries)
         summaries_html = f"<ul style='margin:8px 0;padding-left:18px'>{items}</ul>"
 
+    text_html = ""
+    if buf:
+        escaped = (
+            buf.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
+        text_html = (
+            f"<div style='margin-top:10px;padding:8px;background:#0d0d0d;border-radius:4px;"
+            f"max-height:300px;overflow-y:auto;color:#ddd;white-space:pre-wrap'>{escaped}</div>"
+        )
+
     return (
         f"<div style='font-family:monospace;padding:10px;background:#111;border-radius:6px'>"
         f"<p style='color:#4af;margin:0 0 6px'><b>READING MODE</b>"
@@ -57,6 +77,7 @@ def _reading_html(state) -> str:
         f"Direction: {direction}  ·  Buffer: {len(buf)} chars / {words} words  ·  "
         f"Pages scanned: {len(summaries)}</p>"
         f"{summaries_html}"
+        f"{text_html}"
         f"</div>"
     )
 
@@ -191,14 +212,17 @@ def create_ui(gui_frame_queue, _vlm_unused, orchestrator=None, servicer=None) ->
 
         # --- Tracking tab ---
         det = state.last_detection if state else None
+        hand_box = state.last_hand_box if state else None
         track_frame = (
-            _annotate_tracking(frame_bgr, det) if (frame_bgr is not None and det)
+            _annotate_tracking(frame_bgr, det, hand_box)
+            if (frame_bgr is not None and (det or hand_box))
             else frame_rgb
         )
         if state and state.mode == "tracking":
             track_status = f"Target: {state.tracking_target}"
             if det:
-                track_status += f"  Score: {det.get('score', 0):.2f}"
+                track_status += f"  Score: {det.get('score', 0):.2f}  Status: {det.get('status', '?')}"
+            track_status += f"  Hand: {'visible' if hand_box else 'not visible'}"
         else:
             track_status = "Tracking idle"
 

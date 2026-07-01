@@ -25,21 +25,22 @@ from tools import (
     ObjectStore,
 )
 from tools.depth import SparseObstacleDetector
-from tools.embedder import EfficientNetLiteEmbedder
+from tools.embedder import DINOv2Embedder
 
+gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+
+ocr_server_url = os.getenv("OCR_SERVER_URL", "")
 memory_base_dir = os.getenv("MEMORY_STORE_DIR", os.path.join(os.path.dirname(__file__), "data", "memory"))
-maps_root_dir = os.path.join(os.path.dirname(__file__), "data", "maps")
 rag_model_id = os.getenv("RAG_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
-rag_clip_model_id = os.getenv("RAG_CLIP_MODEL_ID", "clip-ViT-B-32")
-ocr_server_url = os.getenv("OCR_SERVER_URL", "http://localhost:8100")
-gemini_api_key = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6Lr2C7-ZasjbHtX-BC7QST_uR73D_sWOn-6D84SAzdQ4A")
+
+maps_root_dir = os.path.join(os.path.dirname(__file__), "data", "maps")
 
 gui_frame_queue = queue.Queue(maxsize=10)
 print("[SERVER] Initializing models...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 detector = GroundingDINODetector()
-embedder = EfficientNetLiteEmbedder()
+embedder = DINOv2Embedder()
 
 _depth_model = os.getenv("DEPTH_MODEL", "sparse")
 if _depth_model == "stereo":
@@ -56,8 +57,8 @@ else:
 
 memory_store = JsonMemoryStore(base_dir=memory_base_dir)
 object_store = ObjectStore(base_dir=memory_base_dir)
-# rag_store = RagStore(base_dir=memory_base_dir, model_id=rag_model_id, clip_model_id=rag_clip_model_id)
-rag_store = DummyRagStore()
+rag_store = RagStore(base_dir=memory_base_dir, image_embedder=embedder, model_id=rag_model_id)
+# rag_store = DummyRagStore()
 ocr = OCRTool(url=ocr_server_url)
 
 _da3_onnx_path = os.getenv("DA3_ONNX_PATH", os.path.join(os.path.dirname(__file__), "..", "DA3METRIC-LARGE.onnx"))
@@ -74,6 +75,14 @@ except Exception as e:
 
 walking_config = WalkingConfig()
 
+tts = None
+try:
+    from tools.tts import KokoroTTS
+    tts = KokoroTTS()
+    print("[SERVER] KokoroTTS loaded — local read-aloud enabled")
+except Exception as e:
+    print(f"[SERVER] KokoroTTS load failed ({e}) — local read-aloud disabled")
+
 tools_bundle = ToolsBundle(
     detector=detector,
     depth_detector=depth_detector,
@@ -86,6 +95,7 @@ tools_bundle = ToolsBundle(
     object_store=object_store,
     da3_onnx=da3_onnx,
     walking_config=walking_config,
+    tts=tts,
 )
 
 servicer = TrackingServiceServicer(

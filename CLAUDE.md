@@ -53,7 +53,7 @@ Note that python env is at: server/.venv/
 │    sparse (default): SparseObstacleDetector — ORB relative depth     │
 │    stereo: StereoDepthDetector — plane sweep MVS, metric depth (m)   │
 │  • GroundingDINO   — open-vocab object detection                     │
-│  • EfficientNetLite — re-ID embeddings (cosine ≥ 0.75 = same target)│
+│  • DINOv2 ViT-S/14 — re-ID embeddings (cosine ≥ 0.75 = same target) │
 │  • DocLayoutRapidOCR (remote, paddle_ocr_server port 8100)           │
 │  Orchestration: LiveAPISession (live_session.py)                     │
 │  • Gemini Live API (gemini-3.1-flash-live-preview) — ASR + LLM + TTS│
@@ -103,11 +103,11 @@ Generated stubs are copied to `server/`, `client/proto/`, `test_module/`.
 | RPC | Input | Output | What it does |
 |-----|-------|--------|--------------|
 | `DetectObject` | prompt string | box_xyxy + score | GroundingDINO detection |
-| `GetEmbedding` | box_xyxy | float vector | EfficientNetLite embedding for re-ID |
+| `GetEmbedding` | box_xyxy | float vector | DINOv2 ViT-S/14 embedding for re-ID |
 | `Chat` | text message | text response | One-shot Gemini generate (not Live); simple text stub |
 | `VoiceChat` | raw audio bytes | text response | Stub — redirects user to VoiceChatStream |
 | `StreamFrame` | JPEG bytes | success | Stores latest frame for DetectObject/GetEmbedding; no ticks |
-| `VoiceChatStream` | stream VoiceChatChunk (audio+frames) | stream AudioChunk (raw PCM) | Creates LiveAPISession; forwards mic audio to Gemini Live; frame stored server-side; Gemini decides tool calls; PCM audio streamed back |
+| `VoiceChatStream` | stream VoiceChatChunk (audio+frames+tracking_data) | stream AudioChunk (raw PCM) | Creates LiveAPISession; forwards mic audio to Gemini Live; frame stored server-side; `VoiceChatChunk.tracking_data` (object+hand boxes from Android's on-device tracker, sent while mode=tracking) updates `state.last_detection`/`state.last_hand_box` live; Gemini decides tool calls; PCM audio streamed back (either Gemini's voice or local TTS via `read_aloud`) |
 
 ### MediatorService (port 50052 on mediator host)
 
@@ -165,8 +165,9 @@ Android mic audio + JPEG frames
 | `run_detection(desc)` | scene_tools | GroundingDINO on latest_frame |
 | `check_obstacle()` | scene_tools | depth_detector on latest_frame |
 | `enter_reading_mode(label?)` | reading_tools | Set mode=reading, reset buffer; passive OCR accumulation begins |
-| `scan_current_view()` | reading_tools | OCR on latest_frame → dedup-append to reading_buffer |
+| `scan_current_view()` | reading_tools | OCR on latest_frame → dedup-append to reading_buffer (silent — not read aloud) |
 | `get_reading_section(query)` | reading_tools | Keyword/semantic search over reading_buffer (never feeds full buffer to Gemini) |
+| `read_aloud(scope)` | reading_tools | scope=new: scan+speak new text; scope=all: speak full reading_buffer. Uses local KokoroTTS (`tools/tts.py`), streamed straight to `_output_q` — bypasses Gemini Live's voice entirely |
 | `flip_reading_direction()` | reading_tools | Toggle ltr/rtl |
 | `exit_reading_mode()` | reading_tools | Clear reading state |
 | `start_tracking(target)` | tracking_tools | GroundingDINO detect, set mode=tracking |
@@ -187,8 +188,13 @@ Android mic audio + JPEG frames
 
 Per-user state held in `LiveAPISession.state` (not in Gemini context window):
 - `mode`: idle | reading | tracking | guiding
-- `reading_buffer`: full OCR text (server-side only; accessed via `get_reading_section`)
+- `reading_buffer`: full OCR text (server-side only; accessed via `get_reading_section`/`read_aloud`)
 - `page_summaries`: brief summaries per scanned page (returned by `scan_current_view`)
+- `last_detection`, `last_hand_box`: live per-frame object/hand boxes in tracking mode, updated
+  from the client's `VoiceChatChunk.tracking_data` (Android's on-device ORB tracker + MediaPipe
+  hand detector) — also drives the server GUI's Tracking tab
+- `tracking_guidance_active`, `tracking_last_guidance_at`: gate the Gemini hand-guidance tick
+  (fires once when object+hand are first both visible, then every 5 s while both remain visible)
 - `nav_route`, `nav_route_idx`, `nav_last_position`: guiding mode progress
 - `walking_obstacle_cache`: list of `{label, expires_at}` with 6 s TTL; used to suppress duplicate obstacle alerts
 - `live_vision_active`: whether 1 fps frame stream is running
@@ -294,8 +300,9 @@ server/
     rag_store.py                 Sentence-transformer + CLIP embeddings; query_global()
     localization.py              LocalizationEngine — PnP against map keyframes
     route_planner.py             RoutePlanner — zone-based path planning
-    embedder.py                  EfficientNetLiteEmbedder — visual re-ID embeddings
-    tts.py                       KokoroTTS — kept for non-Live stubs (optional)
+    embedder.py                  DINOv2Embedder (ViT-S/14) — visual re-ID embeddings
+    tts.py                       KokoroTTS.synthesize_pcm_chunks() — local 24 kHz PCM TTS used by
+                                   reading_tools.read_aloud() to voice scanned text without Gemini Live
     asr.py                       WhisperASR — kept for non-Live stubs (optional)
   _archived/                     Old orchestrator/, agents/, cloud_vlm, intent_parser (reference only)
   data/
@@ -405,11 +412,14 @@ Each received JPEG frame triggers background ticks:
 User says "read this" or "enter reading mode"
   → Gemini Live calls enter_reading_mode()
   → User points camera at text; OCR tick (1.5 s) accumulates text in reading_buffer
-  → User says "scan this" → Gemini calls scan_current_view()
-    → OCR on latest_frame → returns new text → Gemini reads it aloud
-  → User asks question about content → Gemini calls get_reading_section(query)
+  → User says "read this" / "scan and read" → Gemini calls read_aloud(scope="new")
+    → OCR on latest_frame → new text → KokoroTTS synthesizes 24 kHz PCM
+    → streamed directly into _output_q → client hears it — Gemini's own voice is NOT used
+  → User says "read all of it" → Gemini calls read_aloud(scope="all")
+    → entire reading_buffer synthesized and streamed the same way
+  → User asks a question about content → Gemini calls get_reading_section(query)
     → keyword search over reading_buffer → returns relevant passage
-    → Gemini answers from passage
+    → Gemini answers from passage in its own voice (only path that still uses Gemini's TTS)
 ```
 
 ### Environment scanning (offline, team-operated)

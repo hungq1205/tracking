@@ -9,12 +9,14 @@ import numpy as np
 
 CHUNK_SIZE_WORDS = 200
 EMBED_DIM = 384
-CLIP_EMBED_DIM = 512
+IMAGE_EMBED_DIM = 384  # DINOv2 ViT-S/14, shared with tools/embedder.py
 
 
 class RagStore:
     """
-    Semantic memory store backed by sentence-transformers embeddings + numpy cosine similarity.
+    Semantic memory store backed by sentence-transformers text embeddings + numpy cosine
+    similarity, plus DINOv2 image embeddings (shared instance with tools/embedder.py — image
+    search here is image-to-image only, not cross-modal with text).
 
     Per-label storage layout:
       base_dir/{label}.json   — chunk metadata (text, created_at, source)
@@ -25,22 +27,18 @@ class RagStore:
     def __init__(
         self,
         base_dir: str,
+        image_embedder,
         model_id: str = "sentence-transformers/all-MiniLM-L6-v2",
-        clip_model_id: str = "clip-ViT-B-32",
     ):
         from sentence_transformers import SentenceTransformer
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         print(f"[RagStore] Loading text embedding model {model_id}...")
         self._embedder = SentenceTransformer(model_id)
-        print(f"[RagStore] Loading CLIP model {clip_model_id}...")
-        self._clip_embedder = SentenceTransformer(clip_model_id)
+        self._image_embedder = image_embedder
 
     def _get_embedder(self):
         return self._embedder
-
-    def _get_clip_embedder(self):
-        return self._clip_embedder
 
     # ── path helpers ──────────────────────────────────────────────────────────
 
@@ -58,7 +56,7 @@ class RagStore:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _clip_emb_path(self, label: str) -> Path:
+    def _image_emb_path(self, label: str) -> Path:
         return self.base_dir / f"{self._safe(label)}_clip.npy"
 
     # ── chunk helper ──────────────────────────────────────────────────────────
@@ -118,23 +116,22 @@ class RagStore:
         self.add_text(label, description, source=f"image:{img_path.name}")
 
     def add_object(self, label: str, image: np.ndarray, description: str) -> None:
-        """Store a named object: text embedding of description (384-dim) + CLIP image embedding (512-dim)."""
+        """Store a named object: text embedding of description (384-dim) + DINOv2 image embedding (384-dim)."""
         # Text embedding of description for text-query retrieval
         self.add_text(label, description, source="object_description")
 
-        # CLIP image embedding for future visual search
+        # DINOv2 image embedding for future image-to-image visual search
         try:
-            from PIL import Image as PILImage
-            clip_model = self._get_clip_embedder()
-            pil_img = PILImage.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-            img_emb = clip_model.encode([pil_img], show_progress_bar=False).astype(np.float32)
-
-            clip_path = self._clip_emb_path(label)
-            existing = np.load(str(clip_path)) if clip_path.exists() else None
-            combined = np.vstack([existing, img_emb]) if existing is not None else img_emb
-            np.save(str(clip_path), combined)
+            h, w = image.shape[:2]
+            img_emb = self._image_embedder.get_embedding(image, (0, 0, w, h))
+            if img_emb is not None:
+                img_emb = img_emb.numpy().astype(np.float32)
+                img_path = self._image_emb_path(label)
+                existing = np.load(str(img_path)) if img_path.exists() else None
+                combined = np.vstack([existing, img_emb]) if existing is not None else img_emb
+                np.save(str(img_path), combined)
         except Exception as e:
-            print(f"[RagStore] CLIP image embedding failed: {e}")
+            print(f"[RagStore] Image embedding failed: {e}")
 
         # Save image to disk
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

@@ -47,7 +47,6 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
     # ── Simple RPCs (unchanged behaviour) ────────────────────────────────────
 
     def DetectObject(self, request, context):
-        print(f"[SERVER] DetectObject: prompt='{request.prompt}'", flush=True)
         if self.latest_frame is None:
             return tracking_pb2.DetectionResponse()
         frame = self.latest_frame.copy()
@@ -55,11 +54,9 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
         if det.score > 0:
             x1, y1, x2, y2 = map(int, det.box_xyxy)
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        print(f"[SERVER] DetectObject → score={det.score:.2f}", flush=True)
         return tracking_pb2.DetectionResponse(box_xyxy=list(det.box_xyxy), score=det.score)
 
     def GetEmbedding(self, request, context):
-        print(f"[SERVER] GetEmbedding: box={request.box_xyxy}", flush=True)
         if self.latest_frame is None:
             return tracking_pb2.EmbeddingResponse(embedding=[])
         emb = self.embedder.get_embedding(self.latest_frame, tuple(request.box_xyxy))
@@ -145,6 +142,11 @@ class TrackingServiceServicer(tracking_pb2_grpc.TrackingServiceServicer):
                 jpeg = bytes(chunk.video_frame)
                 self.latest_frame = self._decode_image(jpeg)  # keep for DetectObject
                 session.receive_frame_sync(jpeg)
+                if chunk.HasField("tracking_data"):
+                    td = chunk.tracking_data
+                    session.receive_tracking_data_sync(
+                        list(td.box_xyxy), td.confidence, td.status, list(td.hand_box_xyxy)
+                    )
             elif which == "tool_result":
                 tr = chunk.tool_result
                 session.receive_tool_result_sync(tr.call_id, tr.result_json)

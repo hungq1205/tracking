@@ -28,7 +28,7 @@ import tracking.Tracking
 class TrackingBackend(
     private val grpcManager: GrpcClientManager,
     private val nfeatures: Int = 800,
-    private val renewalIntervalMs: Long = 1500L,
+    private val renewalIntervalMs: Long = 1000L,
 ) {
 
     private val orb: ORB by lazy {
@@ -279,7 +279,7 @@ class TrackingBackend(
         var dot = 0f; var na = 0f; var nb = 0f
         for (i in a.indices) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
         if (na == 0f || nb == 0f) return false
-        return (dot / (kotlin.math.sqrt(na) * kotlin.math.sqrt(nb))) > 0.75f
+        return (dot / (kotlin.math.sqrt(na) * kotlin.math.sqrt(nb))) > 0.4f
     }
 
     private fun buildLostTrack(frameWidth: Int, frameHeight: Int): ObjectTrack {

@@ -3,7 +3,7 @@ Device-native tool declarations routed to the connected client (Android/iOS).
 These are never executed server-side; the server relays them via AudioChunk.tool_call.
 """
 
-DEVICE_TOOL_NAMES = {"make_phone_call", "set_alarm", "create_calendar_event", "search_contacts"}
+DEVICE_TOOL_NAMES = {"make_phone_call", "set_alarm", "create_calendar_event", "search_contacts", "play_video", "stop_music"}
 
 DEVICE_TOOL_DECLARATIONS = [
     {
@@ -93,6 +93,29 @@ DEVICE_TOOL_DECLARATIONS = [
                 },
             },
             "required": ["title", "start_time"],
+        },
+    },
+    {
+        "name": "stop_music",
+        "description": "Stop the currently playing music or video on the user's device.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "play_video",
+        "description": (
+            "Play a YouTube video in the background on the user's device via ExoPlayer. "
+            "Call after the user selects a result from search_youtube. "
+            "The server automatically extracts the audio stream URL before forwarding to the device."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "video_id": {
+                    "type": "string",
+                    "description": "YouTube video ID from search_youtube results, e.g. 'ktvTqknDobU'",
+                },
+            },
+            "required": ["video_id"],
         },
     },
 ]

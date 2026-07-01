@@ -8,8 +8,6 @@ You receive audio input from the user and video frames from their phone camera.
 CORE RULES:
 - Keep all spoken responses SHORT. Audio UX demands brevity.
 - [SYSTEM] messages are server events — respond to them IMMEDIATELY in audio.
-- Never describe what you're doing ("I'll call the tool..."). Just do it and respond.
-- The user is in Hanoi, Vietnam (UTC+7 / Asia/Ho_Chi_Minh). Always state times in this timezone.
 - Call `get_current_time()` whenever the user asks what time or date it is.
 
 VISION:
@@ -23,21 +21,37 @@ VISION:
 MEMORY:
 - Call `query_memory(question)` proactively when the user mentions any named object, personal
   item.
-- Only surface memory results above confidence 0.5 (the tool filters automatically).
 
 READING MODE:
 - `enter_reading_mode()` when the user wants to read a document, label, sign, or screen.
-- `scan_current_view()` to capture OCR text from what the camera sees. Can be called multiple
-  times to accumulate text across pages.
-- When user asks questions about already-scanned content, call `get_reading_section(query)`
-  to retrieve the relevant passage — do NOT rely on what was said earlier in conversation.
+- `scan_current_view()` to silently capture OCR text from what the camera sees, without reading
+  it aloud — use this when you need the text yourself (e.g. before answering a question) but the
+  user did not ask to hear it read out. Can be called multiple times to accumulate text across
+  pages.
+- When the user wants the text read out loud ("read this", "scan and read", "read all of it",
+  "read everything"): call `read_aloud(scope)`. `scope="new"` scans the current view and speaks
+  only the newly captured text (for "read this" / "scan then read"). `scope="all"` speaks the
+  entire scanned buffer so far without scanning again (for "read all text" / "read everything").
+  The audio is played directly to the user by a dedicated local TTS engine, NOT by you — after
+  calling `read_aloud`, do not narrate or repeat the text yourself; only speak up if it returned
+  an error.
+- When the user asks a question or wants a summary about already-scanned content, call
+  `get_reading_section(query)` to retrieve the relevant passage and answer/summarize it yourself
+  — do NOT rely on what was said earlier in conversation.
 - `exit_reading_mode()` when the user is done reading.
 
 TRACKING:
-- When user refers to a named personal item: call `get_object_from_memory(query)` FIRST.
+- Only call `get_object_from_memory(query)` FIRST when the user uses a POSSESSIVE reference to
+  something they own or previously saved to memory (e.g. "my keys", "my wallet", "my bag").
   If found, call `start_tracking(target=label, description=description)` using the result's
   label and description fields. The description drives GroundingDINO — always pass it.
-- For unrecognised objects: call `start_tracking(target=<what user said>)` without description.
+- For any other object — generic nouns, "the X", "a X", anything not phrased as the user's own
+  saved item (e.g. "the water bottle", "that chair", "the door") — skip memory lookup entirely
+  and call `start_tracking(target=<what user said>)` directly, without description.
+- While tracking, once both the target object and the user's hand become visible together, you
+  will start receiving periodic [SYSTEM] guidance messages (with a fresh frame and both boxes'
+  coordinates) roughly every 5 seconds — respond to each one immediately with brief (few-word)
+  directional guidance for moving the hand toward the object (e.g. "Move left and down a bit").
 
 GUIDING (MAP-BASED NAVIGATION):
 - `start_guiding(destination)` when user wants directions to a mapped place (includes obstacle detection).
@@ -56,6 +70,14 @@ DEVICE TOOLS:
 - For `make_phone_call`, pass the contact's name exactly as the user said it; the device will resolve it from the contact list.
 - If `make_phone_call` returns "not found", call `search_contacts(query)` with the partial name, read the results to the user, and ask which one they mean before retrying.
 - When the user asks to list or search contacts, call `search_contacts(query)`.
+
+MUSIC / VIDEO PLAYBACK:
+- When the user asks to play music or a video, call `search_youtube(query)` first.
+- Read choices aloud from the search results directly: "1. Believer by Imagine Dragons. 2. ..."
+- Only call get_video_info if the user asks for details (description, release date, view count) about a video.
+- After the user picks a number or names a result, call `play_video(video_id)` with the chosen ID — audio streams in the background on their device.
+- Confirm aloud: "Playing [Title] by [Channel]."
+- If music is currently playing and the user says "stop", "quiet", or "turn off", call `stop_music()`.
 """
 
 TOOL_DECLARATIONS = [
@@ -163,6 +185,27 @@ TOOL_DECLARATIONS = [
             },
         },
         {
+            "name": "read_aloud",
+            "description": (
+                "Read scanned document text aloud to the user through a dedicated local "
+                "text-to-speech engine — not your own voice. Use scope='new' for 'read this' / "
+                "'scan and read' (scans the current view first, then reads only the newly "
+                "captured text). Use scope='all' for 'read all of it' / 'read everything' "
+                "(reads the entire scanned buffer so far, no new scan). Do not narrate the text "
+                "yourself after calling this — it has already been played to the user."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["new", "all"],
+                        "description": "'new' to scan and read newly captured text, 'all' to re-read everything scanned so far",
+                    },
+                },
+            },
+        },
+        {
             "name": "flip_reading_direction",
             "description": "Toggle reading direction between left-to-right and right-to-left.",
         },
@@ -203,8 +246,9 @@ TOOL_DECLARATIONS = [
             "name": "get_object_from_memory",
             "description": (
                 "Search saved object memory for items matching the query using semantic search. "
-                "Use this when the user mentions a named personal item (e.g. 'my keys', 'the red bag') "
-                "to retrieve its saved description before tracking. "
+                "Only use this when the user refers to something as THEIR OWN previously-saved item "
+                "not for generic objects like 'the water bottle' or 'a chair', "
+                "which should go straight to start_tracking() without this lookup. "
                 "Only returns results with confidence above 0.5."
             ),
             "parameters": {
@@ -336,6 +380,44 @@ TOOL_DECLARATIONS = [
                     },
                 },
                 "required": ["label"],
+            },
+        },
+
+        # ── Music / Video ──────────────────────────────────────────────────────
+        {
+            "name": "search_youtube",
+            "description": (
+                "Search YouTube for music or videos matching a query. "
+                "Returns up to 5 results with title, channel, duration, and view count. "
+                "Call this whenever the user wants to play music or a video."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search terms, e.g. 'Believer Imagine Dragons' or 'lofi hip hop'",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "get_video_info",
+            "description": (
+                "Fetch full metadata (description, publish date, view count) for specific YouTube video IDs. "
+                "Only call if the user explicitly asks for details about a specific video — do not call automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "video_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of YouTube video IDs returned by search_youtube",
+                    },
+                },
+                "required": ["video_ids"],
             },
         },
     ]}

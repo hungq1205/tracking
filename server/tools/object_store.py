@@ -4,7 +4,7 @@ Lightweight persistent store for named objects (reference images + embeddings).
 Layout:
   {base_dir}/objects/{safe_label}/meta.json     — label + description
   {base_dir}/objects/{safe_label}/ref_image.jpg — reference crop (BGR)
-  {base_dir}/objects/{safe_label}/ref_emb.npy   — EfficientNetLite embedding (float32)
+  {base_dir}/objects/{safe_label}/ref_emb.npy   — DINOv2 embedding (float32)
 """
 from __future__ import annotations
 

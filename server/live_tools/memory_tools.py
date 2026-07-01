@@ -84,7 +84,7 @@ async def tool_remember_object(session: "LiveAPISession", label: str, descriptio
         except Exception:
             pass
 
-        # Compute EfficientNetLite embedding of the crop
+        # Compute DINOv2 embedding of the crop
         embedding = None
         if session.tools.embedder is not None and box is not None:
             try:

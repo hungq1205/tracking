@@ -39,7 +39,7 @@ AUDIO_OUT_RATE = 24_000
 VIDEO_FPS      = 5           # camera frames per second sent to server
 JPEG_QUALITY   = 70
 
-_EMB_DIM = 1280  # EfficientNetLite embedding dimension
+_EMB_DIM = 384  # DINOv2 ViT-S/14 embedding dimension
 
 
 # ── Local tracking ───────────────────────────────────────────────────────────

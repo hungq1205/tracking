@@ -30,6 +30,7 @@ _DEPTH_INTERVAL = 0.5
 _OBSTACLE_COOLDOWN = 15.0
 _LOCALIZE_INTERVAL = 2.0
 _WALKING_DETECT_COOLDOWN = 10.0  # seconds between obstacle alerts in walking mode
+_TRACKING_GUIDANCE_INTERVAL = 5.0  # seconds between hand-guidance ticks in tracking mode
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -60,6 +61,9 @@ class LiveSessionState:
     # Tracking
     tracking_target: str = ""
     last_detection: Optional[Dict] = None
+    last_hand_box: Optional[List[float]] = None
+    tracking_guidance_active: bool = False
+    tracking_last_guidance_at: float = 0.0
 
     # Guiding — shared by free-walk (no route) and routed guiding (with route)
     nav_destination: str = ""
@@ -73,6 +77,10 @@ class LiveSessionState:
     walking_obstacle_cache: List[Dict] = field(default_factory=list)  # [{label, expires_at}]
     walking_last_detect_at: float = 0.0
     walking_last_obstacle_at: float = 0.0
+
+    # Music
+    music_search_results: List[Dict] = field(default_factory=list)  # cached from search_youtube
+    current_music: Optional[Dict] = None                            # metadata of currently playing video
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -88,10 +96,11 @@ class ToolsBundle:
     memory_store: Any
     maps_root_dir: str
     gemini_api_key: str
-    embedder: Any = None          # EfficientNetLiteEmbedder
+    embedder: Any = None          # DINOv2Embedder
     object_store: Any = None      # ObjectStore
     da3_onnx: Any = None          # DA3OnnxEstimator; None = walking mode disabled
     walking_config: Any = None    # WalkingConfig instance shared across sessions
+    tts: Any = None                # KokoroTTS; None = local read-aloud disabled
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -192,6 +201,26 @@ class LiveAPISession:
         self.latest_frame = jpeg
         if self._loop and self._input_q and not self._done_event.is_set():
             self._loop.call_soon_threadsafe(self._input_q.put_nowait, ("frame", jpeg))
+
+    def receive_tracking_data_sync(
+        self,
+        box_xyxy: List[float],
+        confidence: float,
+        status: str,
+        hand_box_xyxy: List[float],
+    ) -> None:
+        """Update live object/hand boxes from the client's per-frame tracking data."""
+        if self.state.mode != "tracking":
+            return
+        if box_xyxy:
+            if self.state.last_detection is None:
+                self.state.last_detection = {"target": self.state.tracking_target}
+            self.state.last_detection.update({
+                "box_xyxy": list(box_xyxy),
+                "score": confidence,
+                "status": status,
+            })
+        self.state.last_hand_box = list(hand_box_xyxy) if hand_box_xyxy else None
 
     def read_pcm_sync(self, timeout: float = 0.1) -> Optional[bytes]:
         """
@@ -379,6 +408,17 @@ class LiveAPISession:
         if self._session:
             await self._session.send_realtime_input(text=text)
 
+    def _speak_local(self, text: str) -> None:
+        """Synthesize text with the local TTS engine and stream PCM straight to the client.
+
+        Runs synchronously (call via asyncio.to_thread) — puts directly onto the same
+        thread-safe _output_q that Gemini's own audio uses, bypassing the Live API entirely.
+        """
+        if not text or self.tools.tts is None:
+            return
+        for pcm_chunk in self.tools.tts.synthesize_pcm_chunks(text):
+            self._output_q.put(pcm_chunk)
+
     # ── Background frame ticks ────────────────────────────────────────────────
 
     async def _on_frame_tick(self, jpeg: bytes) -> None:
@@ -388,6 +428,19 @@ class LiveAPISession:
         if self.state.mode == "reading" and now - self.state.last_ocr_at > _OCR_INTERVAL:
             self.state.last_ocr_at = now
             asyncio.get_event_loop().create_task(self._ocr_tick(jpeg))
+
+        # Tracking: Gemini-guided hand direction once both object and hand are visible
+        if self.state.mode == "tracking":
+            det = self.state.last_detection
+            object_present = bool(det and det.get("status") in ("TRACKING", "INITIALIZED"))
+            hand_present = self.state.last_hand_box is not None
+            if object_present and hand_present:
+                self.state.tracking_guidance_active = True
+                if now - self.state.tracking_last_guidance_at > _TRACKING_GUIDANCE_INTERVAL:
+                    self.state.tracking_last_guidance_at = now
+                    asyncio.get_event_loop().create_task(self._tracking_guidance_tick(jpeg))
+            else:
+                self.state.tracking_guidance_active = False
 
         # Guiding (free-walk or routed): DINO+DA3 obstacle detection every detection_interval
         if self.state.mode == "guiding":
@@ -465,6 +518,40 @@ class LiveAPISession:
                 await self._inject_system(
                     f"[SYSTEM] Passed {route[idx]}, now heading to {next_label}. Announce this."
                 )
+
+    async def _tracking_guidance_tick(self, jpeg: bytes) -> None:
+        try:
+            det = self.state.last_detection
+            hand_box = self.state.last_hand_box
+            if not det or not det.get("box_xyxy") or not hand_box:
+                return
+            if self._session:
+                await self._session.send_realtime_input(
+                    video=types.Blob(data=jpeg, mime_type="image/jpeg")
+                )
+
+            ox1, oy1, ox2, oy2 = det["box_xyxy"]
+            hx1, hy1, hx2, hy2 = hand_box
+            ocx, ocy = (ox1 + ox2) / 2, (oy1 + oy2) / 2
+            hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+            obj_diag = ((ox2 - ox1) ** 2 + (oy2 - oy1) ** 2) ** 0.5 or 1.0
+            dist = ((ocx - hcx) ** 2 + (ocy - hcy) ** 2) ** 0.5
+            is_close = dist < obj_diag * 1.5
+
+            proximity_note = (
+                "The hand is close to the object — give a small, precise nudge "
+                "(e.g. \"just a bit to the left\" / \"a little lower\")."
+                if is_close else
+                "The hand is still far from the object — just state the general "
+                "direction to move (left/right/up/down/forward)."
+            )
+            await self._inject_system(
+                f"[SYSTEM] Guiding hand to '{self.state.tracking_target}'. "
+                f"Object box (x1,y1,x2,y2)={det['box_xyxy']}, hand box={hand_box} in the frame "
+                f"just sent. {proximity_note} Keep it brief."
+            )
+        except Exception as e:
+            print(f"[LiveSession] Tracking guidance tick error: {e}", flush=True)
 
     async def _walking_tick(self, jpeg: bytes, now: float) -> None:
         if self.tools.da3_onnx is None or self.tools.walking_config is None:
@@ -567,6 +654,21 @@ class LiveAPISession:
     # ── Tool dispatcher ───────────────────────────────────────────────────────
 
     async def _dispatch_tool(self, name: str, args: Dict[str, Any]) -> Any:
+        # For play_video: extract stream URL server-side and cache metadata before routing to device
+        if name == "play_video":
+            from live_tools.music_tools import extract_stream_url
+            video_id = args.get("video_id", "")
+            hit = next((r for r in self.state.music_search_results if r.get("videoId") == video_id), None)
+            if hit:
+                self.state.current_music = hit
+                args = {**args, "title": hit.get("title", ""), "channel": hit.get("channel", "")}
+            try:
+                stream_url = await extract_stream_url(video_id)
+                args = {**args, "stream_url": stream_url}
+            except Exception as exc:
+                print(f"[LiveSession] extract_stream_url failed for {video_id}: {exc}", flush=True)
+                return {"error": f"Could not extract stream URL: {exc}"}
+
         # Device tools are routed to the connected client, not executed server-side
         if name in self.device_capabilities:
             call_id = str(uuid.uuid4())
@@ -574,11 +676,24 @@ class LiveAPISession:
             self._device_result_futures[call_id] = future
             self._device_tool_q.put_nowait({"call_id": call_id, "name": name, "args": args})
             try:
-                return await asyncio.wait_for(asyncio.shield(future), timeout=30.0)
+                result = await asyncio.wait_for(asyncio.shield(future), timeout=30.0)
             except asyncio.TimeoutError:
                 self._device_result_futures.pop(call_id, None)
                 print(f"[LiveSession] Device tool {name} timed out after 30s", flush=True)
                 return {"error": "Device did not respond in time"}
+
+            if name == "play_video" and "error" not in result:
+                title = (self.state.current_music or {}).get("title", "")
+                channel = (self.state.current_music or {}).get("channel", "")
+                await self._inject_system(
+                    f'[SYSTEM] Music is now playing: "{title}" by {channel}. '
+                    f'If the user says stop, pause, or quiet, call stop_music().'
+                )
+            elif name == "stop_music":
+                self.state.current_music = None
+                await self._inject_system("[SYSTEM] Music stopped.")
+
+            return result
 
         from live_tools.scene_tools import HANDLERS as SCENE
         from live_tools.reading_tools import HANDLERS as READING
@@ -587,8 +702,9 @@ class LiveAPISession:
         from live_tools.navigation_tools import HANDLERS as NAV
         from live_tools.walking_tools import HANDLERS as WALKING
         from live_tools.time_tools import HANDLERS as TIME
+        from live_tools.music_tools import HANDLERS as MUSIC
 
-        ALL = {**SCENE, **READING, **TRACKING, **MEMORY, **NAV, **WALKING, **TIME}
+        ALL = {**SCENE, **READING, **TRACKING, **MEMORY, **NAV, **WALKING, **TIME, **MUSIC}
         handler = ALL.get(name)
         if handler is None:
             return {"error": f"Unknown tool: {name}"}

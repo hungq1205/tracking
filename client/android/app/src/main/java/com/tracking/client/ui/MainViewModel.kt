@@ -58,6 +58,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private var isLocalTrackingActive = false
     private var localTrackingPrompt = ""
+    private var lastTrackingUpdateMs = 0L
+    private val trackingIntervalMs = 143L // cap local ORB tracking at ~7 fps
 
     // Latest JPEG bytes for local tracking initialization retries
     @Volatile private var latestFrameBytes: ByteArray? = null
@@ -171,8 +173,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val frameWidth = jpegOpts.outWidth
                     val frameHeight = jpegOpts.outHeight
 
-                    // Local ORB tracking — runs every frame without blocking
-                    if (isLocalTrackingActive && _uiState.value.agentState == "TRACKING") {
+                    // Local ORB tracking — throttled to 10 fps
+                    val now = System.currentTimeMillis()
+                    if (isLocalTrackingActive && _uiState.value.agentState == "TRACKING" &&
+                        now - lastTrackingUpdateMs >= trackingIntervalMs
+                    ) {
+                        lastTrackingUpdateMs = now
                         try {
                             val track = trackingBackend.update(jpegBytes)
                             if (track != null) {
@@ -259,8 +265,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
             val videoJob = launch {
                 edgeDevice.frameFlow.conflate().collect { jpeg ->
-                    send(Tracking.VoiceChatChunk.newBuilder()
-                        .setVideoFrame(ByteString.copyFrom(jpeg)).build())
+                    val chunkBuilder = Tracking.VoiceChatChunk.newBuilder()
+                        .setVideoFrame(ByteString.copyFrom(jpeg))
+                    if (_uiState.value.agentState == "TRACKING") {
+                        val g = _uiState.value.guidanceData
+                        chunkBuilder.setTrackingData(
+                            Tracking.TrackingData.newBuilder()
+                                .addAllBoxXyxy(g.objectBoxXyxy)
+                                .setConfidence(g.confidence)
+                                .setStatus(g.status)
+                                .addAllHandBoxXyxy(g.handBoxXyxy)
+                                .build()
+                        )
+                    }
+                    send(chunkBuilder.build())
                 }
             }
             val imuJob = if (imuSensor.isAvailable) launch {

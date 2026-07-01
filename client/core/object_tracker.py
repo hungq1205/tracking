@@ -15,7 +15,7 @@ class GPUVIOAnchorBackend(IObjectTracker):
     """
     Lightweight tracking backend for Edge Devices.
     Runs ORB feature detection and Homography locally.
-    Re-identifies using EfficientNetLite embeddings every 2 seconds.
+    Re-identifies using DINOv2 embeddings every 2 seconds.
     """
     def __init__(
         self,
@@ -46,7 +46,7 @@ class GPUVIOAnchorBackend(IObjectTracker):
         self._ref_center_cpu = None
         self._init_wh = (0, 0)
         self._last_box = None
-        self._ref_crop_emb = None   # reference EfficientNetLite embedding (torch.Tensor)
+        self._ref_crop_emb = None   # reference DINOv2 embedding (torch.Tensor)
         self._ref_image: Optional[np.ndarray] = None  # reference crop (BGR) for display
         self._last_H = None
 

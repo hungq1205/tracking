@@ -26,6 +26,7 @@ async def lifespan(_app: FastAPI):
         use_doc_unwarping=True,
         use_textline_orientation=True,
         device="gpu",
+         enable_mkldnn=False,
     )
     log.info("models ready")
     yield

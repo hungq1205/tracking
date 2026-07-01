@@ -48,6 +48,7 @@ val protobufVersion = "4.28.3"
 val cameraxVersion = "1.3.4"
 val opencvVersion = "4.11.0"
 val mediapipeVersion = "0.10.14"
+val media3Version = "1.3.1"
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.09.03")
@@ -83,6 +84,9 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.compose.material:material-icons-extended:1.7.3")
+
+    implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-ui:$media3Version")
 }
 
 protobuf {

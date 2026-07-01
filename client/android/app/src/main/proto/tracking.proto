@@ -79,6 +79,7 @@ message VoiceChatChunk {
     DeviceToolResult tool_result  = 4;  // result of a device tool call
   }
   repeated string capabilities = 5;    // advertised device capabilities (first chunk only)
+  TrackingData     tracking_data = 6;  // optional: object+hand boxes, set alongside video_frame while tracking
 }
 
 // Single raw-PCM chunk streamed back by the server (24 kHz, 16-bit LE, mono).
@@ -103,6 +104,7 @@ message TrackingData {
   float confidence = 4;
   string status = 5;
   repeated HandData hand_data = 6;
+  repeated float hand_box_xyxy = 7;  // hand bounding box from client-side hand detection
 }
 
 message FrameRequest {

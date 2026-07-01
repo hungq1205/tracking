@@ -8,6 +8,8 @@ import asyncio
 import re
 from typing import TYPE_CHECKING, Any, Dict, List
 
+import requests
+
 if TYPE_CHECKING:
     from live_session import LiveAPISession
 
@@ -64,9 +66,17 @@ async def tool_scan_current_view(session: "LiveAPISession", **_) -> Dict[str, An
         if frame is None:
             return {"error": "Could not decode frame."}
 
-        text = await asyncio.to_thread(
-            session.tools.ocr.read_text, frame, session.state.reading_direction
-        )
+        try:
+            text = await asyncio.to_thread(
+                session.tools.ocr.read_text, frame, session.state.reading_direction
+            )
+        except requests.exceptions.ConnectionError as e:
+            print(f"[OCR] connection failed: {e}")
+            return {"error": "OCR service is unreachable. Text reading is unavailable right now."}
+        except requests.exceptions.RequestException as e:
+            print(f"[OCR] request failed: {e}")
+            return {"error": f"OCR request failed: {e}"}
+
         if not text:
             return {"found": False, "message": "No text detected in current view."}
 
@@ -126,6 +136,24 @@ async def tool_get_reading_section(session: "LiveAPISession", query: str, **_) -
         return {"error": str(e)}
 
 
+async def tool_read_aloud(session: "LiveAPISession", scope: str = "new", **_) -> Dict[str, Any]:
+    if scope == "all":
+        text = session.state.reading_buffer
+        if not text:
+            return {"error": "No text has been scanned yet."}
+    else:
+        scan_result = await tool_scan_current_view(session)
+        if scan_result.get("error") or not scan_result.get("found"):
+            return scan_result
+        text = scan_result["new_text"]
+
+    if session.tools.tts is None:
+        return {"error": "Text-to-speech engine unavailable."}
+
+    await asyncio.to_thread(session._speak_local, text)
+    return {"status": "read_aloud", "scope": scope, "chars": len(text)}
+
+
 async def tool_flip_reading_direction(session: "LiveAPISession", **_) -> Dict[str, Any]:
     session.state.reading_direction = "rtl" if session.state.reading_direction == "ltr" else "ltr"
     label = "right to left" if session.state.reading_direction == "rtl" else "left to right"
@@ -146,6 +174,7 @@ HANDLERS = {
     "enter_reading_mode": tool_enter_reading_mode,
     "scan_current_view": tool_scan_current_view,
     "get_reading_section": tool_get_reading_section,
+    "read_aloud": tool_read_aloud,
     "flip_reading_direction": tool_flip_reading_direction,
     "exit_reading_mode": tool_exit_reading_mode,
 }
