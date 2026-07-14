@@ -52,6 +52,13 @@ class ImuSensor(context: Context) {
                     Sensor.TYPE_ACCELEROMETER -> {
                         latestAccel = event.values.clone()
                         latestAccelTs = event.timestamp
+                        // Emit here only — a single sensor's event.timestamp stream is
+                        // guaranteed monotonically increasing by Android; emitting from
+                        // both accel's and gyro's onSensorChanged (as this used to)
+                        // interleaves two independently-clocked timestamp sequences and
+                        // produces non-monotonic/duplicate output whenever the two
+                        // sensors' hardware clocks drift relative to each other — fatal
+                        // for anything doing IMU preintegration (ORB-SLAM3, Kalibr).
                         val g = latestGyro ?: return
                         trySend(
                             ImuReading(
@@ -68,18 +75,6 @@ class ImuSensor(context: Context) {
                     Sensor.TYPE_GYROSCOPE -> {
                         latestGyro = event.values.clone()
                         latestGyroTs = event.timestamp
-                        val a = latestAccel ?: return
-                        trySend(
-                            ImuReading(
-                                timestampNs = event.timestamp,
-                                accelX = a[0],
-                                accelY = a[1],
-                                accelZ = a[2],
-                                gyroX = event.values[0],
-                                gyroY = event.values[1],
-                                gyroZ = event.values[2],
-                            )
-                        )
                     }
                 }
             }

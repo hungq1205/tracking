@@ -16,3 +16,17 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
+
+  # RTAB-Map pose service — see scan_server/rtabmap_docker/README.md.
+  # Replaces the old orbslam3 service: RTAB-Map's RGB-D odometry needs only
+  # camera intrinsics (sent per-frame over the wire), no camera-IMU
+  # calibration file to mount at all, and no GPU/Container Toolkit
+  # requirement (RTAB-Map's corelib has no GUI/OpenGL dependency, unlike the
+  # old base image whose Pangolin viewer expected GPU passthrough even when
+  # run headless).
+  rtabmap:
+    build:
+      context: ./scan_server/rtabmap_docker
+    ports:
+      - "5556:5556"
+    restart: unless-stopped

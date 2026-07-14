@@ -72,7 +72,6 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
-    implementation("androidx.camera:camera-video:$cameraxVersion")
 
     implementation("io.grpc:grpc-okhttp:$grpcVersion")
     implementation("io.grpc:grpc-protobuf-lite:$grpcVersion")

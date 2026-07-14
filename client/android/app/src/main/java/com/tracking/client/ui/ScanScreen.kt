@@ -134,7 +134,7 @@ fun ScanScreen(
                 // ── Offline Recording section ─────────────────────────────────
                 ScanSectionLabel("Record to File")
                 Text(
-                    "Walk through the venue. Video + IMU saved locally, then upload to scan server.",
+                    "Walk through the venue. Images + IMU saved locally, then upload to scan server.",
                     color = Color.Gray, fontSize = 10.sp
                 )
 
@@ -152,11 +152,11 @@ fun ScanScreen(
                     ) { Text("Stop", fontSize = 12.sp) }
                 }
 
-                if (uiState.videoFile != null) {
-                    RecordingFileInfo(uiState.videoFile, uiState.imuFile)
+                if (uiState.datasetDir != null) {
+                    RecordingFileInfo(uiState.datasetDir, uiState.imageCount, uiState.imuFile)
                 }
 
-                if (uiState.videoFile != null && !uiState.isRecording) {
+                if (uiState.datasetDir != null && !uiState.isRecording) {
                     ScanSectionLabel("Upload to Scan Server")
                     OutlinedTextField(
                         value = uiState.scanServerHost,
@@ -311,15 +311,15 @@ fun ScanScreen(
 }
 
 @Composable
-private fun RecordingFileInfo(videoFile: File?, imuFile: File?) {
-    if (videoFile == null) return
+private fun RecordingFileInfo(datasetDir: File?, imageCount: Int, imuFile: File?) {
+    if (datasetDir == null) return
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(
-            "Video: ${videoFile.name}  (${videoFile.length() / 1024} KB)",
+            "Images: ${datasetDir.name}/images  ($imageCount frames)",
             color = Color(0xFF69F0AE), fontSize = 10.sp, fontFamily = FontFamily.Monospace
         )
         if (imuFile != null && imuFile.exists()) {
-            val lines = imuFile.bufferedReader().use { it.readLines().size }
+            val lines = (imuFile.bufferedReader().use { it.readLines().size } - 1).coerceAtLeast(0)
             Text(
                 "IMU:   ${imuFile.name}  ($lines samples)",
                 color = Color(0xFF69F0AE), fontSize = 10.sp, fontFamily = FontFamily.Monospace

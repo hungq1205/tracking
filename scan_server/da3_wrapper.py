@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
-from attrs import inspect
 import numpy as np
 import cv2
 import torch
@@ -53,12 +52,7 @@ f"Original error: {e}"
         This is the correct usage: DA3 jointly reasons across all views for
         globally consistent depth and camera poses.
         """
-        import cv2
-
         prediction = self.model.inference(rgb_frames)
-        import inspect
-        print(inspect.getsource(self.model.forward))
-        print(self.model)
 
         results = []
         for i, rgb_frame in enumerate(rgb_frames):

@@ -40,21 +40,27 @@ def _ensure_map_loaded(session: "LiveAPISession", location_id: str) -> bool:
         print(f"[NavTools] map_labels.json not found: {labels_path}")
         session._route_planner = None
         session._localizer = None
+        session._grid_planner = None
         session._current_location_id = location_id
         return False
 
     from tools.route_planner import RoutePlanner
     from tools.localization import LocalizationEngine
+    from tools.grid_path_planner import GridPathPlanner
 
     with open(labels_path) as f:
         data = json.load(f)
     session._route_planner = RoutePlanner(data.get("zones", []))
     session._localizer = LocalizationEngine(map_dir)
+    # None on maps exported before the height-tiered A* planner existed —
+    # tool_start_navigation falls back to the zone-centroid greedy walk below.
+    session._grid_planner = GridPathPlanner.from_map_file(labels_path)
     session._current_location_id = location_id
     print(
         f"[NavTools] Map '{location_id}' loaded: "
         f"{len(session._route_planner.zones)} zones, "
-        f"localizer={'ok' if session._localizer.available else 'no keyframes'}."
+        f"localizer={'ok' if session._localizer.available else 'no keyframes'}, "
+        f"grid_planner={'ok' if session._grid_planner else 'no occupancy_grid'}."
     )
     return True
 
@@ -68,12 +74,18 @@ async def tool_start_navigation(session: "LiveAPISession", destination: str, **_
     if not ok or session._route_planner is None:
         return {"error": "Failed to load map data."}
 
-    if session._route_planner.find_zone(destination) is None:
+    zone_hit = session._route_planner.find_zone(destination)
+    landmark_hit = None if zone_hit is not None else session._route_planner.find_landmark(destination)
+    if zone_hit is None and landmark_hit is None:
         known = [z.label for z in session._route_planner.zones]
         return {
             "error": f"Unknown destination '{destination}'.",
             "known_zones": known,
         }
+    goal_xz = (
+        (float(zone_hit.centroid[0]), float(zone_hit.centroid[2])) if zone_hit is not None
+        else (landmark_hit[1], landmark_hit[2])
+    )
 
     # Try to localize start position
     start_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -90,29 +102,49 @@ async def tool_start_navigation(session: "LiveAPISession", destination: str, **_
         except Exception as e:
             print(f"[NavTools] Localization failed: {e}")
 
-    route = await asyncio.to_thread(session._route_planner.compute_route, start_pos, destination)
+    # Prefer the height-aware A* planner (avoids normal obstacles, tolerates
+    # low/step-over ones) — falls back to the legacy zone-centroid greedy
+    # walk when the map predates it or no obstacle-respecting path exists.
+    waypoints = None
+    if session._grid_planner is not None:
+        start_xz = (float(start_pos[0]), float(start_pos[2]))
+        waypoints = await asyncio.to_thread(session._grid_planner.find_path, start_xz, goal_xz)
 
     import time
     session.state.mode = "guiding"
     session.state.nav_destination = destination
     session.state.nav_location_id = location_id
-    session.state.nav_route = [z.label for z in route]
-    session.state.nav_route_idx = 0
     session.state.nav_last_localize_at = time.time()
     # Shared walking obstacle state — reset so guiding starts fresh
     session.state.walking_obstacle_cache = []
     session.state.walking_last_detect_at = 0.0
     session.state.walking_last_obstacle_at = 0.0
 
-    announcement = await asyncio.to_thread(
-        session._route_planner.route_announcement, route, destination
-    )
+    if waypoints:
+        session.state.nav_waypoints = waypoints
+        session.state.nav_waypoint_idx = 0
+        session.state.nav_route = []
+        session.state.nav_route_idx = 0
+        announcement = f"Navigating to {destination}. I will alert you of obstacles along the way."
+        route_labels = []
+    else:
+        dest_label = zone_hit.label if zone_hit is not None else landmark_hit[0].label
+        route = await asyncio.to_thread(session._route_planner.compute_route, start_pos, dest_label)
+        session.state.nav_waypoints = []
+        session.state.nav_waypoint_idx = 0
+        session.state.nav_route = [z.label for z in route]
+        session.state.nav_route_idx = 0
+        announcement = await asyncio.to_thread(
+            session._route_planner.route_announcement, route, dest_label
+        )
+        route_labels = session.state.nav_route
+
     try:
         session.state_update_q.put_nowait({
             "agent_state": "GUIDING",
             "agent_payload": json.dumps({
                 "destination": destination,
-                "route": session.state.nav_route,
+                "route": route_labels,
             }),
         })
     except Exception:
@@ -120,7 +152,7 @@ async def tool_start_navigation(session: "LiveAPISession", destination: str, **_
     return {
         "status": "navigating",
         "destination": destination,
-        "route": session.state.nav_route,
+        "route": route_labels,
         "announcement": announcement,
     }
 
@@ -131,6 +163,8 @@ async def tool_stop_guiding(session: "LiveAPISession", **_) -> Dict[str, Any]:
     session.state.nav_destination = ""
     session.state.nav_route = []
     session.state.nav_route_idx = 0
+    session.state.nav_waypoints = []
+    session.state.nav_waypoint_idx = 0
     session.state.nav_last_position = None
     session.state.walking_obstacle_cache = []
     try:

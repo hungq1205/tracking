@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from google import genai
 from google.genai import types
@@ -31,6 +31,8 @@ _OBSTACLE_COOLDOWN = 15.0
 _LOCALIZE_INTERVAL = 2.0
 _WALKING_DETECT_COOLDOWN = 10.0  # seconds between obstacle alerts in walking mode
 _TRACKING_GUIDANCE_INTERVAL = 5.0  # seconds between hand-guidance ticks in tracking mode
+_WAYPOINT_ARRIVAL_RADIUS = 0.5    # metres — A*-planned waypoint reached
+_LANDMARK_ARRIVAL_RADIUS = 0.75   # metres — landmarks have no AABB, use a fixed radius
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,8 +70,14 @@ class LiveSessionState:
     # Guiding — shared by free-walk (no route) and routed guiding (with route)
     nav_destination: str = ""
     nav_location_id: str = ""
-    nav_route: List[str] = field(default_factory=list)
+    nav_route: List[str] = field(default_factory=list)      # zone-label route (legacy)
     nav_route_idx: int = 0
+    # A*-planned (x, z) waypoint route (server/tools/grid_path_planner.py) —
+    # used for landmark destinations, which have no zone/AABB. Mutually
+    # exclusive with nav_route: tool_start_navigation always clears whichever
+    # of the two it doesn't set.
+    nav_waypoints: List[Tuple[float, float]] = field(default_factory=list)
+    nav_waypoint_idx: int = 0
     nav_last_position: Optional[List[float]] = None
     nav_last_localize_at: float = 0.0
 
@@ -147,6 +155,7 @@ class LiveAPISession:
         # Navigation helpers (lazy loaded when start_guiding is called)
         self._route_planner = None
         self._localizer = None
+        self._grid_planner = None  # server/tools/grid_path_planner.py — None on older maps
         self._current_location_id: Optional[str] = None
 
         # GUI display frames — updated after each guiding tick
@@ -449,7 +458,12 @@ class LiveAPISession:
                 self.state.walking_last_detect_at = now
                 asyncio.get_event_loop().create_task(self._walking_tick(jpeg, now))
             # Localization only runs when a route/destination is active
-            if self.state.nav_route and now - self.state.nav_last_localize_at > _LOCALIZE_INTERVAL:
+            # (nav_route: legacy zone-label route; nav_waypoints: A*-planned
+            # landmark route — tool_start_navigation always sets exactly one)
+            if (
+                (self.state.nav_route or self.state.nav_waypoints)
+                and now - self.state.nav_last_localize_at > _LOCALIZE_INTERVAL
+            ):
                 self.state.nav_last_localize_at = now
                 asyncio.get_event_loop().create_task(self._localize_tick(jpeg))
 
@@ -495,10 +509,37 @@ class LiveAPISession:
             print(f"[LiveSession] Localize tick error: {e}", flush=True)
 
     async def _check_proximity(self) -> None:
-        if not self.state.nav_last_position or not self._route_planner:
+        if not self.state.nav_last_position:
             return
         import numpy as np
         pos = np.array(self.state.nav_last_position, dtype=np.float32)
+
+        # A*-planned landmark route (server/tools/grid_path_planner.py) — no
+        # zone/AABB to test against, so arrival/waypoint-reached use fixed
+        # radii instead of Zone.contains(). Mutually exclusive with nav_route
+        # (tool_start_navigation always clears whichever it doesn't set).
+        if self.state.nav_waypoints:
+            pos_xz = np.array([pos[0], pos[2]], dtype=np.float32)
+            goal = np.array(self.state.nav_waypoints[-1], dtype=np.float32)
+            if np.linalg.norm(pos_xz - goal) < _LANDMARK_ARRIVAL_RADIUS:
+                dest = self.state.nav_destination
+                self.state.mode = "idle"
+                self.state.nav_destination = ""
+                self.state.nav_waypoints = []
+                await self._inject_system(f"[SYSTEM] User has arrived at {dest}. Announce arrival warmly.")
+                return
+            idx = self.state.nav_waypoint_idx
+            if idx < len(self.state.nav_waypoints) - 1:
+                wp = np.array(self.state.nav_waypoints[idx], dtype=np.float32)
+                if np.linalg.norm(pos_xz - wp) < _WAYPOINT_ARRIVAL_RADIUS:
+                    # Silent advance — only final arrival is announced, to
+                    # avoid chatter at every one of what can be many A*
+                    # waypoints (unlike the coarser, per-zone nav_route below).
+                    self.state.nav_waypoint_idx += 1
+            return
+
+        if not self._route_planner:
+            return
 
         dest_zone = self._route_planner.find_zone(self.state.nav_destination) if self.state.nav_destination else None
         if dest_zone and dest_zone.contains(pos):

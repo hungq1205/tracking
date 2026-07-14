@@ -1,14 +1,30 @@
 """
-Scan Server GUI — 3 tabs:
-  1. Live Points   — interactive 3D model viewer (PLY), updated after each batch
+Scan Server GUI — tabs:
+  1. Live Reconstruction — Live Points + Voxelization (side by side) and
+                      Occupancy Map (below), all three rebuilding
+                      progressively, once per processed chunk, as a scan
+                      runs (see ScanSession.process_frames_batch /
+                      OccupancyMap.update()) — not deferred to the end.
+                      Each view toggleable via its own checkbox.
   2. Depth Metric  — per-frame depth map + click-to-measure
-  3. Occupancy Map — 2D top-down grid (free / unknown / occupied)
+  3. Detections    — GroundingDINO boxes + VLM response debug view
 
-Workflow:
-  1. Upload a video + set Location ID
+Workflow (there is no batch "Scan" button — every run replays the dataset
+frame-by-frame through StreamingScanSession, see stream_session.py /
+stream_simulator.py):
+  1. Point at a dataset folder (images/ + imu.csv + camera.csv) + set Location ID
   2. Fill Segment Table: start_s | end_s | zone_name
-  3. Click Scan → SLAM processes each segment in order
-  4. Click Export Map → saves PLY + JSON + ORB keyframes
+  3. Click "Simulated Live Stream" (auto, whole dataset) OR click "Start /
+     Reset Manual Stream" then "Feed Next Frame" repeatedly (one frame per
+     click, with a preview of the frame about to be fed)
+  4. Click Export Map (or let a stream finish, which auto-exports) — saves
+     PLY + JSON + ORB keyframes
+
+Dataset folder layout (see camera.csv/imu.csv headers for exact columns):
+    dataset/
+        images/000000000.jpg, 000000001.jpg, ...
+        imu.csv       timestamp_ns,ax,ay,az,gx,gy,gz
+        camera.csv    timestamp_ns,filename
 """
 
 import tempfile
@@ -25,6 +41,19 @@ import plotly.graph_objects as go
 matplotlib.use("Agg")
 
 from scan_css import SCAN_CSS, SCAN_DESCRIPTION_HTML, SCAN_HEADER_HTML, get_scan_theme
+from scan_session import voxelize_cloud, DEFAULT_VOXEL_SIZE, MAX_VOXELS
+from timing_utils import timed
+from stream_session import StreamingScanSession
+from stream_simulator import replay_dataset, ManualDatasetReplayer
+
+# Dropdown label -> ImuIntegrator's `orientation` key (see scan_session.IMU_ORIENTATIONS).
+# Only the raw imu.csv values are rotated; images are handled separately by the
+# existing "Rotate Images 90°" button/video_rotation_state.
+_IMU_ORIENTATION_LABELS = {
+    "Portrait (native)": "portrait",
+    "Landscape — left (top of phone left)": "landscape-left",
+    "Landscape — right (top of phone right)": "landscape-right",
+}
 
 _DEFAULT_SEGMENTS = pd.DataFrame(
     {"start_s": [0.0], "end_s": [0.0], "area_name": [""]}
@@ -62,6 +91,41 @@ def _build_depth_data(
         }
         for i, (rgb, df) in enumerate(zip(frames_rgb, depth_frames))
     }
+
+
+# ── Detection debug view (GroundingDINO boxes + Qwen VL response) ─────────────
+
+
+def _draw_detections(frame_bgr: np.ndarray, detections: list) -> np.ndarray:
+    """Draw GroundingDINO boxes + label/score on a BGR frame; return RGB uint8."""
+    img = frame_bgr.copy()
+    for det in detections:
+        x0, y0, x1, y1 = [int(round(v)) for v in det.box_xyxy]
+        cv2.rectangle(img, (x0, y0), (x1, y1), (50, 220, 50), 2)
+        label = f"{det.label} {det.score:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        ty0 = max(0, y0 - th - 6)
+        cv2.rectangle(img, (x0, ty0), (x0 + tw + 4, y0), (50, 220, 50), -1)
+        cv2.putText(img, label, (x0 + 2, max(th + 2, y0 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def _build_detection_view(session):
+    """Return (boxed_rgb_image_or_None, status_markdown) for the Detections tab."""
+    if session is None or session.semantic_mapper is None:
+        return None, "Semantic mapping is disabled on this server."
+    sm = session.semantic_mapper
+    frame_bgr = sm.last_frame_bgr
+    if frame_bgr is None:
+        return None, "No frame processed yet — run Scan with a labelled area."
+    image = _draw_detections(frame_bgr, sm.last_detections)
+    lines = [f"**{len(sm.last_detections)} detection(s)**"]
+    if sm.last_error:
+        lines.append(f"⚠️ {sm.last_error}")
+    lines.append("\n**Qwen VL response:**\n")
+    lines.append(f"```\n{sm.last_vlm_response or '(empty)'}\n```")
+    return image, "\n".join(lines)
 
 
 # ── Zone / landmark rendering helpers ─────────────────────────────────────────
@@ -116,6 +180,17 @@ def _make_stick(p1, p2, radius: float = 0.03, color=(255, 80, 80, 220)):
 
 
 def _cloud_to_glb(cloud_or_pts, zones=None, ground_y=None) -> Optional[str]:
+    """Times the render (GLB export via trimesh — CPU-only, no GPU path in
+    this library) and delegates to _cloud_to_glb_impl."""
+    try:
+        n_pts = len(cloud_or_pts.points) if hasattr(cloud_or_pts, "points") else len(cloud_or_pts[0])
+    except Exception:
+        n_pts = "?"
+    with timed(f"_cloud_to_glb render ({n_pts} pts)"):
+        return _cloud_to_glb_impl(cloud_or_pts, zones=zones, ground_y=ground_y)
+
+
+def _cloud_to_glb_impl(cloud_or_pts, zones=None, ground_y=None) -> Optional[str]:
     """
     Export point cloud to a temp GLB file for gr.Model3D.
     Uses trimesh (same as DA3 app): PointCloud → Scene → .glb
@@ -149,54 +224,8 @@ def _cloud_to_glb(cloud_or_pts, zones=None, ground_y=None) -> Optional[str]:
         scene = trimesh.Scene()
         scene.add_geometry(pc)
 
-        # ── Zone bounding boxes + landmark spheres ────────────────────────────
-        if zones:
-            # Floor Y: use provided ground_y or estimate from point cloud centroid
-            gy = float(ground_y) if ground_y is not None else float(pts[:, 1].max())
-            for z_idx, zone in enumerate(zones):
-                color = _ZONE_RGBA[z_idx % len(_ZONE_RGBA)]
-                mn = np.array(zone.bbox_min, dtype=np.float64)
-                mx = np.array(zone.bbox_max, dtype=np.float64)
-
-                # Draw the floor rectangle of the AABB as 4 edge sticks
-                floor_y = gy
-                fc = np.array([
-                    [mn[0], floor_y, mn[2]],
-                    [mx[0], floor_y, mn[2]],
-                    [mx[0], floor_y, mx[2]],
-                    [mn[0], floor_y, mx[2]],
-                ])
-                for a, b in ((0, 1), (1, 2), (2, 3), (3, 0)):
-                    stick = _make_stick(fc[a], fc[b], radius=0.04, color=color)
-                    if stick:
-                        scene.add_geometry(stick)
-
-                # Landmark spheres placed at floor level
-                for lm in getattr(zone, "landmarks", []):
-                    sph = trimesh.creation.icosphere(subdivisions=1, radius=0.18)
-                    sph.apply_translation([float(lm.x), floor_y, float(lm.z)])
-                    sph.visual.face_colors = np.array(color, dtype=np.uint8)
-                    scene.add_geometry(sph)
-
-        # Top-down initial camera: camera placed above centroid looking down (-Y).
-        # In trimesh camera space: +X=right, +Y=up, -Z=forward (toward scene).
-        # For top-down: camera -Z (forward) aligns with world -Y (down),
-        #   so camera +Z column = world +Y = [0,1,0]
-        #       camera +X column = world +X = [1,0,0]
-        #       camera +Y column = world -Z = [0,0,-1]  (right-hand cross product)
-        centroid = pts.mean(axis=0)
-        extent = pts.max(axis=0) - pts.min(axis=0)
-        view_dist = float(max(extent)) * 1.5 + 1.5
-
-        cam_R = np.array([
-            [1.0,  0.0,  0.0],
-            [0.0,  0.0, -1.0],
-            [0.0,  1.0,  0.0],
-        ], dtype=np.float64)
-        cam_T = np.eye(4, dtype=np.float64)
-        cam_T[:3, :3] = cam_R
-        cam_T[:3, 3] = [centroid[0], centroid[1] + view_dist, centroid[2]]
-        scene.camera_transform = cam_T
+        _add_zone_overlays(scene, zones, pts, ground_y)
+        _set_top_down_camera(scene, pts)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
         tmp.close()
@@ -204,6 +233,141 @@ def _cloud_to_glb(cloud_or_pts, zones=None, ground_y=None) -> Optional[str]:
         return tmp.name
     except Exception as e:
         print(f"[cloud_to_glb] EXCEPTION: {e}")
+        return None
+
+
+def _add_zone_overlays(scene, zones, pts: np.ndarray, ground_y: Optional[float]) -> None:
+    """Draw zone AABB floor outlines + landmark spheres into a trimesh Scene.
+    Shared by _cloud_to_glb (raw point cloud) and _voxels_to_glb (voxel blocks)."""
+    if not zones:
+        return
+    import trimesh
+    gy = float(ground_y) if ground_y is not None else float(pts[:, 1].max())
+    for z_idx, zone in enumerate(zones):
+        color = _ZONE_RGBA[z_idx % len(_ZONE_RGBA)]
+        mn = np.array(zone.bbox_min, dtype=np.float64)
+        mx = np.array(zone.bbox_max, dtype=np.float64)
+
+        # Draw the floor rectangle of the AABB as 4 edge sticks
+        floor_y = gy
+        fc = np.array([
+            [mn[0], floor_y, mn[2]],
+            [mx[0], floor_y, mn[2]],
+            [mx[0], floor_y, mx[2]],
+            [mn[0], floor_y, mx[2]],
+        ])
+        for a, b in ((0, 1), (1, 2), (2, 3), (3, 0)):
+            stick = _make_stick(fc[a], fc[b], radius=0.04, color=color)
+            if stick:
+                scene.add_geometry(stick)
+
+        # Landmark spheres placed at floor level
+        for lm in getattr(zone, "landmarks", []):
+            sph = trimesh.creation.icosphere(subdivisions=1, radius=0.18)
+            sph.apply_translation([float(lm.x), floor_y, float(lm.z)])
+            sph.visual.face_colors = np.array(color, dtype=np.uint8)
+            scene.add_geometry(sph)
+
+
+def _set_top_down_camera(scene, pts: np.ndarray) -> None:
+    """Top-down initial camera: camera placed above centroid looking down (-Y).
+    In trimesh camera space: +X=right, +Y=up, -Z=forward (toward scene).
+    For top-down: camera -Z (forward) aligns with world -Y (down),
+      so camera +Z column = world +Y = [0,1,0]
+          camera +X column = world +X = [1,0,0]
+          camera +Y column = world -Z = [0,0,-1]  (right-hand cross product)"""
+    centroid = pts.mean(axis=0)
+    extent = pts.max(axis=0) - pts.min(axis=0)
+    view_dist = float(max(extent)) * 1.5 + 1.5
+
+    cam_R = np.array([
+        [1.0,  0.0,  0.0],
+        [0.0,  0.0, -1.0],
+        [0.0,  1.0,  0.0],
+    ], dtype=np.float64)
+    cam_T = np.eye(4, dtype=np.float64)
+    cam_T[:3, :3] = cam_R
+    cam_T[:3, 3] = [centroid[0], centroid[1] + view_dist, centroid[2]]
+    scene.camera_transform = cam_T
+
+
+# ── Point cloud → voxel blocks → Model3D ───────────────────────────────────────
+
+
+def _voxel_centers_to_glb(
+    centers: np.ndarray, colors: Optional[np.ndarray], voxel_size: float,
+    zones=None, ground_y=None,
+) -> Optional[str]:
+    """Times the render (per-voxel trimesh box construction — CPU-only) and
+    delegates to _voxel_centers_to_glb_impl."""
+    with timed(f"_voxel_centers_to_glb render ({len(centers)} voxels)"):
+        return _voxel_centers_to_glb_impl(centers, colors, voxel_size, zones=zones, ground_y=ground_y)
+
+
+def _voxel_centers_to_glb_impl(
+    centers: np.ndarray, colors: Optional[np.ndarray], voxel_size: float,
+    zones=None, ground_y=None,
+) -> Optional[str]:
+    """
+    Render already-voxelized centers+colors (e.g. session.last_voxel_centers/
+    colors, cached once per batch by ScanSession.process_frames_batch) as
+    solid cube blocks — the box-building half of _voxels_to_glb, factored out
+    so the Scan loop's per-batch auto-refresh can reuse the exact same voxels
+    that just fed the Occupancy Map, instead of re-running voxelize_cloud.
+
+    Builds ONE combined mesh directly via vectorized numpy broadcasting of a
+    single reference box's vertex/face template, instead of calling
+    trimesh.creation.box() once per voxel and concatenating — profiled at
+    seconds (scales linearly with voxel count, each call constructing a full
+    separate trimesh object) for tens of thousands of voxels; this is the
+    same final geometry (the template IS a real trimesh.creation.box() call,
+    just reused instead of rebuilt), just constructed in one shot.
+    """
+    if len(centers) == 0:
+        return None
+    try:
+        import trimesh
+
+        template = trimesh.creation.box(extents=[voxel_size, voxel_size, voxel_size])
+        template_verts = np.asarray(template.vertices, dtype=np.float64)  # (V, 3)
+        template_faces = np.asarray(template.faces, dtype=np.int64)      # (F, 3)
+        n_verts_per_box = len(template_verts)
+        n_faces_per_box = len(template_faces)
+
+        n = len(centers)
+        centers64 = np.asarray(centers, dtype=np.float64)
+        # (n, V, 3) = (n, 1, 3) centers broadcast against (1, V, 3) template
+        all_verts = (centers64[:, None, :] + template_verts[None, :, :]).reshape(-1, 3)
+        # Each box's faces reference its OWN 8 vertices — offset the shared
+        # template's indices by i*n_verts_per_box per box.
+        face_offsets = (np.arange(n, dtype=np.int64) * n_verts_per_box)[:, None, None]
+        all_faces = (template_faces[None, :, :] + face_offsets).reshape(-1, 3)
+
+        # process=False: skip trimesh's default post-load processing (merge
+        # duplicate vertices etc.) — unnecessary here (every vertex is
+        # already correctly placed) and itself scales with mesh size.
+        mesh = trimesh.Trimesh(vertices=all_verts, faces=all_faces, process=False)
+
+        if colors is not None:
+            rgb8 = np.clip(np.asarray(colors) * 255, 0, 255).astype(np.uint8)
+        else:
+            rgb8 = np.full((n, 3), [180, 180, 180], dtype=np.uint8)
+        alpha = np.full((n, 1), 255, dtype=np.uint8)
+        rgba = np.hstack([rgb8, alpha])                       # (n, 4)
+        mesh.visual.face_colors = np.repeat(rgba, n_faces_per_box, axis=0)  # (n*F, 4)
+
+        scene = trimesh.Scene()
+        scene.add_geometry(mesh)
+
+        _add_zone_overlays(scene, zones, centers, ground_y)
+        _set_top_down_camera(scene, centers)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
+        tmp.close()
+        scene.export(tmp.name)
+        return tmp.name
+    except Exception as e:
+        print(f"[voxel_centers_to_glb] EXCEPTION: {e}")
         return None
 
 
@@ -223,6 +387,8 @@ def _euler_from_R(R: np.ndarray):
         yaw   = 0.0
     return roll, pitch, yaw
 
+
+_AXIS_CHOICES = ["+X", "+Y", "+Z", "-X", "-Y", "-Z"]
 
 # Axis label → (column_index, sign) for building permutation matrix
 _AXIS_MAP = {"+X": (0, 1), "+Y": (1, 1), "+Z": (2, 1),
@@ -325,11 +491,9 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
     def _load_upload(scan_id: Optional[str]):
         if not scan_id or _upload_dir is None:
-            return None, None
-        base = _upload_dir / scan_id
-        video = str(base / "video.mp4") if (base / "video.mp4").exists() else None
-        imu = str(base / "imu_data.csv") if (base / "imu_data.csv").exists() else None
-        return video, imu
+            return None
+        base = _upload_dir / scan_id / "dataset"
+        return str(base) if base.exists() else None
 
     def _correct_rotation(frame: np.ndarray, rotation: int) -> np.ndarray:
         rotation = rotation % 360
@@ -345,34 +509,16 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             return frame
         return cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-    def _collect_frames_in_range(
-        video_path: str, start_s: float, end_s: float, fps_val: float,
-        max_dim: int = 0, extra_rotation: int = 0,
-    ) -> List[np.ndarray]:
-        cap = cv2.VideoCapture(video_path)
-        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        rotation = (int(cap.get(cv2.CAP_PROP_ORIENTATION_META)) + extra_rotation) % 360
-        interval = max(1, int(video_fps / max(fps_val, 0.1)))
-        start_frame = max(0, int(start_s * video_fps))
-        end_frame = min(int(end_s * video_fps) if end_s > 0 else total, total)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        frames, idx = [], 0
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if int(cap.get(cv2.CAP_PROP_POS_FRAMES)) > end_frame:
-                break
-            if idx % interval == 0:
-                frame = _correct_rotation(frame, rotation)
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                if max_dim > 0:
-                    rgb = _resize_frame(rgb, max_dim)
-                frames.append(rgb)
-            idx += 1
-        cap.release()
-        return frames
+    def _read_camera_index(dataset_path: str) -> List[tuple]:
+        """Return [(timestamp_ns, abs_image_path), ...] sorted by timestamp,
+        read from dataset_path/camera.csv (header: timestamp_ns,filename)."""
+        base = Path(dataset_path)
+        csv_path = base / "camera.csv"
+        if not csv_path.exists():
+            return []
+        df = pd.read_csv(csv_path)
+        rows = sorted(zip(df["timestamp_ns"].tolist(), df["filename"].tolist()), key=lambda r: r[0])
+        return [(int(ts), str(base / "images" / fname)) for ts, fname in rows]
 
     def _parse_segments(df) -> List[tuple]:
         if df is None or (hasattr(df, "empty") and df.empty):
@@ -474,249 +620,527 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
     # ── event handlers ─────────────────────────────────────────────────────────
 
-    def _handle_video_upload(video_path: Optional[str], fps_val: float, extra_rotation: int = 0):
-        if not video_path:
-            return None, "Upload a video to preview.", _DEFAULT_SEGMENTS
-        cap = cv2.VideoCapture(video_path)
-        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        rotation = (int(cap.get(cv2.CAP_PROP_ORIENTATION_META)) + extra_rotation) % 360
-        duration = total / video_fps if video_fps > 0 else 0.0
-        interval = max(1, int(video_fps / max(fps_val, 0.1)))
-        frames, idx = [], 0
-        while cap.isOpened() and len(frames) < 16:
-            ret, frame = cap.read()
-            if not ret:
+    def _handle_dataset_change(dataset_path: Optional[str], fps_val: float, extra_rotation: int = 0):
+        if not dataset_path or not Path(dataset_path).exists():
+            return None, "Enter/select a dataset folder (images/ + camera.csv) to preview.", _DEFAULT_SEGMENTS
+        index = _read_camera_index(dataset_path)
+        if not index:
+            return None, f"No camera.csv found under {dataset_path}.", _DEFAULT_SEGMENTS
+        t0, t1 = index[0][0], index[-1][0]
+        duration = (t1 - t0) / 1e9
+        deltas = np.diff([ts for ts, _ in index])
+        dataset_fps = float(1e9 / np.median(deltas)) if len(deltas) else fps_val
+        interval = max(1, round(dataset_fps / max(fps_val, 0.1)))
+
+        preview = []
+        for i, (_, path) in enumerate(index):
+            if i % interval != 0:
+                continue
+            frame = cv2.imread(path)
+            if frame is None:
+                continue
+            frame = _correct_rotation(frame, extra_rotation)
+            preview.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if len(preview) >= 16:
                 break
-            if idx % interval == 0:
-                frame = _correct_rotation(frame, rotation)
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            idx += 1
-        cap.release()
-        approx = max(1, int(total / max(interval, 1)))
-        msg = f"Video: {duration:.1f}s — ~{approx} sampled frames at {fps_val} FPS"
+
+        approx = max(1, len(index) // max(interval, 1))
+        msg = f"Dataset: {duration:.1f}s — {len(index)} frames, ~{approx} sampled at {fps_val} FPS"
         default_df = pd.DataFrame(
             {"start_s": [0.0], "end_s": [round(duration, 1)], "area_name": [""]}
         )
-        return frames, msg, default_df
+        return preview, msg, default_df
 
-    def _run_local_scan(
-        video_path: Optional[str],
-        imu_file_path: Optional[str],
+    def _run_simulated_stream(
+        dataset_path: Optional[str],
         fps_val: float,
         batch_size: int,
         location_id: str,
         segments_df,
         resolution: str,
-        pose_src: str = "Auto",
-        extra_rotation: int = 0,
-        zone_type: str = "",
+        pose_src: str,
+        extra_rotation: int,
+        imu_orientation: str,
+        zone_type: str,
+        axis_roll: str,
+        axis_pitch: str,
+        axis_yaw: str,
+        sor_neighbors: int,
+        sor_std_ratio: float,
+        voxel_size: float,
+        realtime: bool,
+        occ_obstacle_min_h: float = 0.10,
+        occ_step_over_max_h: float = 0.40,
+        occ_obstacle_max_h: float = 2.20,
+        occ_logodds_hit: float = 0.85,
+        occ_logodds_miss: float = 0.40,
+        occ_logodds_occ_thresh: float = 1.0,
+        occ_logodds_free_thresh: float = -1.0,
+        occ_height_ewma_alpha: float = 0.30,
+        occ_enable_ray_casting: bool = True,
+        occ_enable_bayesian: bool = True,
+        show_live_points: bool = True,
+        show_voxelization: bool = True,
+        show_occupancy: bool = True,
     ) -> Generator[Dict[str, Any], None, None]:
-        if not video_path:
-            yield {log_output: "Upload a video first."}
+        """
+        Simulated-live counterpart to _run_local_scan: instead of reading a
+        finished camera.csv/imu.csv all at once and slicing it into
+        pre-declared segments, this replays the same dataset folder
+        frame-by-frame / IMU-sample-by-sample through StreamingScanSession's
+        push API (stream_session.py) via stream_simulator.replay_dataset —
+        proving the streaming interface a real Android live source will
+        drive later, without needing that source to exist yet.
+
+        Live Points -> Voxelization -> Occupancy Map all rebuild after every
+        processed chunk now, each gated by its own checkbox (see the Live
+        Reconstruction tab) — the Occupancy Map's own update() already ran
+        inside StreamingScanSession._process_chunk, fed from this chunk's
+        points additionally voxel-downsampled at `voxel_size` (see
+        ScanSession.process_frames_batch's docstring); Live Points/
+        Voxelization are rebuilt here for display only when checked, since
+        both cost grows with the total scan size (no incremental voxel-merge
+        primitive in Open3D) — unlike the Occupancy Map's update.
+        """
+        if not dataset_path or not Path(dataset_path).exists():
+            yield {log_output: "Select a dataset folder first."}
             return
 
+        axis_perm = _perm_matrix(axis_roll, axis_pitch, axis_yaw)
         max_dim = int(resolution.split("×")[0]) if resolution != "Original" else 0
         location_id = (location_id or "").strip() or "default"
         zone_type = (zone_type or "").strip()
         segments = _parse_segments(segments_df)
-        session = scan_manager.get_or_create(location_id, zone_type=zone_type)
+        imu_orient_key = _IMU_ORIENTATION_LABELS.get(imu_orientation, "portrait")
 
-        # Resolve effective pose source
-        _use_imu  = pose_src in ("Auto", "IMU + VO")
-        _use_da3  = pose_src == "DA3 poses"
-        # _use_vo   = pose_src in ("VO only",) — default when neither flag set
+        stream = StreamingScanSession(
+            scan_manager, location_id, pose_src=pose_src,
+            imu_orientation=imu_orient_key, zone_type=zone_type,
+            axis_perm=axis_perm, mini_batch=int(batch_size),
+            sor_nb_neighbors=int(sor_neighbors), sor_std_ratio=float(sor_std_ratio),
+            occupancy_voxel_size=float(voxel_size),
+        )
+        session = stream.session
+        # See _run_local_scan's identical call — applied fresh at the start
+        # of this run, only affects FUTURE update() calls.
+        session.configure_occupancy_map(
+            obstacle_min_h=occ_obstacle_min_h,
+            step_over_max_h=occ_step_over_max_h,
+            obstacle_max_h=occ_obstacle_max_h,
+            logodds_hit=occ_logodds_hit,
+            logodds_miss=occ_logodds_miss,
+            logodds_occupied_thresh=occ_logodds_occ_thresh,
+            logodds_free_thresh=occ_logodds_free_thresh,
+            height_ewma_alpha=occ_height_ewma_alpha,
+            enable_ray_casting=occ_enable_ray_casting,
+            enable_bayesian=occ_enable_bayesian,
+        )
 
-        # Load IMU data (only if an IMU-based mode is requested)
-        if _use_imu and imu_file_path and Path(imu_file_path).exists():
-            yield {log_output: f"Loading IMU data from {Path(imu_file_path).name}…"}
-            try:
-                session.set_imu_file(imu_file_path)
-                yield {log_output: f"[{pose_src}] IMU data loaded — poses pre-computed before depth estimation."}
-            except Exception as e:
-                yield {log_output: f"IMU load failed ({e}), falling back to VO."}
-                _use_imu = False
-        elif _use_imu and pose_src == "IMU + VO":
-            yield {log_output: "IMU + VO selected but no IMU file provided — falling back to VO."}
-            _use_imu = False
-        elif _use_da3:
-            yield {log_output: "[DA3 poses] Using DA3 model camera_pose — requires PyTorch DA3Estimator (not ONNX)."}
-        else:
-            yield {log_output: f"[{pose_src}] Using FeatureTracker VO for pose estimation."}
+        yield {log_output: f"[Simulated Live Stream] Replaying `{dataset_path}` "
+                           f"as a live frame+IMU source…"}
 
-        # Read video FPS for IMU timestamp mapping
-        cap = cv2.VideoCapture(video_path)
-        video_fps = cap.get(cv2.CAP_PROP_FPS) or fps_val
-        cap.release()
-
-        MINI_BATCH = max(1, int(batch_size))
-        depth_accum: list = []
-        all_frames_accum: list = []   # (rgb, DepthFrame, pose) for every processed frame
-        total_infer_ms = 0.0
-        total_frames_processed = 0
-
-        for seg_i, (start_s, end_s, zone_name) in enumerate(segments, 1):
-            label = f"'{zone_name}'" if zone_name else "(unlabelled)"
-            yield {log_output: f"Segment {seg_i}/{len(segments)} {label}: "
-                               f"extracting frames {start_s:.1f}s – {end_s:.1f}s…"}
-
-            frames_rgb = _collect_frames_in_range(video_path, start_s, end_s, fps_val, max_dim, extra_rotation)
-            if not frames_rgb:
-                yield {log_output: f"Segment {seg_i}: no frames in range, skipping."}
+        n_chunks = 0
+        # See _run_local_scan's identical variable — skip rebuilding Live
+        # Points/Voxelization on a chunk that added zero new points.
+        _last_render_point_count = -1
+        for event in replay_dataset(
+            stream, dataset_path, segments, fps_val=fps_val,
+            max_dim=max_dim, extra_rotation=extra_rotation, realtime=bool(realtime),
+        ):
+            if event["kind"] == "error":
+                yield {log_output: event["message"]}
+                return
+            if event["kind"] in ("zone_start", "zone_end"):
+                yield {log_output: f"[{event['kind']}] '{event['zone']}' "
+                                   f"@ {event['progress']*100:.0f}% replayed"}
                 continue
 
-            # Set area context for semantic landmark accumulation
-            session._current_area_name = zone_name
-            session._raw_landmarks = []
-
-            n_total = len(frames_rgb)
-            segment_positions: list = []
-            point_count, cam_pos = 0, [0.0, 0.0, 0.0]
-            seg_infer_ms = 0.0
-
-            # ── Pass 1: pre-compute all IMU poses for this segment ─────────────
-            # Use sampling FPS (fps_val), not video FPS — extracted frame i is at
-            # start_s + i/fps_val seconds, not start_s + i/video_fps.
-            seg_imu_poses: Optional[List] = (
-                session.compute_segment_poses(n_total, start_s, fps_val)
-                if _use_imu else None
-            )
-            if seg_imu_poses is not None:
-                yield {log_output: (
-                    f"Seg {seg_i}/{len(segments)} {label} — "
-                    f"{n_total} IMU poses computed, starting depth estimation…"
-                )}
-
-            # ── Pass 2: depth estimation + back-projection in mini-batches ─────
-            for chunk_start in range(0, n_total, MINI_BATCH):
-                chunk = frames_rgb[chunk_start:chunk_start + MINI_BATCH]
-                chunk_poses = (
-                    seg_imu_poses[chunk_start:chunk_start + len(chunk)]
-                    if seg_imu_poses is not None else None
-                )
-                f_lo = chunk_start + 1
-                f_hi = chunk_start + len(chunk)
-
-                yield {
-                    log_output: (
-                        f"Seg {seg_i}/{len(segments)} {label} — "
-                        f"frames {f_lo}–{f_hi} / {n_total}…"
+            result = event.get("result")
+            if result is None:
+                continue
+            n_chunks += 1
+            cam_pos = result["cam_pos"]
+            pos_str = f"x={cam_pos[0]:.2f}  y={cam_pos[1]:.2f}  z={cam_pos[2]:.2f}"
+            src_tag = f"[{result['pose_source']}]"
+            session.preview_landmarks()
+            det_image, det_text = _build_detection_view(session)
+            _yield: Dict[Any, Any] = {
+                detection_image: det_image,
+                detection_text: det_text,
+                scan_status: (
+                    f"[Live] chunk {n_chunks} | {result['point_count']:,} pts | "
+                    f"{event['progress']*100:.0f}% replayed | "
+                    f"batch {result['infer_ms']:.0f} ms "
+                    f"({result['infer_ms']/result['n_frames']:.0f} ms/f)"
+                ),
+                scan_position: f"{src_tag}  {pos_str}",
+                log_output: (
+                    f"{src_tag} {pos_str} | {result['point_count']:,} pts | "
+                    f"{event['progress']*100:.0f}% replayed"
+                ),
+            }
+            if show_occupancy:
+                _yield[occupancy_plot] = session.occupancy_map.render_plotly(zones=session.zones)
+            # session.last_voxel_centers is already the single, incrementally-
+            # accumulated voxelization the Occupancy Map feed itself computed
+            # this chunk (see ScanSession._merge_voxels) — no separate
+            # voxelize_cloud() call needed here, just render what's there.
+            # Still skip the mesh rebuild when nothing changed, same as before.
+            if (show_live_points or show_voxelization) and session._raw_point_count != _last_render_point_count:
+                if show_live_points:
+                    cloud = session.ensure_cloud_built()
+                    _yield[live_cloud_plot] = _cloud_to_glb(
+                        cloud, zones=session.zones, ground_y=session.occupancy_map._ground_y
                     )
-                }
+                if show_voxelization:
+                    _yield[voxel_plot] = _voxel_centers_to_glb(
+                        session.last_voxel_centers, session.last_voxel_colors, session.last_voxel_size,
+                        zones=session.zones, ground_y=session.occupancy_map._ground_y,
+                    )
+                _last_render_point_count = session._raw_point_count
+            yield _yield
 
-                point_count, cam_pos, batch_infer_ms = session.process_frames_batch(
-                    chunk, imu_poses=chunk_poses, use_da3_pose=_use_da3
-                )
-                seg_infer_ms += batch_infer_ms
-                total_infer_ms += batch_infer_ms
-                total_frames_processed += len(chunk)
+        yield {log_output: f"Replay complete ({session._raw_point_count:,} pts) — exporting…"}
+        stream.finish()
 
-                if session.last_frames_rgb and session.last_depth_frames:
-                    mid = len(session.last_frames_rgb) // 2
-                    depth_accum.append((
-                        session.last_frames_rgb[mid],
-                        session.last_depth_frames[mid],
-                        session.last_frame_poses[mid] if session.last_frame_poses else None,
-                    ))
-                    # Accumulate every frame for the frame explorer (skip if no pose)
-                    poses_for_accum = session.last_frame_poses or []
-                    for rgb_f, df_f, pose_f in zip(
-                        session.last_frames_rgb,
-                        session.last_depth_frames,
-                        poses_for_accum,
-                    ):
-                        if pose_f is not None:
-                            all_frames_accum.append((rgb_f, df_f, pose_f))
-
-                if len(session.last_trajectory) > 0:
-                    segment_positions.extend(session.last_trajectory.tolist())
-
-                pos_str = f"x={cam_pos[0]:.2f}  y={cam_pos[1]:.2f}  z={cam_pos[2]:.2f}"
-
-                _cur_zones = session.zones  # zones completed so far
-                _cur_gy = session.occupancy_map._ground_y
-                yield {
-                    live_cloud_plot: _cloud_to_glb(session._cloud, zones=_cur_zones, ground_y=_cur_gy),
-                    occupancy_plot:  session.occupancy_map.render_plotly(zones=_cur_zones),
-                    scan_status:     (
-                        f"Seg {seg_i}/{len(segments)} "
-                        f"[{f_lo}–{f_hi}/{n_total}] | {point_count:,} pts | "
-                        f"batch {batch_infer_ms:.0f} ms "
-                        f"({batch_infer_ms/len(chunk):.0f} ms/f)"
-                    ),
-                    scan_position:   pos_str,
-                    log_output:      (
-                        f"Seg {seg_i}/{len(segments)} {label} — "
-                        f"frames {f_hi}/{n_total} | {point_count:,} pts | "
-                        f"batch {batch_infer_ms:.0f} ms "
-                        f"({batch_infer_ms/len(chunk):.0f} ms/f) | "
-                        f"total {total_infer_ms/1000:.1f} s"
-                    ),
-                }
-
-            if zone_name and segment_positions:
-                session.set_label_from_positions(zone_name, segment_positions, margin=0.3)
-                # Refresh displays immediately so the new area label/landmarks appear
-                _seg_zones = session.zones
-                _seg_gy = session.occupancy_map._ground_y
-                yield {
-                    live_cloud_plot: _cloud_to_glb(session._cloud, zones=_seg_zones, ground_y=_seg_gy),
-                    occupancy_plot:  session.occupancy_map.render_plotly(zones=_seg_zones),
-                }
-
-        accum_rgb   = [x[0] for x in depth_accum]
-        accum_df    = [x[1] for x in depth_accum]
-        accum_poses = [x[2] for x in depth_accum]
-        depth_data = _build_depth_data(accum_rgb, accum_df, frame_poses=accum_poses)
-        n_views = len(depth_data) if depth_data else 0
-        depth_choices = [f"View {i+1}" for i in range(n_views)] if n_views else ["View 1"]
-        first_rgb, first_dvis = _get_depth_view(depth_data, 0) if depth_data else (None, None)
-        zone_names = ", ".join(z.label for z in session.zones) if session.zones else "none"
-
-        n_stored = len(all_frames_accum)
-        slider_max = max(0, n_stored - 1)
-        yield {
-            scan_status:          (
-                f"Done | {len(session._cloud.points):,} pts | Zones: {zone_names} | "
-                f"total infer {total_infer_ms/1000:.1f} s"
-            ),
-            scan_position:        f"x={cam_pos[0]:.2f}  y={cam_pos[1]:.2f}  z={cam_pos[2]:.2f}",
-            log_output:           (
-                f"All {len(segments)} segment(s) complete. "
-                f"{n_stored} frames stored for Frame Explorer. "
-                f"Total inference: {total_infer_ms/1000:.1f} s "
-                f"({total_infer_ms / max(total_frames_processed, 1):.0f} ms/f avg)"
-            ),
-            live_cloud_plot:      _cloud_to_glb(session._cloud, zones=session.zones, ground_y=session.occupancy_map._ground_y),
-            occupancy_plot:       session.occupancy_map.render_plotly(zones=session.zones),
-            depth_data_state:     depth_data,
-            depth_view_selector:  gr.Dropdown(choices=depth_choices, value=depth_choices[0]),
-            depth_rgb_image:      first_rgb,
-            depth_vis_image:      first_dvis,
-            measure_points_state: [],
-            depth_measure_text:   "",
-            all_frames_state:     all_frames_accum,
-            frame_start_slider:   gr.Slider(minimum=0, maximum=slider_max, value=0, step=1),
-            frame_end_slider:     gr.Slider(minimum=0, maximum=slider_max, value=slider_max, step=1),
-            frame_pose_text:      _format_poses(all_frames_accum, 0, slider_max),
+        zones = session.zones
+        zone_names = ", ".join(z.label for z in zones) if zones else "none"
+        _final_yield: Dict[Any, Any] = {
+            scan_status: f"Done | {len(session._cloud.points):,} pts | Zones: {zone_names}",
+            log_output: f"Simulated live stream finished and exported map for '{location_id}'.",
         }
+        if show_occupancy:
+            _final_yield[occupancy_plot] = session.occupancy_map.render_plotly(zones=zones)
+        if show_live_points:
+            _final_yield[live_cloud_plot] = _cloud_to_glb(
+                session._cloud, zones=zones, ground_y=session.occupancy_map._ground_y
+            )
+        if show_voxelization:
+            _final_yield[voxel_plot] = _voxel_centers_to_glb(
+                session.last_voxel_centers, session.last_voxel_colors, session.last_voxel_size,
+                zones=zones, ground_y=session.occupancy_map._ground_y,
+            )
+        yield _final_yield
+
+    def _manual_stream_start(
+        dataset_path: Optional[str],
+        fps_val: float,
+        batch_size: int,
+        location_id: str,
+        segments_df,
+        resolution: str,
+        pose_src: str,
+        extra_rotation: int,
+        imu_orientation: str,
+        zone_type: str,
+        axis_roll: str,
+        axis_pitch: str,
+        axis_yaw: str,
+        sor_neighbors: int,
+        sor_std_ratio: float,
+        voxel_size: float,
+        occ_obstacle_min_h: float,
+        occ_step_over_max_h: float,
+        occ_obstacle_max_h: float,
+        occ_logodds_hit: float,
+        occ_logodds_miss: float,
+        occ_logodds_occ_thresh: float,
+        occ_logodds_free_thresh: float,
+        occ_height_ewma_alpha: float,
+        occ_enable_ray_casting: bool,
+        occ_enable_bayesian: bool,
+    ):
+        """
+        (Re)initializes a manual, single-step replay of dataset_path — same
+        setup as _run_simulated_stream (StreamingScanSession + Occupancy Map
+        Settings applied fresh), but hands control back to the GUI after
+        building the first frame preview instead of auto-looping through
+        replay_dataset(). Each subsequent "Feed Next Frame" click drives one
+        ManualDatasetReplayer.step() (see stream_simulator.py).
+        """
+        if not dataset_path or not Path(dataset_path).exists():
+            return None, None, gr.update(interactive=False), "Select a dataset folder first."
+
+        axis_perm = _perm_matrix(axis_roll, axis_pitch, axis_yaw)
+        max_dim = int(resolution.split("×")[0]) if resolution != "Original" else 0
+        location_id = (location_id or "").strip() or "default"
+        zone_type = (zone_type or "").strip()
+        segments = _parse_segments(segments_df)
+        imu_orient_key = _IMU_ORIENTATION_LABELS.get(imu_orientation, "portrait")
+
+        stream = StreamingScanSession(
+            scan_manager, location_id, pose_src=pose_src,
+            imu_orientation=imu_orient_key, zone_type=zone_type,
+            axis_perm=axis_perm, mini_batch=int(batch_size),
+            sor_nb_neighbors=int(sor_neighbors), sor_std_ratio=float(sor_std_ratio),
+            occupancy_voxel_size=float(voxel_size),
+        )
+        # See _run_simulated_stream's identical call — applied fresh at the
+        # start of this run, only affects FUTURE update() calls.
+        stream.session.configure_occupancy_map(
+            obstacle_min_h=occ_obstacle_min_h,
+            step_over_max_h=occ_step_over_max_h,
+            obstacle_max_h=occ_obstacle_max_h,
+            logodds_hit=occ_logodds_hit,
+            logodds_miss=occ_logodds_miss,
+            logodds_occupied_thresh=occ_logodds_occ_thresh,
+            logodds_free_thresh=occ_logodds_free_thresh,
+            height_ewma_alpha=occ_height_ewma_alpha,
+            enable_ray_casting=occ_enable_ray_casting,
+            enable_bayesian=occ_enable_bayesian,
+        )
+
+        replayer = ManualDatasetReplayer(
+            stream, dataset_path, segments, fps_val=fps_val,
+            max_dim=max_dim, extra_rotation=extra_rotation,
+        )
+        if replayer.error:
+            return None, None, gr.update(interactive=False), replayer.error
+        if not replayer.has_more():
+            return None, None, gr.update(interactive=False), "No frames found in this dataset."
+
+        preview = replayer.peek_next_frame_preview()
+        return (
+            replayer, preview, gr.update(interactive=True),
+            f"[Manual Stream] Ready — '{dataset_path}' loaded. "
+            f"Preview shows the first frame; click 'Feed Next Frame' to begin.",
+        )
+
+    def _manual_stream_feed(
+        replayer: Optional["ManualDatasetReplayer"],
+        show_live_points: bool,
+        show_voxelization: bool,
+        show_occupancy: bool,
+    ):
+        """
+        One "Feed Next Frame" click == one ManualDatasetReplayer.step() —
+        applies any IMU samples/zone boundaries preceding the next frame,
+        then pushes that single frame through the same
+        StreamingScanSession/process_frames_batch pipeline
+        _run_simulated_stream uses (just one frame per click instead of an
+        auto loop). Auto-finalizes + exports once no frames remain, exactly
+        like _run_simulated_stream's own end-of-replay step.
+        """
+        if replayer is None:
+            return (
+                replayer, None, gr.update(interactive=False),
+                gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), gr.update(),
+                "Click 'Start / Reset Manual Stream' first.",
+            )
+
+        event = replayer.step()
+        session = replayer.stream.session
+        zone_log = " ".join(
+            f"[{e['kind']}] '{e.get('zone', '')}'" for e in event.get("zone_events", [])
+        )
+
+        if event["kind"] == "done":
+            replayer.stream.finish()
+            zones = session.zones
+            zone_names = ", ".join(z.label for z in zones) if zones else "none"
+            gy = session.occupancy_map._ground_y
+            occ = session.occupancy_map.render_plotly(zones=zones) if show_occupancy else gr.update()
+            lp = _cloud_to_glb(session._cloud, zones=zones, ground_y=gy) if show_live_points else gr.update()
+            vp = _voxel_centers_to_glb(
+                session.last_voxel_centers, session.last_voxel_colors, session.last_voxel_size,
+                zones=zones, ground_y=gy,
+            ) if show_voxelization else gr.update()
+            log = f"Manual stream finished and exported map for '{session.location_id}'."
+            return (
+                replayer, None, gr.update(interactive=False),
+                lp, vp, occ,
+                gr.update(), gr.update(),
+                f"Done | {len(session._cloud.points):,} pts | Zones: {zone_names}",
+                gr.update(),
+                f"{zone_log} {log}" if zone_log else log,
+            )
+
+        preview = replayer.peek_next_frame_preview()
+        has_more = replayer.has_more()
+        result = event.get("result")
+
+        if result is None:
+            # Still buffering into a mini-batch/DA3 window — no new render yet.
+            log = (zone_log or
+                   f"Frame buffered ({event['progress']*100:.0f}% replayed) — "
+                   f"waiting for a full chunk.")
+            return (
+                replayer, preview, gr.update(interactive=has_more),
+                gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), gr.update(),
+                log,
+            )
+
+        cam_pos = result["cam_pos"]
+        pos_str = f"x={cam_pos[0]:.2f}  y={cam_pos[1]:.2f}  z={cam_pos[2]:.2f}"
+        src_tag = f"[{result['pose_source']}]"
+        session.preview_landmarks()
+        det_image, det_text = _build_detection_view(session)
+
+        occ = session.occupancy_map.render_plotly(zones=session.zones) if show_occupancy else gr.update()
+        lp_update = gr.update()
+        vp_update = gr.update()
+        # See _run_simulated_stream's identical check — skip rebuilding
+        # Live Points/Voxelization on a chunk that added zero new points
+        # (tracked on the replayer itself since it must survive across
+        # separate per-click callback invocations, not one generator's
+        # closure).
+        if (show_live_points or show_voxelization) and session._raw_point_count != replayer.last_render_point_count:
+            if show_live_points:
+                cloud = session.ensure_cloud_built()
+                lp_update = _cloud_to_glb(cloud, zones=session.zones, ground_y=session.occupancy_map._ground_y)
+            if show_voxelization:
+                # session.last_voxel_centers is already the single,
+                # incrementally-accumulated voxelization the Occupancy Map
+                # feed itself computed this step (see
+                # ScanSession._merge_voxels) — no separate voxelize_cloud()
+                # call needed here, just render what's there.
+                vp_update = _voxel_centers_to_glb(
+                    session.last_voxel_centers, session.last_voxel_colors, session.last_voxel_size,
+                    zones=session.zones, ground_y=session.occupancy_map._ground_y,
+                )
+            replayer.last_render_point_count = session._raw_point_count
+
+        status = (
+            f"[Manual] {result['point_count']:,} pts | {event['progress']*100:.0f}% replayed | "
+            f"batch {result['infer_ms']:.0f} ms ({result['infer_ms']/result['n_frames']:.0f} ms/f)"
+        )
+        log = (f"{zone_log} " if zone_log else "") + (
+            f"{src_tag} {pos_str} | {result['point_count']:,} pts | "
+            f"{event['progress']*100:.0f}% replayed"
+        )
+        return (
+            replayer, preview, gr.update(interactive=has_more),
+            lp_update, vp_update, occ,
+            det_image, det_text, status, f"{src_tag}  {pos_str}", log,
+        )
 
     def _export_map(location_id: str):
         location_id = (location_id or "").strip() or "default"
         session = scan_manager.get(location_id)
         if session is None:
-            return "No active session. Run Scan first."
+            return "No active session. Run Scan first.", None, None, go.Figure()
         out_dir = session.export()
         n_pts = len(session._cloud.points)
-        n_zones = len(session.zones)
-        return f"Exported → `{out_dir}`  ({n_pts:,} pts, {n_zones} zones)"
+        # export() -> finalize_landmarks() only just populated zone.landmarks
+        # (clustering + zone assignment happens once, at export time, not
+        # live during scanning) — re-render all three views now so the
+        # landmark markers actually show up instead of staying invisible
+        # until a manual Reload.
+        zones = session.zones
+        n_zones = len(zones)
+        gy = session.occupancy_map._ground_y
+        return (
+            f"Exported → `{out_dir}`  ({n_pts:,} pts, {n_zones} zones)",
+            _cloud_to_glb(session._cloud, zones=zones, ground_y=gy),
+            _voxel_centers_to_glb(
+                session.last_voxel_centers, session.last_voxel_colors,
+                session.last_voxel_size, zones=zones, ground_y=gy,
+            ),
+            session.occupancy_map.render_plotly(zones=zones),
+        )
 
     def _clear_cloud(location_id: str):
         location_id = (location_id or "").strip() or "default"
         session = scan_manager.get(location_id)
         if session is not None:
             session.reset_cloud()
-        return None, go.Figure()
+        return None, None, go.Figure()
+
+    def _reload_occupancy(location_id: str):
+        """Manually re-render the Occupancy Map — a Scan run occasionally ends
+        without the plot updating (Gradio drops a mid-generator yield), so this
+        gives a reliable way to force a redraw from current session state."""
+        location_id = (location_id or "").strip() or "default"
+        session = scan_manager.get(location_id)
+        if session is None:
+            return go.Figure()
+        session.preview_landmarks()  # no-op post-export (raw_landmarks already cleared by finalize_landmarks)
+        return session.occupancy_map.render_plotly(zones=session.zones)
+
+    def _reload_detections(location_id: str):
+        location_id = (location_id or "").strip() or "default"
+        session = scan_manager.get(location_id)
+        return _build_detection_view(session)
+
+    def _voxelize(location_id: str, voxel_size: float):
+        """Manual "Voxelize" button — the one place besides the live
+        Occupancy Map feed allowed to (re)compute voxelize_cloud() directly,
+        since this is an explicit, infrequent, user-picked-voxel-size
+        recompute over the WHOLE cloud (e.g. after changing the slider), not
+        part of the automatic per-chunk pipeline. Routes its result through
+        session._merge_voxels() — same accumulator the live feed uses — so
+        session.last_voxel_centers stays the one canonical answer afterward,
+        rather than a second, disconnected computation."""
+        location_id = (location_id or "").strip() or "default"
+        session = scan_manager.get(location_id)
+        if session is None:
+            return None
+        session.ensure_cloud_built()  # self._cloud is lazy — build it before reading
+        if len(session._cloud.points) == 0:
+            return None
+        centers, colors, vsize = voxelize_cloud(session._cloud, voxel_size=voxel_size)
+        session._merge_voxels(centers, colors, vsize)
+        return _voxel_centers_to_glb(
+            session.last_voxel_centers, session.last_voxel_colors, session.last_voxel_size,
+            zones=session.zones, ground_y=session.occupancy_map._ground_y,
+        )
+
+    def _reload_live_points(location_id: str):
+        """Manually (re)render the Live Points 3D view. Also called
+        automatically once per chunk during Scan/Simulated Live Stream when
+        the "Live Points" checkbox is on (see _run_local_scan/
+        _run_simulated_stream) — this is the on-demand "show me current
+        state right now" counterpart, e.g. after Export or when nothing is
+        actively streaming."""
+        location_id = (location_id or "").strip() or "default"
+        session = scan_manager.get(location_id)
+        if session is None:
+            return None
+        session.ensure_cloud_built()  # incremental — only merges batches added since the last call
+        return _cloud_to_glb(session._cloud, zones=session.zones, ground_y=session.occupancy_map._ground_y)
+
+    def _reload_all_views(location_id: str, voxel_size: float):
+        """Single "Reload" button in the Live Reconstruction tab — refreshes
+        all 3 views at once (Live Points, Voxelization, Occupancy Map),
+        regardless of checkbox state (checkboxes only gate the automatic
+        per-chunk recompute + visibility, not this manual action)."""
+        return (
+            _reload_live_points(location_id),
+            _voxelize(location_id, voxel_size),
+            _reload_occupancy(location_id),
+        )
+
+    def _toggle_live_points(show: bool, location_id: str):
+        """Checkbox toggle — hides the view immediately when unchecked
+        (independent of any running Scan/Stream generator); when re-checked,
+        also refreshes it from current session state right away rather than
+        waiting for the next chunk (which might be a while, or never, if
+        nothing is currently running)."""
+        if not show:
+            return gr.update(visible=False)
+        return gr.update(visible=True, value=_reload_live_points(location_id))
+
+    def _toggle_voxelization(show: bool, location_id: str, voxel_size: float):
+        if not show:
+            return gr.update(visible=False)
+        return gr.update(visible=True, value=_voxelize(location_id, voxel_size))
+
+    def _toggle_occupancy(show: bool, location_id: str):
+        if not show:
+            return gr.update(visible=False)
+        return gr.update(visible=True, value=_reload_occupancy(location_id))
+
+    def _apply_vlm_model(model_id: str):
+        if not scan_manager.semantic_mapper_available:
+            return "Semantic mapping is disabled on this server — nothing to apply."
+        model_id = (model_id or "").strip()
+        if not model_id:
+            return "Model ID can't be empty."
+        scan_manager.set_semantic_mapper_model(model_id)
+        print(f"[Scan GUI] Semantic mapper VLM model switched to '{model_id}'")
+        return f"Now using `{model_id}` for the next VLM call (existing SamplingParams/config unchanged)."
 
     # ── layout ─────────────────────────────────────────────────────────────────
 
@@ -729,40 +1153,64 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         measure_points_state = gr.State(value=[])
         all_frames_state    = gr.State(value=[])   # list of (rgb, DepthFrame, pose 4×4)
         video_rotation_state = gr.State(value=0)   # extra rotation in degrees (0/90/180/270)
+        manual_replay_state = gr.State(value=None)  # ManualDatasetReplayer, see "Manual Live Stream"
 
         with gr.Row():
 
             # ── Left: inputs ─────────────────────────────────────────────────
             with gr.Column(scale=2):
-                input_video = gr.Video(label="Upload Video", interactive=True)
+                dataset_path_input = gr.Textbox(
+                    label="Dataset folder (images/ + imu.csv + camera.csv)",
+                    placeholder="e.g. uploads/<scan_id>/dataset — or an absolute path",
+                    interactive=True,
+                )
                 with gr.Row():
-                    rotate_video_btn = gr.Button("Rotate Video 90°", size="sm", scale=1)
+                    preview_dataset_btn = gr.Button("Preview Dataset", size="sm", scale=2)
+                    rotate_video_btn = gr.Button("Rotate Images 90°", size="sm", scale=1)
                     video_rotation_display = gr.Textbox(
                         value="Rotation: 0°", label="", interactive=False, scale=2,
                         container=False,
                     )
-                imu_file_input = gr.File(
-                    label="IMU data (imu_data.csv — optional)",
-                    file_types=[".csv"],
-                    type="filepath",
-                )
                 pose_src_radio = gr.Radio(
-                    choices=["Auto", "IMU + VO", "VO only", "DA3 poses"],
-                    value="Auto",
+                    choices=["IMU + VO", "RTAB-Map"],
+                    value="IMU + VO",
                     label="Pose source",
                     info=(
-                        "Auto = IMU+VO if file loaded, else VO.  "
-                        "DA3 poses requires the PyTorch DA3Estimator (not ONNX)."
+                        "IMU + VO = FeatureTracker VO translation + IMU gyro rotation "
+                        "(falls back to VO only if the dataset has no imu.csv).  "
+                        "RTAB-Map requires a connected rtabmap_docker container "
+                        "(see scan_server/rtabmap_docker/README.md) — RGB-D visual "
+                        "odometry + loop closure using DA3-estimated depth; does NOT "
+                        "use imu.csv at all, no per-device calibration needed."
+                    ),
+                    interactive=True,
+                )
+                imu_orientation_dd = gr.Dropdown(
+                    choices=list(_IMU_ORIENTATION_LABELS.keys()),
+                    value="Portrait (native)",
+                    label="IMU Orientation (how the phone was physically held while recording)",
+                    info=(
+                        "Android's accelerometer/gyroscope are always reported in the "
+                        "phone's fixed native (portrait) frame — set this to match how "
+                        "you actually held the phone for this dataset so the raw imu.csv "
+                        "samples get rotated into the same frame as the camera images "
+                        "before any pose is computed. Leave at Portrait if you held it "
+                        "in portrait, or the dataset was already normalized.  "
+                        "⚠️ This is a DIFFERENT correction from the Axis Mapping accordion "
+                        "below (that one remaps the already-computed pose, this one remaps "
+                        "raw IMU samples before integration). If Axis Mapping alone already "
+                        "gives a correct cloud, leave this at Portrait — stacking both will "
+                        "double-rotate and make it worse, not better."
                     ),
                     interactive=True,
                 )
                 with gr.Row():
                     s_fps = gr.Slider(
-                        minimum=0.1, maximum=10, value=5, step=0.1,
+                        minimum=0.1, maximum=10, value=1, step=0.1,
                         label="Sampling FPS", interactive=True,
                     )
                     batch_size_input = gr.Slider(
-                        minimum=1, maximum=32, value=4, step=1,
+                        minimum=1, maximum=32, value=1, step=1,
                         label="Batch Size (frames)", interactive=True,
                     )
                 with gr.Row():
@@ -778,6 +1226,118 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                         label="DA3 Input Resolution (VRAM estimate)",
                         interactive=True,
                     )
+
+                with gr.Accordion("Axis Mapping", open=False):
+                    gr.Markdown(
+                        "Applied to every pose **before** Scan processing — affects the "
+                        "point cloud, Voxelization, and Occupancy Map together (not just "
+                        "the Live Points preview). Default: Roll←+Y, Pitch←+X (X/Y swapped), "
+                        "Yaw←+Z. Set this before clicking Scan; changing it mid-session and "
+                        "re-scanning will mix differently-mapped poses into the same "
+                        "accumulated cloud — Clear Cloud first if you do."
+                    )
+                    with gr.Row():
+                        axis_roll_dd = gr.Dropdown(
+                            choices=_AXIS_CHOICES, value="+Y",
+                            label="Roll ← axis", scale=1, interactive=True,
+                        )
+                        axis_pitch_dd = gr.Dropdown(
+                            choices=_AXIS_CHOICES, value="+X",
+                            label="Pitch ← axis", scale=1, interactive=True,
+                        )
+                        axis_yaw_dd = gr.Dropdown(
+                            choices=_AXIS_CHOICES, value="+Z",
+                            label="Yaw ← axis", scale=1, interactive=True,
+                        )
+
+                with gr.Accordion("Outlier Removal (SOR)", open=False):
+                    gr.Markdown(
+                        "Statistical Outlier Removal, applied after every batch's voxel "
+                        "downsample (point cloud, Voxelization, Occupancy Map, and the "
+                        "exported map all reflect it). For each point, compares its "
+                        "average distance to its **Neighbors** nearest neighbors against "
+                        "the cloud-wide mean; points beyond **Std Ratio** standard "
+                        "deviations are dropped. Higher Std Ratio / higher Neighbors = "
+                        "gentler (keeps more points)."
+                    )
+                    with gr.Row():
+                        sor_neighbors_input = gr.Slider(
+                            minimum=4, maximum=50, step=1, value=20,
+                            label="Neighbors (nb_neighbors)", scale=1, interactive=True,
+                        )
+                        sor_std_ratio_input = gr.Slider(
+                            minimum=0.5, maximum=5.0, step=0.1, value=2.25,
+                            label="Std Ratio", scale=1, interactive=True,
+                        )
+
+                with gr.Accordion("Occupancy Map Settings", open=False):
+                    gr.Markdown(
+                        "Read fresh at the start of every Scan/Simulated Live Stream run "
+                        "(see `occupancy_map.py`'s Bayesian log-odds + height-gated ray "
+                        "casting). Everything already accumulated keeps its belief — these "
+                        "only change how FUTURE observations are weighed, so if a map is "
+                        "already wrong, Clear Cloud and re-run to see the new settings take "
+                        "full effect from scratch."
+                    )
+                    gr.Markdown(
+                        "**Height tiers** (metres above the estimated floor):"
+                    )
+                    with gr.Row():
+                        occ_obstacle_min_h = gr.Slider(
+                            minimum=0.0, maximum=0.5, step=0.01, value=0.10,
+                            label="Ground max height", scale=1, interactive=True,
+                        )
+                        occ_step_over_max_h = gr.Slider(
+                            minimum=0.1, maximum=1.0, step=0.01, value=0.40,
+                            label="Step-over max height", scale=1, interactive=True,
+                        )
+                        occ_obstacle_max_h = gr.Slider(
+                            minimum=1.0, maximum=3.0, step=0.05, value=2.20,
+                            label="Ceiling height (ignore above)", scale=1, interactive=True,
+                        )
+                    gr.Markdown(
+                        "**Bayesian log-odds** — how strongly each single hit/miss moves a "
+                        "cell's belief, and how many agreeing observations are needed to "
+                        "confirm occupied/free. Raise **Miss weight** or lower the "
+                        "**Occupied** threshold if too many real obstacles are being eroded "
+                        "away; lower **Miss weight** or raise **Occupied** if noise/clutter "
+                        "is showing up as false obstacles."
+                    )
+                    with gr.Row():
+                        occ_logodds_hit = gr.Slider(
+                            minimum=0.1, maximum=2.0, step=0.05, value=0.85,
+                            label="Hit weight", scale=1, interactive=True,
+                        )
+                        occ_logodds_miss = gr.Slider(
+                            minimum=0.05, maximum=1.5, step=0.05, value=0.40,
+                            label="Miss weight", scale=1, interactive=True,
+                        )
+                    with gr.Row():
+                        occ_logodds_occ_thresh = gr.Slider(
+                            minimum=0.2, maximum=3.0, step=0.05, value=1.0,
+                            label="Occupied confirm threshold", scale=1, interactive=True,
+                        )
+                        occ_logodds_free_thresh = gr.Slider(
+                            minimum=-3.0, maximum=-0.2, step=0.05, value=-1.0,
+                            label="Free confirm threshold", scale=1, interactive=True,
+                        )
+                        occ_height_ewma_alpha = gr.Slider(
+                            minimum=0.05, maximum=1.0, step=0.05, value=0.30,
+                            label="Height recency weight (EWMA α)", scale=1, interactive=True,
+                        )
+                    gr.Markdown(
+                        "**Algorithm toggles** — disable either mechanism for comparison or a "
+                        "simpler/cheaper pass. With Bayesian off, a single hit permanently "
+                        "classifies a cell (no revision), so ray casting's misses become "
+                        "no-ops even if left on."
+                    )
+                    with gr.Row():
+                        occ_enable_ray_casting = gr.Checkbox(
+                            value=True, label="Free-space ray casting", scale=1,
+                        )
+                        occ_enable_bayesian = gr.Checkbox(
+                            value=True, label="Bayesian log-odds belief", scale=1,
+                        )
 
                 with gr.Accordion("Load from Android Upload", open=True):
                     with gr.Row():
@@ -795,6 +1355,24 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                     placeholder='e.g. "hospital", "supermarket", "home" — leave blank if unknown',
                     value="",
                 )
+
+                with gr.Row():
+                    vlm_model_input = gr.Textbox(
+                        label="Semantic Mapper VLM Model ID",
+                        value=(
+                            scan_manager.semantic_mapper_model_id
+                            if scan_manager.semantic_mapper_available
+                            else "(semantic mapping disabled on this server)"
+                        ),
+                        interactive=scan_manager.semantic_mapper_available,
+                        scale=3,
+                    )
+                    vlm_model_apply_btn = gr.Button(
+                        "Apply", size="sm", scale=1,
+                        interactive=scan_manager.semantic_mapper_available,
+                    )
+                vlm_model_status = gr.Markdown("")
+
                 gr.Markdown(
                     "**Segment Table** — one row per area. "
                     "`start_s` / `end_s` in seconds. "
@@ -818,22 +1396,65 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             # ── Right: viewer ────────────────────────────────────────────────
             with gr.Column(scale=4):
                 log_output = gr.Markdown(
-                    "Upload a video, fill the segment table, then click **Scan**."
+                    "Point at a dataset folder, fill the segment table, then click **Scan**."
                 )
 
                 with gr.Tabs():
 
-                    with gr.Tab("Live Points"):
+                    with gr.Tab("Live Reconstruction"):
+                        gr.Markdown(
+                            "Continuously rebuilt as data arrives during Scan/Simulated "
+                            "Live Stream: **Live Points → Voxelization → Occupancy Map** "
+                            "(each chunk's new points feed the Occupancy Map after being "
+                            "voxel-downsampled at the **Voxel size** below, so occupancy "
+                            "cells correspond to what Voxelization shows). Uncheck a view "
+                            "to skip recomputing it — Live Points/Voxelization cost grows "
+                            "with the scan, unlike the Occupancy Map's incremental update."
+                        )
                         with gr.Row():
+                            show_live_points_cb = gr.Checkbox(
+                                value=True, label="Live Points", scale=1,
+                            )
+                            show_voxelization_cb = gr.Checkbox(
+                                value=True, label="Voxelization", scale=1,
+                            )
+                            show_occupancy_cb = gr.Checkbox(
+                                value=True, label="Occupancy Map", scale=1,
+                            )
+                            reload_all_btn = gr.Button(
+                                "Reload", size="sm", scale=0,
+                            )
                             clear_cloud_btn = gr.Button(
                                 "Clear Cloud", variant="stop", size="sm", scale=0,
                             )
-                        live_cloud_plot = gr.Model3D(
-                            height=480,
-                            zoom_speed=0.5,
-                            pan_speed=0.5,
-                            clear_color=[0.05, 0.05, 0.05, 1.0],
-                            label="3D Point Cloud — updates each batch; or render a frame selection below",
+                        with gr.Row():
+                            voxel_size_input = gr.Slider(
+                                minimum=0.02, maximum=0.5, step=0.01, value=DEFAULT_VOXEL_SIZE,
+                                label="Voxel size (m) — also feeds the Occupancy Map each chunk",
+                                scale=3,
+                            )
+                            voxelize_btn = gr.Button(
+                                "Voxelize", variant="secondary", size="sm", scale=1,
+                            )
+                        with gr.Row():
+                            with gr.Column():
+                                live_cloud_plot = gr.Model3D(
+                                    height=420,
+                                    zoom_speed=0.5,
+                                    pan_speed=0.5,
+                                    clear_color=[0.05, 0.05, 0.05, 1.0],
+                                    label="Live Points — 3D point cloud, builds up as data arrives",
+                                )
+                            with gr.Column():
+                                voxel_plot = gr.Model3D(
+                                    height=420,
+                                    zoom_speed=0.5,
+                                    pan_speed=0.5,
+                                    clear_color=[0.05, 0.05, 0.05, 1.0],
+                                    label="Voxelization — voxelized point cloud",
+                                )
+                        occupancy_plot = gr.Plot(
+                            label="Occupancy Map (top-down X-Z) — fed from each chunk's voxelization"
                         )
 
                         with gr.Accordion("Frame Explorer", open=False):
@@ -855,11 +1476,12 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                                 )
                             with gr.Row():
                                 gr.Markdown(
-                                    "**Axis remap** — if horizontal pan shows as wrong angle, "
-                                    "swap axes here. Default: Roll←+X, Pitch←+Y, Yaw←+Z.",
+                                    "**Axis remap (preview only)** — further fine-tune on top of "
+                                    "the pre-scan Axis Mapping setting above, without re-scanning. "
+                                    "If horizontal pan shows as wrong angle, swap axes here. "
+                                    "Default: Roll←+X, Pitch←+Y, Yaw←+Z (no additional change).",
                                     scale=3,
                                 )
-                            _AXIS_CHOICES = ["+X", "+Y", "+Z", "-X", "-Y", "-Z"]
                             with gr.Row():
                                 roll_src_dd = gr.Dropdown(
                                     choices=_AXIS_CHOICES, value="+X",
@@ -906,18 +1528,67 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                         )
                         depth_measure_text = gr.Markdown("")
 
-                    with gr.Tab("Occupancy Map"):
-                        occupancy_plot = gr.Plot(
-                            label="Occupancy Map (top-down X-Z, updates each segment)"
+                    with gr.Tab("Detections"):
+                        with gr.Row():
+                            reload_detections_btn = gr.Button(
+                                "Reload", size="sm", scale=0,
+                            )
+                        detection_image = gr.Image(
+                            type="numpy",
+                            label="Most recent frame — GroundingDINO boxes",
+                            format="png", interactive=False, sources=[],
+                            height=400,
+                        )
+                        detection_text = gr.Markdown(
+                            "Run Scan with a labelled area to see detections here."
                         )
 
                 with gr.Row():
-                    scan_btn = gr.Button("Scan", variant="primary", scale=3)
                     export_btn = gr.Button("Export Map", variant="secondary", scale=1)
+
+                with gr.Row():
+                    simulated_stream_btn = gr.Button(
+                        "Simulated Live Stream", variant="primary", scale=3,
+                    )
+                    realtime_pacing_cb = gr.Checkbox(
+                        label="Real-time pacing", value=False, scale=1,
+                        info="Off = replay as fast as possible. On = pace to the "
+                             "dataset's own recorded timing, as a real live stream would.",
+                    )
+                gr.Markdown(
+                    "**Simulated Live Stream** replays the dataset above frame-by-frame "
+                    "and IMU-sample-by-sample through the same streaming interface a real "
+                    "Android live source will use later (see stream_session.py / "
+                    "stream_simulator.py) — the point cloud updates as each chunk is "
+                    "processed, not only at the end. Voxelization / Occupancy Map still "
+                    "finalize once, when the replay finishes."
+                )
+
+                with gr.Row():
+                    manual_start_btn = gr.Button(
+                        "Start / Reset Manual Stream", variant="secondary", scale=2,
+                    )
+                    manual_feed_btn = gr.Button(
+                        "Feed Next Frame ▶", variant="primary", scale=2, interactive=False,
+                    )
+                    manual_preview_image = gr.Image(
+                        label="Next frame to feed", type="numpy", interactive=False,
+                        sources=[], height=100, scale=1, show_label=True,
+                    )
+                gr.Markdown(
+                    "**Manual Live Stream** feeds the dataset above through the same "
+                    "streaming interface as Simulated Live Stream, one frame per click "
+                    "instead of an automatic loop. Click **Start / Reset Manual Stream** "
+                    "to load the dataset and preview its first frame, then **Feed Next "
+                    "Frame** repeatedly to advance — any IMU samples/zone boundaries "
+                    "between frames are applied automatically along with each click. "
+                    "The button disables and the map is finalized + exported once no "
+                    "frames remain."
+                )
 
         with gr.Row():
             scan_status = gr.Textbox(
-                label="Status", value="Waiting for video upload…", interactive=False,
+                label="Status", value="Waiting for a dataset folder…", interactive=False,
             )
             scan_position = gr.Textbox(
                 label="Last Camera Position (m)", value="x=0.00  y=0.00  z=0.00",
@@ -928,43 +1599,79 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
         # ── event wiring ───────────────────────────────────────────────────────
 
-        def _rotate_video(rotation, video_path, fps_val):
+        def _rotate_video(rotation, dataset_path, fps_val):
             new_rot = (rotation + 90) % 360
-            gallery, msg, segs = _handle_video_upload(video_path, fps_val, new_rot)
+            gallery, msg, segs = _handle_dataset_change(dataset_path, fps_val, new_rot)
             return new_rot, f"Rotation: {new_rot}°", gallery, msg, segs
 
         rotate_video_btn.click(
             fn=_rotate_video,
-            inputs=[video_rotation_state, input_video, s_fps],
+            inputs=[video_rotation_state, dataset_path_input, s_fps],
             outputs=[video_rotation_state, video_rotation_display, frame_gallery, log_output, segment_table],
         )
 
-        input_video.change(
-            fn=_handle_video_upload,
-            inputs=[input_video, s_fps, video_rotation_state],
+        preview_dataset_btn.click(
+            fn=_handle_dataset_change,
+            inputs=[dataset_path_input, s_fps, video_rotation_state],
             outputs=[frame_gallery, log_output, segment_table],
         )
 
-        scan_btn.click(
-            fn=_run_local_scan,
-            inputs=[input_video, imu_file_input, s_fps, batch_size_input,
-                    location_id_input, segment_table, resolution_input,
-                    pose_src_radio, video_rotation_state, zone_type_input],
-            outputs=[
-                live_cloud_plot, occupancy_plot,
-                scan_status, scan_position, log_output,
-                depth_data_state, depth_view_selector,
-                depth_rgb_image, depth_vis_image,
-                measure_points_state, depth_measure_text,
-                all_frames_state, frame_start_slider, frame_end_slider,
-                frame_pose_text,
-            ],
+        dataset_path_input.change(
+            fn=_handle_dataset_change,
+            inputs=[dataset_path_input, s_fps, video_rotation_state],
+            outputs=[frame_gallery, log_output, segment_table],
         )
 
         export_btn.click(
             fn=_export_map,
             inputs=[location_id_input],
-            outputs=[export_log],
+            outputs=[export_log, live_cloud_plot, voxel_plot, occupancy_plot],
+        )
+
+        simulated_stream_btn.click(
+            fn=_run_simulated_stream,
+            inputs=[dataset_path_input, s_fps, batch_size_input,
+                    location_id_input, segment_table, resolution_input,
+                    pose_src_radio, video_rotation_state, imu_orientation_dd, zone_type_input,
+                    axis_roll_dd, axis_pitch_dd, axis_yaw_dd,
+                    sor_neighbors_input, sor_std_ratio_input, voxel_size_input,
+                    realtime_pacing_cb,
+                    occ_obstacle_min_h, occ_step_over_max_h, occ_obstacle_max_h,
+                    occ_logodds_hit, occ_logodds_miss,
+                    occ_logodds_occ_thresh, occ_logodds_free_thresh, occ_height_ewma_alpha,
+                    occ_enable_ray_casting, occ_enable_bayesian,
+                    show_live_points_cb, show_voxelization_cb, show_occupancy_cb],
+            outputs=[
+                live_cloud_plot, voxel_plot, occupancy_plot,
+                detection_image, detection_text,
+                scan_status, scan_position, log_output,
+            ],
+        )
+
+        manual_start_btn.click(
+            fn=_manual_stream_start,
+            inputs=[dataset_path_input, s_fps, batch_size_input,
+                    location_id_input, segment_table, resolution_input,
+                    pose_src_radio, video_rotation_state, imu_orientation_dd, zone_type_input,
+                    axis_roll_dd, axis_pitch_dd, axis_yaw_dd,
+                    sor_neighbors_input, sor_std_ratio_input, voxel_size_input,
+                    occ_obstacle_min_h, occ_step_over_max_h, occ_obstacle_max_h,
+                    occ_logodds_hit, occ_logodds_miss,
+                    occ_logodds_occ_thresh, occ_logodds_free_thresh, occ_height_ewma_alpha,
+                    occ_enable_ray_casting, occ_enable_bayesian],
+            outputs=[manual_replay_state, manual_preview_image, manual_feed_btn, log_output],
+        )
+
+        manual_feed_btn.click(
+            fn=_manual_stream_feed,
+            inputs=[manual_replay_state,
+                    show_live_points_cb, show_voxelization_cb, show_occupancy_cb],
+            outputs=[
+                manual_replay_state, manual_preview_image, manual_feed_btn,
+                live_cloud_plot, voxel_plot, occupancy_plot,
+                detection_image, detection_text,
+                scan_status, scan_position, log_output,
+            ],
         )
 
         prev_depth_btn.click(
@@ -990,10 +1697,50 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             outputs=[depth_rgb_image, measure_points_state, depth_measure_text],
         )
 
+        reload_all_btn.click(
+            fn=_reload_all_views,
+            inputs=[location_id_input, voxel_size_input],
+            outputs=[live_cloud_plot, voxel_plot, occupancy_plot],
+        )
+
+        show_live_points_cb.change(
+            fn=_toggle_live_points,
+            inputs=[show_live_points_cb, location_id_input],
+            outputs=[live_cloud_plot],
+        )
+        show_voxelization_cb.change(
+            fn=_toggle_voxelization,
+            inputs=[show_voxelization_cb, location_id_input, voxel_size_input],
+            outputs=[voxel_plot],
+        )
+        show_occupancy_cb.change(
+            fn=_toggle_occupancy,
+            inputs=[show_occupancy_cb, location_id_input],
+            outputs=[occupancy_plot],
+        )
+
         clear_cloud_btn.click(
             fn=_clear_cloud,
             inputs=[location_id_input],
-            outputs=[live_cloud_plot, occupancy_plot],
+            outputs=[live_cloud_plot, voxel_plot, occupancy_plot],
+        )
+
+        reload_detections_btn.click(
+            fn=_reload_detections,
+            inputs=[location_id_input],
+            outputs=[detection_image, detection_text],
+        )
+
+        voxelize_btn.click(
+            fn=_voxelize,
+            inputs=[location_id_input, voxel_size_input],
+            outputs=[voxel_plot],
+        )
+
+        vlm_model_apply_btn.click(
+            fn=_apply_vlm_model,
+            inputs=[vlm_model_input],
+            outputs=[vlm_model_status],
         )
 
         # ── Frame Explorer ─────────────────────────────────────────────────────
@@ -1047,14 +1794,10 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             outputs=[upload_dropdown],
         )
 
-        def _do_load_upload(scan_id):
-            video, imu = _load_upload(scan_id)
-            return video, imu  # imu may be None — gr.File accepts None to clear
-
         load_upload_btn.click(
-            fn=_do_load_upload,
+            fn=_load_upload,
             inputs=[upload_dropdown],
-            outputs=[input_video, imu_file_input],
+            outputs=[dataset_path_input],
         )
 
     return app

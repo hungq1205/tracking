@@ -21,7 +21,8 @@ data class ScanUiState(
     // Offline recording state
     val isRecording: Boolean = false,
     val recordingElapsedMs: Long = 0L,
-    val videoFile: File? = null,
+    val datasetDir: File? = null,
+    val imageCount: Int = 0,
     val imuFile: File? = null,
     val scanServerHost: String = "192.168.1.100",
     val scanServerPort: Int = 7861,

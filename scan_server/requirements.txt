@@ -1,0 +1,17 @@
+numpy
+opencv-python
+open3d
+torch
+torchvision
+pillow
+plotly
+scipy
+gradio
+matplotlib
+pandas
+uvicorn
+fastapi
+onnxruntime-gpu
+pyzmq
+rosbags
+google-genai==2.9.0

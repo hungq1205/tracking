@@ -9,21 +9,16 @@ import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.FileOutputOptions
-import androidx.camera.video.Quality
-import androidx.camera.video.QualitySelector
-import androidx.camera.video.Recorder
-import androidx.camera.video.Recording
-import androidx.camera.video.VideoCapture
-import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import java.io.BufferedWriter
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileWriter
 import java.util.concurrent.Executors
 
 class CameraManager(private val context: Context) {
@@ -43,8 +38,13 @@ class CameraManager(private val context: Context) {
     private var cameraProvider: ProcessCameraProvider? = null
     private var boundLifecycleOwner: LifecycleOwner? = null
 
-    private var videoCapture: VideoCapture<Recorder>? = null
-    private var activeRecording: Recording? = null
+    // ── Dataset recording (images/ + camera.csv) ───────────────────────────────
+    private val recordingLock = Any()
+    private var recordingImagesDir: File? = null
+    private var cameraCsvWriter: BufferedWriter? = null
+    private var recordingFrameIndex = 0
+    private var recordingFps: Int = 5
+    private var lastRecordFrameTimeMs = 0L
 
     fun bind(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
         boundLifecycleOwner = lifecycleOwner
@@ -79,111 +79,125 @@ class CameraManager(private val context: Context) {
                     }
                 }
 
+            // Bind everything the app will ever need — Preview + ImageAnalysis —
+            // in ONE bindToLifecycle() call, once. Calling bindToLifecycle() a
+            // *second* time later replaces the entire bound use-case set — even
+            // re-passing the same Preview instance was silently dropping its
+            // rendered output, which is what caused the preview to go black
+            // when a second bind happened.
             try {
                 provider.bindToLifecycle(
                     lifecycleOwner,
                     CameraSelector.DEFAULT_BACK_CAMERA,
                     preview,
-                    imageAnalysis
+                    imageAnalysis,
                 )
                 boundPreview = preview
                 boundAnalysis = imageAnalysis
             } catch (e: Exception) {
+                Log.e("CameraManager", "Failed to bind camera use cases: ${e.message}")
                 e.printStackTrace()
             }
         }, ContextCompat.getMainExecutor(context))
     }
 
     fun unbind() {
-        val toUnbind = listOfNotNull(boundPreview, boundAnalysis, videoCapture)
+        val toUnbind = listOfNotNull(boundPreview, boundAnalysis)
         if (toUnbind.isNotEmpty()) cameraProvider?.unbind(*toUnbind.toTypedArray())
         boundPreview = null
         boundAnalysis = null
-        videoCapture = null
     }
 
-    fun startRecording(outputFile: File, onFinalized: (File) -> Unit) {
-        val provider = cameraProvider ?: return
-        val lco = boundLifecycleOwner ?: return
-
-        val recorder = Recorder.Builder()
-            .setQualitySelector(
-                QualitySelector.from(
-                    Quality.HD,
-                    androidx.camera.video.FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
-                )
-            )
-            .build()
-        val vc = VideoCapture.withOutput(recorder)
-        videoCapture = vc
-
-        try {
-            provider.bindToLifecycle(lco, CameraSelector.DEFAULT_BACK_CAMERA, vc)
-        } catch (e: Exception) {
-            Log.e("CameraManager", "Failed to bind VideoCapture: ${e.message}")
-            videoCapture = null
-            return
+    /**
+     * Start dumping analyzed frames to `outputDir/images/NNN.jpg` at [fps],
+     * alongside `outputDir/camera.csv` (header: timestamp_ns,filename) —
+     * the dataset layout the scan server ingests.
+     */
+    fun startRecording(outputDir: File, fps: Int = 5) {
+        val imagesDir = File(outputDir, "images").also { it.mkdirs() }
+        val writer = BufferedWriter(FileWriter(File(outputDir, "camera.csv")))
+        writer.write("timestamp_ns,filename\n")
+        synchronized(recordingLock) {
+            recordingImagesDir = imagesDir
+            cameraCsvWriter = writer
+            recordingFrameIndex = 0
+            recordingFps = fps
         }
-
-        outputFile.parentFile?.mkdirs()
-        activeRecording = vc.output
-            .prepareRecording(context, FileOutputOptions.Builder(outputFile).build())
-            .start(ContextCompat.getMainExecutor(context)) { event: VideoRecordEvent ->
-                if (event is VideoRecordEvent.Finalize) {
-                    activeRecording = null
-                    onFinalized(outputFile)
-                }
-            }
-
-        Log.d("CameraManager", "Recording started → ${outputFile.absolutePath}")
+        Log.d("CameraManager", "Recording started → ${imagesDir.absolutePath}")
     }
 
-    fun stopRecording() {
-        activeRecording?.stop()
-        activeRecording = null
+    /** Stops dataset recording and returns the number of frames saved. */
+    fun stopRecording(): Int {
+        return synchronized(recordingLock) {
+            val count = recordingFrameIndex
+            cameraCsvWriter?.flush()
+            cameraCsvWriter?.close()
+            cameraCsvWriter = null
+            recordingImagesDir = null
+            count
+        }
     }
 
-    val isRecordingVideo: Boolean get() = activeRecording != null
+    val isRecording: Boolean get() = synchronized(recordingLock) { recordingImagesDir != null }
 
     private var loggedOnce = false
 
     private fun processFrame(imageProxy: ImageProxy) {
         val now = System.currentTimeMillis()
-        if (now - lastFrameTimeMs >= 1000L / targetFps) {
-            lastFrameTimeMs = now
-            try {
-                val crop = imageProxy.cropRect
-                val bitmap = imageProxy.toBitmap()
+        val doStream = now - lastFrameTimeMs >= 1000L / targetFps
+        val doRecord = isRecording && now - lastRecordFrameTimeMs >= 1000L / recordingFps
+        if (!doStream && !doRecord) {
+            imageProxy.close()
+            return
+        }
+        try {
+            val crop = imageProxy.cropRect
+            val bitmap = imageProxy.toBitmap()
 
-                if (!loggedOnce) {
-                    Log.d("CameraManager",
-                        "ImageProxy buffer: ${imageProxy.width}x${imageProxy.height} " +
-                        "cropRect: ${crop.width()}x${crop.height()} @(${crop.left},${crop.top}) " +
-                        "rotation: ${imageProxy.imageInfo.rotationDegrees} " +
-                        "format: ${imageProxy.format}")
-                    Log.d("CameraManager", "toBitmap: ${bitmap.width}x${bitmap.height}")
-                }
+            if (!loggedOnce) {
+                Log.d("CameraManager",
+                    "ImageProxy buffer: ${imageProxy.width}x${imageProxy.height} " +
+                    "cropRect: ${crop.width()}x${crop.height()} @(${crop.left},${crop.top}) " +
+                    "rotation: ${imageProxy.imageInfo.rotationDegrees} " +
+                    "format: ${imageProxy.format}")
+                Log.d("CameraManager", "toBitmap: ${bitmap.width}x${bitmap.height}")
+            }
 
-                val jpeg = bitmapToJpeg(bitmap, imageProxy.imageInfo.rotationDegrees)
+            val rotated = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
 
+            if (doStream) {
+                lastFrameTimeMs = now
+                val jpeg = streamJpeg(rotated)
                 if (!loggedOnce) {
                     Log.d("CameraManager", "JPEG sent: ${jpeg.size} bytes")
                     loggedOnce = true
                 }
-
                 _frameFlow.tryEmit(jpeg)
-                bitmap.recycle()
-            } catch (e: Exception) {
-                e.printStackTrace()
             }
+
+            if (doRecord) {
+                lastRecordFrameTimeMs = now
+                // imageInfo.timestamp is the sensor's boot-time nanosecond clock —
+                // the same clock domain as SensorEvent.timestamp (see ImuSensor.kt),
+                // so camera.csv and imu.csv stay directly comparable.
+                saveRecordingFrame(rotated, imageProxy.imageInfo.timestamp)
+            }
+
+            if (rotated !== bitmap) bitmap.recycle()
+            rotated.recycle()
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
         imageProxy.close()
     }
 
-    private fun bitmapToJpeg(src: Bitmap, rotationDegrees: Int): ByteArray {
+    private fun rotateBitmap(src: Bitmap, rotationDegrees: Int): Bitmap {
+        if (rotationDegrees == 0) return src
         val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-        val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+        return Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+    }
 
+    private fun streamJpeg(rotated: Bitmap): ByteArray {
         // Downscale to max 640px on the long edge, preserving full frame (no crop)
         val maxLongEdge = 640
         val longEdge = maxOf(rotated.width, rotated.height)
@@ -197,15 +211,25 @@ class CameraManager(private val context: Context) {
             )
         } else rotated
 
-        Log.d("CameraManager", "sending: ${scaled.width}x${scaled.height}")
-
         val baos = ByteArrayOutputStream()
         scaled.compress(Bitmap.CompressFormat.JPEG, 50, baos)
 
         if (scaled !== rotated) scaled.recycle()
-        if (rotated !== src) rotated.recycle()
 
         return baos.toByteArray()
+    }
+
+    private fun saveRecordingFrame(rotated: Bitmap, timestampNs: Long) {
+        synchronized(recordingLock) {
+            val dir = recordingImagesDir ?: return
+            val writer = cameraCsvWriter ?: return
+            val filename = "%09d.jpg".format(recordingFrameIndex)
+            val baos = ByteArrayOutputStream()
+            rotated.compress(Bitmap.CompressFormat.JPEG, 90, baos)
+            File(dir, filename).writeBytes(baos.toByteArray())
+            writer.write("$timestampNs,$filename\n")
+            recordingFrameIndex++
+        }
     }
 
     fun shutdown() {

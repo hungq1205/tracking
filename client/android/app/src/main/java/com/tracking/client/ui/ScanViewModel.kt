@@ -18,12 +18,16 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import tracking.Tracking
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -49,6 +53,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private var recordingStartMs = 0L
 
     private var imuRecorder: ImuRecorder? = null
+    private var currentOutDir: File? = null
 
     // ── gRPC live-stream controls ─────────────────────────────────────────────
 
@@ -185,33 +190,22 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val outDir = File(ctx.getExternalFilesDir("scans"), "scan_$ts")
         outDir.mkdirs()
+        currentOutDir = outDir
 
-        val videoFile = File(outDir, "video.mp4")
         val recorder = ImuRecorder(ctx, outDir)
         imuRecorder = recorder
-
         if (recorder.isAvailable) {
             recorder.start(viewModelScope)
         }
 
-        cameraManager.startRecording(videoFile) { finalized ->
-            val imuFile = recorder.stop()
-            _uiState.update {
-                it.copy(
-                    isRecording = false,
-                    videoFile = finalized,
-                    imuFile = imuFile,
-                    statusMessage = "Recording saved: ${finalized.name} (${finalized.length() / 1024} KB)"
-                )
-            }
-            elapsedTickJob?.cancel()
-        }
+        cameraManager.startRecording(outDir, fps = 5)
 
         recordingStartMs = System.currentTimeMillis()
         _uiState.update {
             it.copy(
                 isRecording = true,
-                videoFile = null,
+                datasetDir = null,
+                imageCount = 0,
                 imuFile = null,
                 recordingElapsedMs = 0L,
                 uploadStatus = null,
@@ -230,19 +224,32 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun stopRecording() {
-        imuRecorder?.stop()
-        cameraManager.stopRecording()
+        val imageCount = cameraManager.stopRecording()
+        val imuFile = imuRecorder?.stop()
         elapsedTickJob?.cancel()
-        _uiState.update { it.copy(isRecording = false, statusMessage = "Saving…") }
+        _uiState.update {
+            it.copy(
+                isRecording = false,
+                datasetDir = currentOutDir,
+                imageCount = imageCount,
+                imuFile = imuFile,
+                statusMessage = "Recording saved: $imageCount frames"
+            )
+        }
     }
 
     fun uploadToScanServer() {
         val state = _uiState.value
-        val videoFile = state.videoFile ?: return
-        _uiState.update { it.copy(isUploading = true, uploadStatus = "Uploading…") }
+        val datasetDir = state.datasetDir ?: return
+        _uiState.update { it.copy(isUploading = true, uploadStatus = "Zipping…") }
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                val zipFile = File(datasetDir.parentFile, "${datasetDir.name}.zip")
+                zipDirectory(datasetDir, zipFile)
+
+                _uiState.update { it.copy(uploadStatus = "Uploading…") }
+
                 val boundary = "----Boundary${System.currentTimeMillis()}"
                 val url = URL("http://${state.scanServerHost}:${state.scanServerPort}/api/upload")
                 val conn = url.openConnection() as HttpURLConnection
@@ -253,22 +260,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 conn.readTimeout = 300_000
 
                 conn.outputStream.buffered().use { out ->
-                    fun writePart(name: String, filename: String, contentType: String, file: File) {
-                        out.write("--$boundary\r\n".toByteArray())
-                        out.write("Content-Disposition: form-data; name=\"$name\"; filename=\"$filename\"\r\n".toByteArray())
-                        out.write("Content-Type: $contentType\r\n\r\n".toByteArray())
-                        file.inputStream().use { it.copyTo(out) }
-                        out.write("\r\n".toByteArray())
-                    }
-
-                    writePart("video", videoFile.name, "video/mp4", videoFile)
-
-                    val imuFile = state.imuFile
-                    if (imuFile != null && imuFile.exists()) {
-                        writePart("imu", "imu_data.csv", "text/csv", imuFile)
-                    }
-
-                    out.write("--$boundary--\r\n".toByteArray())
+                    out.write("--$boundary\r\n".toByteArray())
+                    out.write("Content-Disposition: form-data; name=\"dataset\"; filename=\"dataset.zip\"\r\n".toByteArray())
+                    out.write("Content-Type: application/zip\r\n\r\n".toByteArray())
+                    zipFile.inputStream().use { it.copyTo(out) }
+                    out.write("\r\n--$boundary--\r\n".toByteArray())
                 }
 
                 val code = conn.responseCode
@@ -284,6 +280,22 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     it.copy(isUploading = false, uploadStatus = "Upload error: ${e.message}")
                 }
             }
+        }
+    }
+
+    /** Zips [dir]'s contents (images/, imu.csv, camera.csv) at the zip root into [zipFile]. */
+    private fun zipDirectory(dir: File, zipFile: File) {
+        ZipOutputStream(BufferedOutputStream(FileOutputStream(zipFile))).use { zos ->
+            fun addFile(file: File, entryName: String) {
+                if (file.isDirectory) {
+                    file.listFiles()?.sortedBy { it.name }?.forEach { addFile(it, "$entryName/${it.name}") }
+                } else {
+                    zos.putNextEntry(ZipEntry(entryName))
+                    file.inputStream().use { it.copyTo(zos) }
+                    zos.closeEntry()
+                }
+            }
+            dir.listFiles()?.sortedBy { it.name }?.forEach { addFile(it, it.name) }
         }
     }
 
