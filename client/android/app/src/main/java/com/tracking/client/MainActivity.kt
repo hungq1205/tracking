@@ -13,8 +13,6 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.tracking.client.ui.MainScreen
 import com.tracking.client.ui.MainViewModel
-import com.tracking.client.ui.ScanScreen
-import com.tracking.client.ui.ScanViewModel
 import com.tracking.client.ui.SettingsScreen
 import com.tracking.client.ui.theme.TrackingTheme
 
@@ -48,21 +46,13 @@ class MainActivity : ComponentActivity() {
                         MainScreen(
                             viewModel = mainViewModel,
                             onOpenSettings = { navController.navigate("settings") },
-                            onOpenScan = { navController.navigate("scan") }
-                        )
-                    }
-                    composable("scan") {
-                        val scanViewModel: ScanViewModel = viewModel()
-                        ScanScreen(
-                            viewModel = scanViewModel,
-                            onBack = { navController.popBackStack() }
                         )
                     }
                     composable("settings") {
                         SettingsScreen(
                             mainViewModel = mainViewModel,
-                            onConnect = { host, port, fps, vadThreshold, startThreshold ->
-                                mainViewModel.connect(host, port, fps, vadThreshold, startThreshold)
+                            onConnect = { host, port, frameIntervalMs, scanIntervalMs, recentBufferMs, vadThreshold, startThreshold, apiKey, ocrUrl, locationId ->
+                                mainViewModel.connect(host, port, frameIntervalMs, scanIntervalMs, recentBufferMs, vadThreshold, startThreshold, apiKey, ocrUrl, locationId)
                             },
                             onBack = { navController.popBackStack() }
                         )

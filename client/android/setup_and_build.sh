@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -e
 
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "This script requires bash — run it as 'bash $0' (or './setup_and_build.sh')," >&2
+    echo "not 'sh $0'. sh on this system is dash, which doesn't support the "'${BASH_SOURCE[0]}'" syntax below." >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANDROID_HOME="$HOME/Android/Sdk"
 

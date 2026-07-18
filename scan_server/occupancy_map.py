@@ -1,8 +1,9 @@
 """
 Height-based traversability map on the X-Z plane — a real Bayesian occupancy
 grid (same representation gmapping/cartographer/RTAB-Map's own OccupancyGrid
-module use), rendered in classic SLAM grayscale (white=free, black=obstacle,
-gray=unknown), built progressively as data arrives.
+module use), rendered as a continuous height-above-ground heatmap (0.0m
+ground → OBSTACLE_MAX_H at the colorscale's top, unknown cells left blank),
+built progressively as data arrives.
 
 Pipeline: point cloud (ScanSession._cloud) → voxelization (scan_session.
 voxelize_cloud, shared with the Voxelization tab) → this module. update()
@@ -141,7 +142,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
-from scipy.ndimage import maximum_filter
+from scipy.ndimage import distance_transform_edt, maximum_filter
 
 from timing_utils import timed
 
@@ -383,10 +384,26 @@ class OccupancyMap:
             self.HEIGHT_EWMA_ALPHA if height_ewma_alpha is None else height_ewma_alpha
         )
         self._cells: Dict[Tuple[int, int], _CellState] = {}
+        # Cells touched (any _register_* call) since the last
+        # extract_dirty_delta() call — the sparse counterpart to
+        # extract_full_grid(), see that method's docstring for the full
+        # incremental-sync design (mapping_servicer.py decides full vs.
+        # delta per update).
+        self._dirty_cells: set = set()
         self._ground_y: Optional[float] = None
         # Accumulated camera path (X, Y, Z) across every update() call in this
         # session — (X, Z) draws the live trajectory on render_plotly().
         self._trajectory: List[Tuple[float, float, float]] = []
+        # Bumped once per update() call, regardless of what changed —
+        # a cheap, always-correct "did the grid change" signal for a
+        # caller deciding whether to re-run path planning against a live
+        # (not-yet-exported) map. Deliberately not tied to cell/point
+        # counts: a cell's classification can change (e.g. crossing the
+        # confirm threshold) without any new grid cell being added.
+        self._update_count: int = 0
+        # Set at the top of each update() call, read by the _register_*
+        # methods below to scale log-odds deltas — see update()'s docstring.
+        self._current_confidence: float = 1.0
 
     def get_params(self) -> dict:
         """Current tunable values (for the GUI to display / re-apply)."""
@@ -437,10 +454,71 @@ class OccupancyMap:
         rebuild from a complete point cloud so re-running it doesn't keep
         re-accumulating the same data on top of itself."""
         self._cells.clear()
+        self._dirty_cells.clear()
         self._ground_y = None
         self._trajectory.clear()
+        self._update_count = 0
 
-    def update(self, trajectory: np.ndarray, cloud_points: np.ndarray) -> None:
+    def seed_from_summary(self, grid_dict: dict, ground_y: float) -> None:
+        """
+        Coarse re-seed from a previously-EXPORTED summary (class + normalized
+        height per cell — NOT the raw per-cell logodds/height_ewma, which
+        isn't persisted anywhere; see MappingService/CLAUDE.md's "occupancy
+        grid persistence across sessions" note for why this is a deliberate,
+        accepted simplification rather than true incremental multi-day SLAM).
+
+        Seeds each non-unknown cell with a modest, still-revisable belief —
+        roughly "confirmed twice" (LOGODDS_OCCUPIED_THRESH/FREE_THRESH plus
+        one hit/miss's worth) rather than LOGODDS_MAX/MIN, so real new
+        evidence from this session can still move a cell either way, same as
+        any other Bayesian update. CLASS_UNKNOWN cells are left with no
+        entry at all, matching how genuinely-unobserved cells already work.
+        Must be called before any update() call in the new session (reset()
+        first if this map already has data — this does not clear anything
+        itself).
+        """
+        if grid_dict is None:
+            return
+        if abs(grid_dict.get("resolution", -1.0) - self.resolution) > 1e-6:
+            print(
+                f"[OccupancyMap] seed_from_summary: resolution mismatch "
+                f"(saved={grid_dict.get('resolution')}, current={self.resolution}) — skipping reseed."
+            )
+            return
+        self._ground_y = ground_y
+        res = self.resolution
+        ix_lo = round(grid_dict["origin_x"] / res)
+        iz_lo = round(grid_dict["origin_z"] / res)
+        cls_grid = grid_dict["class"]
+        height_grid = grid_dict["data"]
+        seeded = 0
+        for row in range(grid_dict["height"]):
+            for col in range(grid_dict["width"]):
+                cls = cls_grid[row][col]
+                if cls == self.CLASS_UNKNOWN:
+                    continue
+                key = (ix_lo + col, iz_lo + row)
+                if cls == self.CLASS_GROUND:
+                    self._cells[key] = _CellState(
+                        logodds=self.LOGODDS_FREE_THRESH - self.LOGODDS_MISS,
+                        height_ewma=ground_y,
+                        hit_count=2,
+                    )
+                else:
+                    norm = height_grid[row][col]
+                    height_above_ground = self.OBSTACLE_MIN_H + norm * (self.OBSTACLE_MAX_H - self.OBSTACLE_MIN_H)
+                    self._cells[key] = _CellState(
+                        logodds=self.LOGODDS_OCCUPIED_THRESH + self.LOGODDS_HIT,
+                        height_ewma=ground_y - height_above_ground,
+                        hit_count=2,
+                    )
+                seeded += 1
+        print(f"[OccupancyMap] seed_from_summary: reseeded {seeded} cells from saved snapshot (ground_y={ground_y:.3f}).")
+
+    def update(
+        self, trajectory: np.ndarray, cloud_points: np.ndarray,
+        confidence: float = 1.0,
+    ) -> None:
         """
         Accumulate Bayesian occupancy evidence from a new batch of already-
         voxelized points (see module docstring — scan_session.voxelize_cloud
@@ -454,12 +532,32 @@ class OccupancyMap:
                       ray-cast origin for this batch's newly-touched cells.
         cloud_points: Mx3 float — voxel-center world-space points (one per
                       occupied voxel, not raw per-point data).
+        confidence:   [0,1] — how much to trust THIS batch's depth (see
+                      scan_session.py's depth-consistency check, e.g.
+                      1 - frac_bad) — scales every log-odds delta registered
+                      this call (see _register_obstacle_hit/_register_
+                      ground_hit/_register_miss), so a batch built from
+                      borderline depth moves belief more slowly than one
+                      built from solid measurements, instead of every hit
+                      counting the same regardless of source reliability.
+                      Standard Bayesian evidence weighting, not a hard cap:
+                      enough agreeing low-confidence observations can still
+                      accumulate to high confidence over time (correct if
+                      the underlying errors are independent noise) — it does
+                      NOT protect against DA3 systematically misjudging the
+                      exact same real surface the same way every time, which
+                      is a correlated bias, not independent noise. Only
+                      applies in Bayesian mode (enable_bayesian) — non-
+                      Bayesian mode's "single hit = permanent" design has no
+                      incremental belief to scale.
         """
         if len(trajectory):
             self._trajectory.extend((float(p[0]), float(p[1]), float(p[2])) for p in trajectory)
 
         if len(cloud_points) < 10:
             return
+        self._current_confidence = max(0.0, min(1.0, confidence))
+        self._update_count += 1
 
         pts = np.asarray(cloud_points, dtype=np.float64)
 
@@ -549,9 +647,12 @@ class OccupancyMap:
         )
 
     def _register_obstacle_hit(self, key: Tuple[int, int], y: float) -> None:
+        self._dirty_cells.add(key)
         cell = self._cells.setdefault(key, _CellState())
         if self.enable_bayesian:
-            cell.logodds = min(self.LOGODDS_MAX, cell.logodds + self.LOGODDS_HIT)
+            cell.logodds = min(
+                self.LOGODDS_MAX, cell.logodds + self.LOGODDS_HIT * self._current_confidence
+            )
         else:
             # Non-Bayesian mode: a single hit fully and permanently
             # classifies the cell as occupied — no incremental belief, no
@@ -568,9 +669,12 @@ class OccupancyMap:
         hits. Still updates height_ewma (with the ground point's own,
         near-floor Y) so the cumulative ground_y estimate stays informed by
         real floor samples, not just obstacle-cell heights."""
+        self._dirty_cells.add(key)
         cell = self._cells.setdefault(key, _CellState())
         if self.enable_bayesian:
-            cell.logodds = max(self.LOGODDS_MIN, cell.logodds - self.LOGODDS_MISS)
+            cell.logodds = max(
+                self.LOGODDS_MIN, cell.logodds - self.LOGODDS_MISS * self._current_confidence
+            )
         else:
             cell.logodds = self.LOGODDS_MIN
         cell.hit_count += 1
@@ -584,8 +688,11 @@ class OccupancyMap:
             # Non-Bayesian mode: hits are permanent, so a miss carries no
             # meaning to register — there is no belief left to erode.
             return
+        self._dirty_cells.add(key)
         cell = self._cells.setdefault(key, _CellState())
-        cell.logodds = max(self.LOGODDS_MIN, cell.logodds - self.LOGODDS_MISS)
+        cell.logodds = max(
+            self.LOGODDS_MIN, cell.logodds - self.LOGODDS_MISS * self._current_confidence
+        )
         # height_ewma deliberately untouched — a miss carries no height
         # evidence, only "probably nothing occupies this space."
 
@@ -665,109 +772,147 @@ class OccupancyMap:
             return float("nan"), self.CLASS_UNKNOWN
         return self._classify_state(cell)
 
-    def render_plotly(self, zones=None) -> go.Figure:
+    def render_plotly(
+        self, zones=None,
+        route: Optional[List[Tuple[float, float]]] = None,
+        route_confirmed: Optional[bool] = None,
+    ) -> go.Figure:
         """Times the render (rendering is CPU-only — Plotly/numpy grid
-        construction has no GPU path) and delegates to _render_plotly_impl."""
+        construction has no GPU path) and delegates to _render_plotly_impl.
+        `route`/`route_confirmed` — see _overlay_route()."""
         with timed(f"occupancy_map.render_plotly ({len(self._cells)} cells)"):
-            return self._render_plotly_impl(zones)
+            return self._render_plotly_impl(zones, route, route_confirmed)
 
-    def _render_plotly_impl(self, zones=None) -> go.Figure:
-        """
-        Return a Plotly Heatmap in the classic SLAM occupancy-grid style
-        (gmapping/cartographer/RTAB-Map's own OccupancyGrid display):
-          white  → free / ground (walkable)
-          light gray → low, step-over-able obstacle
-          black  → normal obstacle (blocked)
-          mid-gray → unknown (not enough agreeing evidence either way)
-        """
-        if not self._cells or self._ground_y is None:
-            fig = go.Figure()
-            fig.update_layout(
-                template="plotly_dark",
-                title=dict(text="Traversability Map (no data yet)", font=dict(size=13)),
-                margin=dict(l=40, r=10, b=40, t=28),
-                xaxis=dict(title="X (m)", color="#888"),
-                yaxis=dict(title="Z (m)", color="#888", scaleanchor="x", scaleratio=1),
-            )
-            self._overlay_trajectory(fig)
-            _overlay_zones(fig, zones)
-            return fig
+    def _empty_figure(
+        self, title: str, uirevision: str,
+        route: Optional[List[Tuple[float, float]]] = None,
+        route_confirmed: Optional[bool] = None,
+    ) -> go.Figure:
+        """Shared 'no data yet' placeholder for both render_plotly() and
+        render_confidence_plotly()."""
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_dark",
+            title=dict(text=title, font=dict(size=13)),
+            margin=dict(l=40, r=10, b=40, t=28),
+            xaxis=dict(title="X (m)", color="#888"),
+            yaxis=dict(title="Z (m)", color="#888", scaleanchor="x", scaleratio=1),
+            uirevision=uirevision,
+        )
+        self._overlay_trajectory(fig)
+        self._overlay_route(fig, route, route_confirmed)
+        return fig
 
+    def _grid_bbox_and_ticks(self) -> Tuple[int, int, int, int, int, int, list, list]:
+        """Shared by render_plotly()/render_confidence_plotly(): the bounding
+        box of every cell ever touched, its (H, W) shape, and world-space
+        tick arrays for the X/Z axes — both renders iterate the exact same
+        self._cells keys into the exact same grid shape, just filling it
+        with a different per-cell value."""
         keys = np.array(list(self._cells.keys()), dtype=np.int32)
-        ix_min, iz_min = keys[:, 0].min(), keys[:, 1].min()
-        ix_max, iz_max = keys[:, 0].max(), keys[:, 1].max()
-
+        ix_min, iz_min = int(keys[:, 0].min()), int(keys[:, 1].min())
+        ix_max, iz_max = int(keys[:, 0].max()), int(keys[:, 1].max())
         H = iz_max - iz_min + 1
         W = ix_max - ix_min + 1
-        grid = np.full((H, W), self.CLASS_UNKNOWN, dtype=np.int8)
-
         res = self.resolution
+        x_ticks = [ix_min * res + j * res for j in range(W)]
+        z_ticks = [iz_min * res + i * res for i in range(H)]
+        return ix_min, iz_min, ix_max, iz_max, H, W, x_ticks, z_ticks
+
+    _CLASS_NAME = {
+        CLASS_UNKNOWN: "Unknown",
+        CLASS_GROUND: "Free / ground",
+        CLASS_LOW_STEP_OVER: "Low (step-over)",
+        CLASS_OBSTACLE: "Obstacle",
+    }
+
+    def _render_plotly_impl(
+        self, zones=None,
+        route: Optional[List[Tuple[float, float]]] = None,
+        route_confirmed: Optional[bool] = None,
+    ) -> go.Figure:
+        """
+        Return a Plotly Heatmap as a continuous height-above-ground gradient
+        (an elevation/height map, not the classic SLAM discrete
+        free/step-over/obstacle grayscale this used to render) — 0.0m
+        (ground) at the colorscale's low end, OBSTACLE_MAX_H at the high
+        end, so a glance shows how TALL an obstacle is (a low curb vs. a
+        chest-height shelf vs. a full wall), not just that a cell is
+        occupied. Unknown cells (not enough agreeing evidence, or the
+        module's own CLASS_UNKNOWN — see _classify_state) render as NaN,
+        which Plotly leaves blank/transparent — visually distinct from any
+        real height value without needing a dedicated color.
+
+        Reuses _classify_state() as the single source of truth for
+        ground/step-over/obstacle/unknown (same Bayesian belief the
+        Occupancy Map's own path-planning export uses) and de-normalizes
+        its `norm` output back to a real metres value for non-ground cells,
+        rather than duplicating the classification thresholds here.
+
+        `route`/`route_confirmed` — see _overlay_route().
+        """
+        if not self._cells or self._ground_y is None:
+            return self._empty_figure(
+                "Traversability Map (no data yet)", uirevision="occ",
+                route=route, route_confirmed=route_confirmed,
+            )
+
+        ix_min, iz_min, ix_max, iz_max, H, W, x_ticks, z_ticks = self._grid_bbox_and_ticks()
+        height_grid = np.full((H, W), np.nan, dtype=np.float64)
+        class_grid = np.full((H, W), self.CLASS_UNKNOWN, dtype=np.int8)
+
         gy = self._ground_y
 
         for key, cell in self._cells.items():
             ix, iz = key
             row = iz - iz_min
             col = ix - ix_min
-            _, cls = self._classify_state(cell)
-            grid[row, col] = cls  # ceiling/uncertain (-> CLASS_UNKNOWN) left as unknown
+            norm, cls = self._classify_state(cell)
+            class_grid[row, col] = cls
+            if cls == self.CLASS_UNKNOWN:
+                continue  # not enough evidence, or ceiling — left as NaN
+            if cls == self.CLASS_GROUND:
+                height_grid[row, col] = 0.0
+            else:
+                # De-normalize _classify_state's (height-OBSTACLE_MIN_H)/
+                # (OBSTACLE_MAX_H-OBSTACLE_MIN_H) fraction back to real
+                # metres — reuses that method as the single source of truth
+                # for the classification thresholds instead of duplicating
+                # them here.
+                height_grid[row, col] = (
+                    norm * (self.OBSTACLE_MAX_H - self.OBSTACLE_MIN_H) + self.OBSTACLE_MIN_H
+                )
 
-        # ── Morphological dilation ─────────────────────────────────────────────
-        # Spread known obstacles into adjacent still-unknown cells (3×3 max
-        # filter) — fills gaps from sparse depth coverage on obstacle tops.
-        # Never overwrites a cell that already has its own classification
-        # (ground/step-over/obstacle).
-        obs_mask = grid == self.CLASS_OBSTACLE
-        if obs_mask.any():
-            dilated = maximum_filter(obs_mask.astype(np.int8), size=3, mode="constant", cval=0)
-            fill_mask = (grid == self.CLASS_UNKNOWN) & (dilated > 0)
-            grid[fill_mask] = self.CLASS_OBSTACLE
+        # ── Gap fill ─────────────────────────────────────────────────────────
+        # Spread known height values into adjacent still-unknown (NaN) cells
+        # (3×3 max filter) — fills gaps from sparse depth coverage on
+        # obstacle tops, generalizing the same idea the old discrete
+        # rendering used (dilating obstacle presence) to continuous height:
+        # an unknown cell next to a tall neighbor is more likely to be part
+        # of that same obstacle's top than to be ground. Never overwrites a
+        # cell that already has its own classification.
+        valid_mask = ~np.isnan(height_grid)
+        if valid_mask.any():
+            filled_for_filter = np.where(valid_mask, height_grid, -np.inf)
+            dilated = maximum_filter(filled_for_filter, size=3, mode="constant", cval=-np.inf)
+            fill_mask = (~valid_mask) & np.isfinite(dilated)
+            height_grid[fill_mask] = dilated[fill_mask]
 
-        x_ticks = [ix_min * res + j * res for j in range(W)]
-        z_ticks = [iz_min * res + i * res for i in range(H)]
-
-        # Classic SLAM occupancy-grid grayscale — discrete, not a continuous
-        # gradient: white=free, light gray=step-over, black=obstacle,
-        # mid-gray=unknown (same visual language as RViz/gmapping/cartographer).
-        _CLASS_COLOR = {
-            self.CLASS_UNKNOWN: "rgb(120,120,120)",
-            self.CLASS_GROUND: "rgb(255,255,255)",
-            self.CLASS_LOW_STEP_OVER: "rgb(190,190,190)",
-            self.CLASS_OBSTACLE: "rgb(0,0,0)",
-        }
-        _CLASS_NAME = {
-            self.CLASS_UNKNOWN: "Unknown",
-            self.CLASS_GROUND: "Free / ground",
-            self.CLASS_LOW_STEP_OVER: "Low (step-over)",
-            self.CLASS_OBSTACLE: "Obstacle",
-        }
-        # zmin/zmax padded half a class-width so 4 equal-width discrete bands
-        # map cleanly to class ints 0..3 with hard (not blended) edges.
-        colorscale = [
-            [0.00, _CLASS_COLOR[0]], [0.25, _CLASS_COLOR[0]],
-            [0.25, _CLASS_COLOR[1]], [0.50, _CLASS_COLOR[1]],
-            [0.50, _CLASS_COLOR[2]], [0.75, _CLASS_COLOR[2]],
-            [0.75, _CLASS_COLOR[3]], [1.00, _CLASS_COLOR[3]],
-        ]
-        class_names = np.vectorize(_CLASS_NAME.get)(grid)
+        class_names = np.vectorize(self._CLASS_NAME.get)(class_grid)
 
         fig = go.Figure(
             go.Heatmap(
-                z=grid,
+                z=height_grid,
                 x=x_ticks,
                 y=z_ticks,
-                colorscale=colorscale,
-                zmin=-0.5,
-                zmax=3.5,
+                colorscale="Turbo",
+                zmin=0.0,
+                zmax=self.OBSTACLE_MAX_H,
                 showscale=True,
-                colorbar=dict(
-                    title="",
-                    tickvals=[0, 1, 2, 3],
-                    ticktext=["Unknown", "Free / ground", "Low (step-over)", "Obstacle"],
-                    len=0.6,
-                ),
+                colorbar=dict(title="Height (m)", len=0.6),
                 customdata=class_names,
                 hovertemplate=(
-                    "x=%{x:.2f}m  z=%{y:.2f}m<br>%{customdata}<extra></extra>"
+                    "x=%{x:.2f}m  z=%{y:.2f}m<br>height=%{z:.2f}m (%{customdata})<extra></extra>"
                 ),
             )
         )
@@ -785,6 +930,91 @@ class OccupancyMap:
             uirevision="occ",
         )
         self._overlay_trajectory(fig)
+        self._overlay_route(fig, route, route_confirmed)
+        _overlay_zones(fig, zones)
+        return fig
+
+    def render_confidence_plotly(
+        self, zones=None,
+        route: Optional[List[Tuple[float, float]]] = None,
+        route_confirmed: Optional[bool] = None,
+    ) -> go.Figure:
+        """Times the render, same convention as render_plotly()."""
+        with timed(f"occupancy_map.render_confidence_plotly ({len(self._cells)} cells)"):
+            return self._render_confidence_plotly_impl(zones, route, route_confirmed)
+
+    def _render_confidence_plotly_impl(
+        self, zones=None,
+        route: Optional[List[Tuple[float, float]]] = None,
+        route_confirmed: Optional[bool] = None,
+    ) -> go.Figure:
+        """
+        Return a Plotly Heatmap of per-cell CONFIDENCE — how much agreeing
+        evidence a cell has accumulated, independent of whether that
+        evidence says free or occupied — as opposed to render_plotly()'s
+        height/classification view. A cell with logodds near 0 (barely
+        observed, or genuinely contradictory observations cancelling out)
+        reads low confidence even if its current best-guess classification
+        happens to be ground; a cell hit/confirmed many times over reads
+        high confidence regardless of which way it was classified.
+
+        confidence = min(|logodds| / max(LOGODDS_MAX, |LOGODDS_MIN|), 1.0)
+        — 0.0 at logodds==0 (the exact center of _classify_state's
+        "unknown" band), ramping to 1.0 at full log-odds saturation. Cells
+        with NO entry in self._cells at all (never observed, still inside
+        the overall bbox) get an explicit 0.0 — unlike render_plotly()'s
+        height map, "no data" and "confidence zero" are the same concept
+        here, so there's no NaN/blank case to represent separately.
+
+        `route`/`route_confirmed` — see _overlay_route().
+        """
+        if not self._cells or self._ground_y is None:
+            return self._empty_figure(
+                "Confidence Map (no data yet)", uirevision="conf",
+                route=route, route_confirmed=route_confirmed,
+            )
+
+        ix_min, iz_min, ix_max, iz_max, H, W, x_ticks, z_ticks = self._grid_bbox_and_ticks()
+        confidence_grid = np.zeros((H, W), dtype=np.float64)
+        class_grid = np.full((H, W), self.CLASS_UNKNOWN, dtype=np.int8)
+
+        logodds_scale = max(self.LOGODDS_MAX, abs(self.LOGODDS_MIN))
+        for key, cell in self._cells.items():
+            ix, iz = key
+            row = iz - iz_min
+            col = ix - ix_min
+            _, cls = self._classify_state(cell)
+            class_grid[row, col] = cls
+            confidence_grid[row, col] = min(abs(cell.logodds) / logodds_scale, 1.0)
+
+        class_names = np.vectorize(self._CLASS_NAME.get)(class_grid)
+
+        fig = go.Figure(
+            go.Heatmap(
+                z=confidence_grid,
+                x=x_ticks,
+                y=z_ticks,
+                colorscale="Viridis",
+                zmin=0.0,
+                zmax=1.0,
+                showscale=True,
+                colorbar=dict(title="Confidence", len=0.6),
+                customdata=class_names,
+                hovertemplate=(
+                    "x=%{x:.2f}m  z=%{y:.2f}m<br>confidence=%{z:.2f} (%{customdata})<extra></extra>"
+                ),
+            )
+        )
+        fig.update_layout(
+            template="plotly_dark",
+            margin=dict(l=40, r=10, b=40, t=28),
+            title=dict(text="Confidence Map", font=dict(size=12)),
+            xaxis=dict(title="X (m)", color="#888", scaleanchor="y", scaleratio=1),
+            yaxis=dict(title="Z (m)", color="#888"),
+            uirevision="conf",
+        )
+        self._overlay_trajectory(fig)
+        self._overlay_route(fig, route, route_confirmed)
         _overlay_zones(fig, zones)
         return fig
 
@@ -810,6 +1040,34 @@ class OccupancyMap:
             hovertemplate=f"x={xs[-1]:.2f}m  z={zs[-1]:.2f}m<extra>Current position</extra>",
         ))
 
+    def _overlay_route(
+        self, fig: go.Figure,
+        route: Optional[List[Tuple[float, float]]],
+        confirmed: Optional[bool],
+    ) -> None:
+        """Draw a computed navigation route (see live_path_planner.py) —
+        green if `confirmed` (every cell along it is genuinely observed
+        ground/step-over), dashed orange if not (it had to cross at least
+        one still-unexplored cell to reach the destination — "speculative",
+        see live_path_planner.py's module docstring). `route` must include
+        the start point as its first element: LiveGridPathPlanner.find_path()
+        itself omits it (matching GridPathPlanner's existing convention),
+        so the caller prepends the current camera position before passing
+        a route here."""
+        if not route or len(route) < 2:
+            return
+        xs = [p[0] for p in route]
+        zs = [p[1] for p in route]
+        color = "rgba(50,220,50,0.9)" if confirmed else "rgba(255,150,0,0.9)"
+        fig.add_trace(go.Scatter(
+            x=xs, y=zs,
+            mode="lines+markers",
+            line=dict(color=color, width=3, dash=None if confirmed else "dash"),
+            marker=dict(size=6, color=color),
+            name="Route" if confirmed else "Route (speculative — unexplored)",
+            hoverinfo="skip",
+        ))
+
     def _build_grid_dict(self, ix_lo: int, ix_hi: int, iz_lo: int, iz_hi: int) -> dict:
         """
         Shared by extract_subgrid/extract_full_grid: builds the JSON-serializable
@@ -823,6 +1081,20 @@ class OccupancyMap:
                 A* path planning (server/tools/grid_path_planner.py) reads
                 this; `data` stays exactly as-is for existing consumers
                 (scan_gui.py's per-zone rendering).
+          clearance: List[List[float]] — same shape, new — metres to the
+                nearest CLASS_OBSTACLE cell (0.0 AT an obstacle cell itself),
+                via a 2D Euclidean distance transform over this window's own
+                class grid. Used by server/tools/grid_path_planner.py to
+                prefer open space over hugging walls, not just avoid hard
+                blocks. NOTE (known caveat, not fixed): this is windowed to
+                [ix_lo,ix_hi)x[iz_lo,iz_hi) — an obstacle just outside the
+                window is invisible to this EDT, so extract_subgrid()'s
+                per-zone clearance can overstate real safety near a zone's
+                AABB edge. Harmless today because grid_path_planner.py only
+                ever reads the top-level grid from extract_full_grid(),
+                which spans every occupied cell in one shot (no windowing
+                artifact) — don't trust zones[].occupancy_grid.clearance for
+                planning without revisiting this windowing.
         """
         res = self.resolution
         width = max(1, ix_hi - ix_lo)
@@ -841,6 +1113,18 @@ class OccupancyMap:
                     data[row][col] = -1.0 if cls == self.CLASS_UNKNOWN else norm
                     cls_grid[row][col] = cls
 
+        obstacle_mask = np.array(cls_grid) == self.CLASS_OBSTACLE
+        if obstacle_mask.any():
+            clearance = (distance_transform_edt(~obstacle_mask) * res).tolist()
+        else:
+            # distance_transform_edt on an all-False mask does NOT raise —
+            # it returns nonsense values anchored to the array's (0,0)
+            # corner (as if that corner cell were an implicit obstacle),
+            # empirically verified during planning. 9.0m is a safe inert
+            # sentinel: grid_path_planner.py's clearance-cost formula
+            # saturates to ~1.0x (no effect) well before 9.0m anyway.
+            clearance = [[9.0] * width for _ in range(height)]
+
         return {
             "resolution": res,
             "origin_x": float(ix_lo * res),
@@ -849,6 +1133,7 @@ class OccupancyMap:
             "height": height,
             "data": data,
             "class": cls_grid,
+            "clearance": clearance,
         }
 
     def extract_subgrid(self, bbox_min: List[float], bbox_max: List[float]) -> dict:
@@ -878,3 +1163,80 @@ class OccupancyMap:
         ix_lo, iz_lo = int(keys[:, 0].min()), int(keys[:, 1].min())
         ix_hi, iz_hi = int(keys[:, 0].max()) + 1, int(keys[:, 1].max()) + 1
         return self._build_grid_dict(ix_lo, ix_hi, iz_lo, iz_hi)
+
+    def clear_dirty(self) -> None:
+        """Discards pending dirty cells without extracting them — used after
+        a FULL grid export (mapping_servicer.py), since those cells' current
+        values are already covered by the full send and would otherwise be
+        redundantly included in the next delta too."""
+        self._dirty_cells.clear()
+
+    def bounds(self) -> Optional[Tuple[int, int, int, int]]:
+        """(ix_lo, iz_lo, width, height) of the current full-grid bounding
+        box, without paying for a full _build_grid_dict() classification
+        pass — mapping_servicer.py calls this cheaply on every update to
+        decide whether the box grew since the last full resync (in which
+        case a delta's fixed-origin cell indices would no longer line up
+        with what the client has, and a fresh extract_full_grid() is
+        needed instead of extract_dirty_delta())."""
+        if not self._cells:
+            return None
+        keys = np.array(list(self._cells.keys()), dtype=np.int32)
+        ix_lo, iz_lo = int(keys[:, 0].min()), int(keys[:, 1].min())
+        ix_hi, iz_hi = int(keys[:, 0].max()) + 1, int(keys[:, 1].max()) + 1
+        return ix_lo, iz_lo, ix_hi - ix_lo, iz_hi - iz_lo
+
+    def extract_dirty_delta(self) -> Optional[dict]:
+        """
+        Sparse counterpart to extract_full_grid() — only cells touched
+        (self._dirty_cells) since the last call, for incremental sync
+        instead of re-shipping the whole map every update. Clears
+        self._dirty_cells before returning. Cell indices are GLOBAL grid
+        coordinates (ix, iz), not relative to any particular window, so
+        they stay valid across calls as long as the map's overall bounding
+        box hasn't changed since the last full resync (see bounds() above)
+        — the caller is responsible for that decision, this method doesn't
+        make it.
+
+        Reuses _build_grid_dict's classification + clearance (EDT) pass
+        over the CURRENT full bounding box to get authoritative values for
+        the dirty subset — same server-side cost as extract_full_grid()
+        today (this does not reduce compute, only what's put on the wire,
+        which is what was actually asked for: repeatedly shipping the
+        whole grid over gRPC as a session/map grows).
+
+        Known, accepted imprecision: a cell whose CLEARANCE changed because
+        a NEARBY cell (not itself) just became/stopped being an obstacle,
+        without itself being touched this batch, can go briefly stale until
+        it's next touched itself. Not fixed, because it's rare and
+        low-impact: the clearance cost curve saturates to ~1.0x (no
+        practical path-cost effect) by ~1m from any obstacle (see
+        grid_path_planner.py's CLEARANCE_DECAY_RATE), and cells near a
+        just-touched obstacle are overwhelmingly likely to be touched in
+        the very same batch anyway (same source depth frame), so this
+        would rarely bite in practice.
+
+        Returns None if nothing is dirty (caller sends a pose-only update).
+        """
+        if not self._dirty_cells or self._ground_y is None:
+            return None
+        b = self.bounds()
+        if b is None:
+            return None
+        ix_lo, iz_lo, width, height = b
+        full = self._build_grid_dict(ix_lo, ix_lo + width, iz_lo, iz_lo + height)
+        cells = []
+        for (ix, iz) in self._dirty_cells:
+            row, col = iz - iz_lo, ix - ix_lo
+            if not (0 <= row < height and 0 <= col < width):
+                continue  # defensive — shouldn't happen, bounds() was just computed fresh
+            cells.append({
+                "ix": ix, "iz": iz,
+                "class": full["class"][row][col],
+                "height_norm": full["data"][row][col],
+                "clearance": full["clearance"][row][col],
+            })
+        self._dirty_cells.clear()
+        if not cells:
+            return None
+        return {"resolution": self.resolution, "cells": cells}

@@ -43,7 +43,7 @@ _STATUS_PONG = 0x03
 
 _HEADER_FMT = "<qiidddd"      # timestamp_ns, width, height, fx, fy, cx, cy — no n_imu
 _POSE_FMT = "<7d"             # tx, ty, tz, qx, qy, qz, qw
-_TRACK_TAIL_FMT = "<Bi"       # loop_closure_flag, new_node_id (-1 = no new node)
+_TRACK_TAIL_FMT = "<Bif"      # loop_closure_flag, new_node_id (-1 = no new node), inlier_fraction
 _GET_CLOUD_REQ_FMT = "<iff"   # since_node_id, voxel_size, max_depth
 _NODE_HDR_FMT = "<i7di"       # node_id, pose(7d), point_count
 
@@ -72,6 +72,18 @@ class TrackedFrame:
     # excluded when later pulled via get_cloud() — see rtabmap_server.cc's
     # wire-protocol comment for why this can't be determined any other way.
     node_id: int = -1
+    # RTAB-Map's own frame-to-map registration inlier fraction
+    # (odomInfo.reg.inliers / max(odomInfo.reg.matches, 1)), already computed
+    # server-side as a side effect of normal odometry — used by
+    # scan_session.py as `1.0 - inlier_fraction` to decide whether this frame
+    # is novel enough to keep (the RTAB-Map-pose-mode counterpart to the
+    # Python-side OrbNoveltyGate used for IMU+VO/VO mode). NOT the same
+    # signal as node_id — see rtabmap_server.cc's wire-protocol comment.
+    # Defaults to 1.0 ("fully explained by the existing map" / not novel)
+    # against an older server build that doesn't send this field, so an
+    # un-rebuilt server degrades to "never accept on this signal" rather
+    # than crashing.
+    inlier_fraction: float = 1.0
 
 
 @dataclass
@@ -267,17 +279,30 @@ class RtabmapPoseClient:
         tail_size = struct.calcsize(_TRACK_TAIL_FMT)
         tail_off = 1 + pose_size
         if len(reply) >= tail_off + tail_size:
-            loop_closure_flag, node_id = struct.unpack(
+            loop_closure_flag, node_id, inlier_fraction = struct.unpack(
                 _TRACK_TAIL_FMT, reply[tail_off:tail_off + tail_size]
             )
             loop_closure = bool(loop_closure_flag)
         else:
-            # Older server build without the node_id field — degrade
-            # gracefully rather than crash (loop_closure alone, no node
-            # veto capability, same as before this field existed).
-            loop_closure = bool(reply[tail_off]) if len(reply) > tail_off else False
-            node_id = -1
-        return TrackedFrame(pose=pose, loop_closure=loop_closure, node_id=node_id)
+            # Older server build without node_id/inlier_fraction — degrade
+            # gracefully rather than crash. Try the node_id-only tail (<Bi,
+            # the format before this field existed) before falling back
+            # further, same layered-compat approach node_id itself used when
+            # it was added.
+            legacy_fmt = "<Bi"
+            legacy_size = struct.calcsize(legacy_fmt)
+            if len(reply) >= tail_off + legacy_size:
+                loop_closure_flag, node_id = struct.unpack(
+                    legacy_fmt, reply[tail_off:tail_off + legacy_size]
+                )
+                loop_closure = bool(loop_closure_flag)
+            else:
+                loop_closure = bool(reply[tail_off]) if len(reply) > tail_off else False
+                node_id = -1
+            inlier_fraction = 1.0
+        return TrackedFrame(
+            pose=pose, loop_closure=loop_closure, node_id=node_id, inlier_fraction=inlier_fraction,
+        )
 
     def _reconnect(self) -> None:
         # A timed-out/errored REQ socket is stuck mid-transaction (REQ enforces

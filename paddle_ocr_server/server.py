@@ -6,10 +6,13 @@ import cv2
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
+from ocr_monitor import OcrMonitor
+
 logging.basicConfig(level=logging.INFO, format="[OCR] %(message)s")
 log = logging.getLogger(__name__)
 
 _ocr = None
+ocr_monitor = OcrMonitor()
 
 
 @asynccontextmanager
@@ -33,6 +36,13 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Debug/monitoring UI for the pipeline below — mounted onto this same FastAPI
+# app so `uvicorn server:app --host 0.0.0.0 --port 8100` stays the single
+# entrypoint (no second port/process to manage); reachable at /gui.
+import gradio as gr
+from ocr_gui import create_ui as create_ocr_ui
+app = gr.mount_gradio_app(app, create_ocr_ui(ocr_monitor), path="/gui")
 
 
 def _decode_image(data: bytes) -> np.ndarray:
@@ -108,6 +118,11 @@ async def ocr(image: UploadFile = File(...)):
     try:
         img = _decode_image(data)
     except ValueError as e:
+        ocr_monitor.record(
+            filename=image.filename or "", image_bytes=len(data),
+            original_rgb=None, preprocessed_rgb=None, processed_rgb=None,
+            raw_blocks=[], merged_blocks=[], final_text="", error=str(e),
+        )
         raise HTTPException(status_code=400, detail=str(e))
 
     preprocessed = _preprocess(img)
@@ -126,7 +141,7 @@ async def ocr(image: UploadFile = File(...)):
     _, buf = cv2.imencode(".png", processed_img)
     img_b64 = base64.b64encode(buf.tobytes()).decode()
 
-    blocks = []
+    raw_blocks = []
     for item in results:
         texts = _get(item, "rec_texts") or []
         boxes = _get(item, "rec_boxes")
@@ -139,8 +154,17 @@ async def ocr(image: UploadFile = File(...)):
             text = text.strip()
             if not text:
                 continue
-            blocks.append({"text": text, "box": [round(v) for v in box], "score": round(float(score), 4)})
+            raw_blocks.append({"text": text, "box": [round(v) for v in box], "score": round(float(score), 4)})
 
-    blocks = _merge_into_paragraphs(blocks)
-    log.info("returning %d blocks", len(blocks))
-    return JSONResponse({"blocks": blocks, "image": img_b64})
+    merged_blocks = _merge_into_paragraphs(list(raw_blocks))
+    log.info("returning %d blocks", len(merged_blocks))
+
+    ocr_monitor.record(
+        filename=image.filename or "", image_bytes=len(data),
+        original_rgb=cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+        preprocessed_rgb=cv2.cvtColor(preprocessed, cv2.COLOR_BGR2RGB),
+        processed_rgb=cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB),
+        raw_blocks=raw_blocks, merged_blocks=merged_blocks,
+        final_text="\n".join(b["text"] for b in merged_blocks),
+    )
+    return JSONResponse({"blocks": merged_blocks, "image": img_b64})

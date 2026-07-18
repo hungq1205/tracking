@@ -80,6 +80,27 @@
 //                  filtered client-side; without a node_id link, the client
 //                  would have no way to know which reconstructed node came
 //                  from which frame.
+//       float      inlier_fraction        odomInfo.reg.inliers / max(odomInfo.
+//                  reg.matches, 1) — RTAB-Map's own frame-to-map registration
+//                  quality, already computed as a side effect of the
+//                  odom->process() call above (no new SLAM work). This is the
+//                  RTAB-Map-pose-mode counterpart to the Python-side
+//                  OrbNoveltyGate's new_fraction (scan_server/
+//                  orb_novelty_gate.py, ported from frame_extractor/
+//                  extractor.py): a LOW inlier_fraction means this frame
+//                  didn't register well against what's already mapped, i.e.
+//                  it's likely showing something new — used by
+//                  scan_session.py as `1.0 - inlier_fraction` to decide
+//                  whether a frame is novel enough to keep. Deliberately NOT
+//                  the same signal as new_node_id above — new_node_id
+//                  reflects keyframe-spacing/displacement policy (how far the
+//                  camera moved), not visual overlap with the existing map;
+//                  reusing it for novelty would conflate two different
+//                  questions. Defaults to 1.0 ("fully explained by the
+//                  existing map" / not novel) client-side against an older
+//                  server build that doesn't send this field, so an
+//                  un-rebuilt server degrades to "never accept on this
+//                  signal" rather than crashing.
 //     GET_CLOUD OK only:
 //       int32 node_count
 //       repeated node_count times, ascending node id:
@@ -89,6 +110,7 @@
 //         float32[point_count*3]  xyz
 //         uint8[point_count*3]    rgb
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -439,6 +461,13 @@ int main(int argc, char** argv) {
             send_status(sock, STATUS_LOST);
             continue;
         }
+        // odomInfo.reg (rtabmap::RegistrationInfo) is already populated as a
+        // side effect of odom->process() above — reading inliers/matches here
+        // costs nothing new. See the wire-protocol comment on inlier_fraction
+        // above for why this is used as a novelty signal, not new_node_id.
+        const float inlier_fraction =
+            static_cast<float>(odomInfo.reg.inliers) /
+            static_cast<float>(std::max(odomInfo.reg.matches, 1));
 
         slam.process(data, odomPose);
         // getLastLocationId() returns the id of whichever node RTAB-Map most
@@ -484,12 +513,13 @@ int main(int argc, char** argv) {
         double out_pose[7];
         pose_to_wire(pose, out_pose);
 
-        zmq::message_t reply(1 + sizeof(out_pose) + 1 + sizeof(int32_t));
+        zmq::message_t reply(1 + sizeof(out_pose) + 1 + sizeof(int32_t) + sizeof(float));
         uint8_t* rbuf = static_cast<uint8_t*>(reply.data());
         rbuf[0] = STATUS_OK;
         std::memcpy(rbuf + 1, out_pose, sizeof(out_pose));
         rbuf[1 + sizeof(out_pose)] = loop_closure_flag;
         std::memcpy(rbuf + 1 + sizeof(out_pose) + 1, &new_node_id, sizeof(int32_t));
+        std::memcpy(rbuf + 1 + sizeof(out_pose) + 1 + sizeof(int32_t), &inlier_fraction, sizeof(float));
         sock.send(reply, zmq::send_flags::none);
     }
 

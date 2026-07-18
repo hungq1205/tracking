@@ -12,14 +12,13 @@ import android.provider.ContactsContract
 import android.util.Log
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
-import tracking.Tracking
 import java.util.Calendar
 
 class AndroidDeviceToolHandler(private val context: Context) : DeviceToolHandler {
 
     override val capabilities = listOf("make_phone_call", "set_alarm", "create_calendar_event", "search_contacts", "play_video", "stop_music")
 
-    override suspend fun execute(toolCall: Tracking.DeviceToolCall): String {
+    override suspend fun execute(toolCall: DeviceToolCall): String {
         val args = try { JSONObject(toolCall.argsJson) } catch (e: Exception) { JSONObject() }
         Log.d(TAG, "Executing device tool: ${toolCall.name} args=$args")
         return try {

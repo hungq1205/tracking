@@ -31,7 +31,7 @@ class DA3Estimator(BaseDepthEstimator):
     Uses depth_anything_3.api directly: returns metric depth, actual camera
     intrinsics (K matrix), and global camera pose (c2w) per frame.
     """
-    def __init__(self, model_id: str = "depth-anything/da3-large", device: Optional[str] = None):
+    def __init__(self, model_id: str = "depth-anything/DA3METRIC-LARGE", device: Optional[str] = None):
         try:
             from depth_anything_3.api import DepthAnything3
             self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -46,6 +46,8 @@ f"Original error: {e}"
     def estimate(self, rgb_frame: np.ndarray) -> DepthFrame:
         return self.estimate_batch([rgb_frame])[0]
 
+    _logged_depth_stats = False  # one-shot diagnostic, see below
+
     def estimate_batch(self, rgb_frames: list) -> list:
         """
         Run DA3 multi-view inference on all frames at once.
@@ -53,6 +55,28 @@ f"Original error: {e}"
         globally consistent depth and camera poses.
         """
         prediction = self.model.inference(rgb_frames)
+
+        if not self._logged_depth_stats:
+            # One-shot sanity check: depth_anything_3's own OutputProcessor
+            # never applies Prediction.scale_factor to Prediction.depth (read
+            # straight from model_output["depth"]), and Prediction.is_metric
+            # is set via getattr(model_output, "is_metric", 0) on a plain
+            # dict — getattr never finds a dict key, so that field always
+            # reads 0 regardless of the model's actual output (a bug in the
+            # vendored package, not real signal). We have no library-level
+            # confirmation that self.model.inference()'s "depth" is really
+            # in metres for this checkpoint — log real value statistics once
+            # so a human can eyeball whether they're plausible room-scale
+            # numbers (~0.3-8m indoors) instead of guessing blind.
+            _d = np.asarray(prediction.depth)
+            print(
+                f"[DA3] depth stats (one-shot, model={self.model.model_name if hasattr(self.model, 'model_name') else '?'}): "
+                f"min={_d.min():.3f} median={np.median(_d):.3f} max={_d.max():.3f} "
+                f"is_metric={getattr(prediction, 'is_metric', None)} "
+                f"scale_factor={getattr(prediction, 'scale_factor', None)} "
+                f"— expect ~0.3-8.0 for a plausible indoor room if this is really metres."
+            )
+            self._logged_depth_stats = True
 
         results = []
         for i, rgb_frame in enumerate(rgb_frames):

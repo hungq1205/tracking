@@ -1,3 +1,19 @@
+"""
+Server Monitor — live view of whatever the Android client's RPCs actually
+send, built directly around ActivityMonitor (services/activity_monitor.py).
+
+There's no server-side "mode" any more (no LiveSessionState — orchestration
+moved on-device, see CLAUDE.md's "Client-Orchestrated Live Session"
+section), so this dashboard doesn't reconstruct state by guessing. Two
+signals feed it: (1) StatusService.ReportMode — the client explicitly tells
+the server which mode it's in, once per transition (ActivityMonitor.
+client_mode) — this is authoritative and preferred for tab selection when
+present; (2) each servicer also records a snapshot into ActivityMonitor as
+real RPCs land regardless (TrackingService -> tracking bucket,
+PerceptionService -> perception bucket, MappingService -> mapping bucket),
+which is what actually supplies the frames/results shown in each tab, and
+is the tab-selection fallback for older clients that predate ReportMode.
+"""
 from __future__ import annotations
 
 import time
@@ -5,356 +21,279 @@ from typing import Optional
 
 import cv2
 import gradio as gr
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
+import plotly.graph_objects as go
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+_TAB_BY_CATEGORY = {
+    "tracking": "tab_tracking",
+    "perception": "tab_perception",
+    "mapping": "tab_mapping",
+}
 
-def _current_tab_id(mode: str) -> str:
-    return {
-        "reading": "tab_reading",
-        "guiding": "tab_nav",
-        "tracking": "tab_tracking",
-    }.get(mode, "tab_info")
+_TAB_BY_CLIENT_MODE = {
+    "tracking": "tab_tracking",
+    "guiding": "tab_mapping",
+    "walking": "tab_mapping",
+    "scanning": "tab_mapping",
+}
 
 
-def _annotate_tracking(
-    frame_bgr: np.ndarray, detection: Optional[dict], hand_box: Optional[list] = None,
-) -> np.ndarray:
+def _bgr_to_rgb(frame_bgr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if frame_bgr is not None else None
+
+
+def _ago(at: float) -> str:
+    if not at:
+        return "never"
+    dt = time.time() - at
+    return f"{dt:.1f}s ago" if dt < 60 else time.strftime("%H:%M:%S", time.localtime(at))
+
+
+def _annotate_tracking(snap: dict) -> Optional[np.ndarray]:
+    frame_bgr = snap.get("frame_bgr")
+    if frame_bgr is None:
+        return None
     vis = frame_bgr.copy()
-    if detection and detection.get("box_xyxy"):
-        x1, y1, x2, y2 = map(int, detection["box_xyxy"])
-        label = f"{detection.get('target', '?')}"
+    box = snap.get("box_xyxy")
+    if box and len(box) == 4:
+        x1, y1, x2, y2 = map(int, box)
+        label = snap.get("prompt", "") or "target"
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 2)
+        cv2.putText(vis, label, (x1, max(y1 - 8, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2, cv2.LINE_AA)
+    return _bgr_to_rgb(vis)
+
+
+def _tracking_status(snap: dict) -> str:
+    if not snap:
+        return "No TrackingService activity yet."
+    lines = [f"op: {snap.get('op', '?')}", f"at: {_ago(snap.get('at', 0))}"]
+    if "prompt" in snap:
+        lines.append(f"prompt: '{snap['prompt']}'")
+    if "score" in snap:
+        lines.append(f"score: {snap['score']:.3f}")
+    if "box_xyxy" in snap:
+        lines.append(f"box: {[round(v) for v in snap['box_xyxy']]}")
+    if "embedding_dim" in snap:
+        lines.append(f"embedding dim: {snap['embedding_dim']}")
+    return "\n".join(lines)
+
+
+def _annotate_perception(snap: dict) -> Optional[np.ndarray]:
+    frame_bgr = snap.get("frame_bgr")
+    if frame_bgr is None:
+        return None
+    vis = frame_bgr.copy()
+    for d in snap.get("detections") or []:
+        x1, y1, x2, y2 = map(int, d["box_xyxy"])
+        label = f"{d.get('label', '?')} {d.get('score', 0):.2f}"
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 170, 0), 2)
+        cv2.putText(vis, label, (x1, max(y1 - 8, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 170, 0), 2, cv2.LINE_AA)
+    obstacle = snap.get("obstacle")
+    if obstacle and obstacle.get("detected"):
+        h, w = vis.shape[:2]
+        text = f"OBSTACLE ~{obstacle['distance_m']:.2f}m"
+        cv2.putText(vis, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+    return _bgr_to_rgb(vis)
+
+
+def _perception_status(snap: dict) -> str:
+    if not snap:
+        return "No PerceptionService activity yet."
+    lines = [f"op: {snap.get('op', '?')}", f"at: {_ago(snap.get('at', 0))}"]
+    if "ops" in snap:
+        lines.append(f"requested ops: {snap['ops']}")
+    if snap.get("prompt"):
+        lines.append(f"prompt: '{snap['prompt']}'")
+    if "detections" in snap:
+        lines.append(f"detections: {len(snap['detections'])}")
+        for d in snap["detections"][:5]:
+            lines.append(f"  · {d.get('label', '?')} score={d.get('score', 0):.2f} box={[round(v) for v in d['box_xyxy']]}")
+    if snap.get("obstacle"):
+        o = snap["obstacle"]
+        lines.append(f"obstacle: detected={o.get('detected')} distance={o.get('distance_m', 0):.2f}m")
+    if snap.get("op") in ("Synthesize", "Embed") and "text" in snap:
+        lines.append(f"text: '{snap['text']}'")
+    return "\n".join(lines)
+
+
+def _annotate_mapping(snap: dict) -> Optional[np.ndarray]:
+    frame_rgb = snap.get("frame_rgb")
+    if frame_rgb is None:
+        return None
+    if snap.get("op") != "UpdateMapping":
+        return frame_rgb
+    vis = frame_rgb.copy()
+    text = f"pose=({snap.get('pose_x', 0):.2f},{snap.get('pose_z', 0):.2f}) conf={snap.get('confidence', 0):.2f}"
+    cv2.putText(vis, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 100), 2, cv2.LINE_AA)
+    rtabmap_lost = snap.get("rtabmap_lost", 0)
+    if rtabmap_lost:
+        # frame_rgb is RGB order (see _decode_image_rgb) — (255,0,0) is red
+        # here, matching the green/magenta text above which are also RGB.
         cv2.putText(
-            vis, label, (x1, max(y1 - 8, 14)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2, cv2.LINE_AA,
+            vis, f"RTAB-Map TRACKING LOST ({rtabmap_lost}/{snap.get('rtabmap_total', 0)})",
+            (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2, cv2.LINE_AA,
         )
-    if hand_box and len(hand_box) == 4:
-        hx1, hy1, hx2, hy2 = map(int, hand_box)
-        cv2.rectangle(vis, (hx1, hy1), (hx2, hy2), (255, 140, 0), 2)
-        cv2.putText(
-            vis, "hand", (hx1, max(hy1 - 8, 14)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 140, 0), 2, cv2.LINE_AA,
-        )
-    return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+    beacon_pixel = snap.get("beacon_pixel")
+    if beacon_pixel is not None:
+        cv2.circle(vis, beacon_pixel, 14, (255, 0, 255), 3, cv2.LINE_AA)
+        cv2.putText(vis, "HRTF", (beacon_pixel[0] + 16, beacon_pixel[1] + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2, cv2.LINE_AA)
+    return vis
 
 
-def _reading_html(state) -> str:
-    buf = state.reading_buffer
-    words = len(buf.split()) if buf else 0
-    summaries = state.page_summaries or []
-    direction = state.reading_direction or "ltr"
-    label = state.reading_label or ""
-
-    summaries_html = ""
-    if summaries:
-        items = "".join(f"<li style='color:#ccc;margin:3px 0'>{s}</li>" for s in summaries)
-        summaries_html = f"<ul style='margin:8px 0;padding-left:18px'>{items}</ul>"
-
-    text_html = ""
-    if buf:
-        escaped = (
-            buf.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace("\n", "<br>")
-        )
-        text_html = (
-            f"<div style='margin-top:10px;padding:8px;background:#0d0d0d;border-radius:4px;"
-            f"max-height:300px;overflow-y:auto;color:#ddd;white-space:pre-wrap'>{escaped}</div>"
-        )
-
-    return (
-        f"<div style='font-family:monospace;padding:10px;background:#111;border-radius:6px'>"
-        f"<p style='color:#4af;margin:0 0 6px'><b>READING MODE</b>"
-        f"{'  ·  <b>' + label + '</b>' if label else ''}</p>"
-        f"<p style='color:#aaa;margin:0 0 4px'>"
-        f"Direction: {direction}  ·  Buffer: {len(buf)} chars / {words} words  ·  "
-        f"Pages scanned: {len(summaries)}</p>"
-        f"{summaries_html}"
-        f"{text_html}"
-        f"</div>"
-    )
+def _render_occupancy(snap: dict):
+    """Height-heatmap occupancy grid, reusing occupancy_map.py's own
+    render_plotly() directly — no reimplementation of its classification/
+    colorscale logic. Deliberately no point-cloud/voxel view here (that
+    stays scan_gui.py's separate, heavier offline debug tool — see
+    CLAUDE.md's server_gui.py note); this is occupancy-grid-only, matching
+    what the client actually navigates/plays HRTF audio against.
+    Wrapped in try/except: occupancy_map is a live object reference,
+    mutated concurrently by the gRPC streaming thread while this renders on
+    the Gradio polling thread — a render racing a mutation should degrade
+    (skip this tick, try again next poll) rather than crash the dashboard.
+    Also overlays beacon_world_xz (beacon_preview.py's server-side,
+    visualization-only reconstruction of where the HRTF beacon points —
+    the real audio direction is computed entirely on Android) as a magenta
+    circle marker, same color/meaning as the frame-view circle above."""
+    occ_map = snap.get("occupancy_map")
+    if occ_map is None:
+        return None
+    try:
+        fig = occ_map.render_plotly()
+        beacon_xz = snap.get("beacon_world_xz")
+        if beacon_xz is not None:
+            fig.add_trace(go.Scatter(
+                x=[beacon_xz[0]], y=[beacon_xz[1]], mode="markers", name="HRTF",
+                marker=dict(size=16, color="magenta", symbol="circle-open", line=dict(width=3)),
+            ))
+        return fig
+    except Exception:
+        return None
 
 
-def _injections_html(session) -> str:
-    entries = list(session.context_injections)[-20:]
+def _mapping_status(snap: dict) -> str:
+    if not snap:
+        return "No MappingService activity yet."
+    lines = [f"op: {snap.get('op', '?')}", f"at: {_ago(snap.get('at', 0))}"]
+    if "location_id" in snap:
+        lines.append(f"location_id: '{snap['location_id']}'")
+    if snap.get("op") == "UpdateMapping":
+        lines.append(f"pose: ({snap.get('pose_x', 0):.2f}, {snap.get('pose_z', 0):.2f})")
+        rtabmap_lost = snap.get("rtabmap_lost", 0)
+        rtabmap_total = snap.get("rtabmap_total", 0)
+        if rtabmap_lost:
+            lines.append(f"⚠ RTAB-Map tracking: LOST {rtabmap_lost}/{rtabmap_total} frames this batch")
+        elif rtabmap_total:
+            lines.append(f"RTAB-Map tracking: OK ({rtabmap_total}/{rtabmap_total})")
+        lines.append(f"grid_updated: {snap.get('grid_updated')}")
+        lines.append(f"confidence: {snap.get('confidence', 0):.2f}")
+        lines.append(f"landmarks so far: {snap.get('landmark_count', 0)}")
+    elif snap.get("op") == "FindLandmark":
+        lines.append(f"query: '{snap.get('query', '')}'")
+        if snap.get("found"):
+            lines.append(f"-> '{snap.get('matched_label')}' at ({snap.get('x', 0):.2f}, {snap.get('z', 0):.2f}) "
+                          f"confidence={snap.get('confidence', 0):.2f}")
+        else:
+            lines.append("-> not found")
+    return "\n".join(lines)
+
+
+def _log_html(entries: list) -> str:
     if not entries:
-        return "<div style='color:#555;padding:6px;font-family:monospace'>No context injections yet.</div>"
+        return "<div style='color:#555;padding:6px;font-family:monospace'>No activity yet.</div>"
+    color_by_category = {"tracking": "#4af", "perception": "#fa4", "mapping": "#8f6"}
     rows = []
-    for e in reversed(entries):
+    for e in entries[:60]:
         ts = time.strftime("%H:%M:%S", time.localtime(e["at"]))
-        text = e["text"].replace("<", "&lt;").replace(">", "&gt;")
-        is_tool = text.startswith("[TOOL]")
-        is_sys = text.startswith("[SYSTEM]")
-        color = "#4af" if is_tool else ("#fa4" if is_sys else "#aaa")
+        text = str(e["text"]).replace("<", "&lt;").replace(">", "&gt;")
+        color = color_by_category.get(e.get("category", ""), "#aaa")
         rows.append(
             f"<tr>"
             f"<td style='color:#555;padding:2px 8px;font-size:0.75em;white-space:nowrap'>{ts}</td>"
-            f"<td style='color:{color};padding:2px 6px;font-size:0.82em;word-break:break-word'>{text}</td>"
+            f"<td style='color:{color};padding:2px 6px;font-size:0.78em;white-space:nowrap'>[{e.get('category', '?')}]</td>"
+            f"<td style='color:#ccc;padding:2px 6px;font-size:0.82em;word-break:break-word'>{text}</td>"
             f"</tr>"
         )
     return (
         "<div style='background:#0d0d0d;border-radius:4px;padding:4px;"
-        "max-height:220px;overflow-y:auto;font-family:monospace'>"
+        "max-height:420px;overflow-y:auto;font-family:monospace'>"
         "<table style='width:100%;border-collapse:collapse'>"
         "<tbody>" + "".join(rows) + "</tbody></table></div>"
     )
 
 
-def _build_nav_map(session) -> Optional[plt.Figure]:
-    if session is None:
-        return None
-    state = session.state
-    rp = getattr(session, "_route_planner", None)
-    if rp is None or not getattr(rp, "zones", None):
-        return None
-
-    dest_label = (state.nav_destination or "").lower()
-    route_set = {z.lower() for z in (state.nav_route or [])}
-    current_wp = ""
-    if state.nav_route and state.nav_route_idx < len(state.nav_route):
-        current_wp = state.nav_route[state.nav_route_idx].lower()
-
-    fig, ax = plt.subplots(figsize=(5, 4))
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#16213e")
-    ax.tick_params(colors="#666")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#333")
-
-    for zone in rp.zones:
-        x0, z0 = float(zone.bbox_min[0]), float(zone.bbox_min[2])
-        x1, z1 = float(zone.bbox_max[0]), float(zone.bbox_max[2])
-        lbl_lower = zone.label.lower()
-
-        if lbl_lower == dest_label:
-            fc, ec, lw = "#aa2222", "#ff6666", 2.0
-        elif lbl_lower == current_wp:
-            fc, ec, lw = "#224488", "#44aaff", 2.0
-        elif lbl_lower in route_set:
-            fc, ec, lw = "#1a3355", "#336699", 1.5
-        else:
-            fc, ec, lw = "#1e1e3a", "#444466", 1.0
-
-        rect = mpatches.FancyBboxPatch(
-            (x0, z0), x1 - x0, z1 - z0,
-            boxstyle="round,pad=0.04",
-            facecolor=fc, edgecolor=ec, linewidth=lw, alpha=0.85,
-        )
-        ax.add_patch(rect)
-        cx, cz = float(zone.centroid[0]), float(zone.centroid[2])
-        ax.text(cx, cz, zone.label, ha="center", va="center",
-                color="#ddd", fontsize=7, fontweight="bold", zorder=5)
-
-    if state.nav_last_position is not None:
-        px, _, pz = state.nav_last_position
-        ax.plot(float(px), float(pz), "o", color="#ff4444", markersize=9, zorder=10)
-        ax.annotate("You", (float(px), float(pz)),
-                    xytext=(6, 6), textcoords="offset points",
-                    color="#ff8888", fontsize=8)
-
-    ax.autoscale_view()
-    ax.set_aspect("equal", adjustable="datalim")
-    ax.margins(0.18)
-    title = f"→ {state.nav_destination}" if state.nav_destination else "Navigation Map"
-    ax.set_title(title, color="#bbb", fontsize=9, pad=6)
-    ax.set_xlabel("X (m)", color="#666", fontsize=8)
-    ax.set_ylabel("Z (m)", color="#666", fontsize=8)
-    plt.tight_layout(pad=0.6)
-    return fig
+def _client_mode_text(snap: dict) -> str:
+    mode = snap.get("client_mode", "")
+    if not mode:
+        return "Client mode: unknown (client hasn't called ReportMode yet — older build?)"
+    target = snap.get("client_mode_target", "")
+    text = f"Client mode: {mode}"
+    if target:
+        text += f"  ·  target/destination: '{target}'"
+    text += f"  ·  reported {_ago(snap.get('client_mode_at', 0))}"
+    return text
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-def create_ui(gui_frame_queue, _vlm_unused, orchestrator=None, servicer=None) -> gr.Blocks:
-    _prev_nav_fig: list = [None]
-
-    def _nav_map_fig(session):
-        if _prev_nav_fig[0] is not None:
-            plt.close(_prev_nav_fig[0])
-            _prev_nav_fig[0] = None
-        fig = _build_nav_map(session)
-        _prev_nav_fig[0] = fig
-        return fig
-
+def create_ui(activity_monitor) -> gr.Blocks:
     def _poll():
-        session = servicer.current_session if servicer is not None else None
-        state = session.state if session is not None else None
-        frame_bgr = servicer.latest_frame if servicer is not None else None
-        frame_rgb = (
-            cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            if frame_bgr is not None else None
+        snap = activity_monitor.snapshot() if activity_monitor is not None else {
+            "tracking": {}, "perception": {}, "mapping": {}, "last_category": "",
+            "client_mode": "", "client_mode_target": "", "client_mode_at": 0.0, "log": [],
+        }
+        tab_id = (
+            _TAB_BY_CLIENT_MODE.get(snap["client_mode"])
+            or _TAB_BY_CATEGORY.get(snap["last_category"], "tab_log")
         )
-
-        mode = state.mode if state else "idle"
-        tab_id = _current_tab_id(mode)
-
-        # --- Conversation log for chatbot ---
-        chat_pairs = []
-        if session:
-            for entry in session.conversation_log:
-                if entry["role"] in ("user", "assistant"):
-                    chat_pairs.append({"role": entry["role"], "content": entry["text"]})
-
-        # --- Context injections ---
-        injections_html = (
-            _injections_html(session) if session
-            else "<div style='color:#555;padding:6px'>No active session.</div>"
-        )
-
-        # --- Tracking tab ---
-        det = state.last_detection if state else None
-        hand_box = state.last_hand_box if state else None
-        track_frame = (
-            _annotate_tracking(frame_bgr, det, hand_box)
-            if (frame_bgr is not None and (det or hand_box))
-            else frame_rgb
-        )
-        if state and state.mode == "tracking":
-            track_status = f"Target: {state.tracking_target}"
-            if det:
-                track_status += f"  Score: {det.get('score', 0):.2f}  Status: {det.get('status', '?')}"
-            track_status += f"  Hand: {'visible' if hand_box else 'not visible'}"
-        else:
-            track_status = "Tracking idle"
-
-        # --- Reading tab ---
-        reading_html = (
-            _reading_html(state) if (state and state.mode == "reading")
-            else "<div style='color:#666;padding:10px'>Reading mode not active.</div>"
-        )
-
-        # --- Guiding tab ---
-        guide_dino = (
-            cv2.cvtColor(session.last_guide_dino_frame, cv2.COLOR_BGR2RGB)
-            if session and session.last_guide_dino_frame is not None
-            else frame_rgb
-        )
-        guide_depth = (
-            session.last_guide_depth_image
-            if session and session.last_guide_depth_image is not None
-            else None
-        )
-        guide_map = _nav_map_fig(session)
-
-        guide_status = "Guiding idle"
-        if state and state.mode == "guiding":
-            if state.nav_route:
-                idx = state.nav_route_idx
-                wp = state.nav_route[idx] if idx < len(state.nav_route) else "—"
-                guide_status = (
-                    f"→ {state.nav_destination}  |  Next: {wp}  "
-                    f"|  Step {idx + 1}/{len(state.nav_route)}"
-                )
-            else:
-                cache = state.walking_obstacle_cache or []
-                now_t = time.time()
-                active = [
-                    f"{e['label']} ({e['expires_at'] - now_t:.1f}s)"
-                    for e in cache if e["expires_at"] > now_t
-                ]
-                guide_status = "Free-walk" + (f"  |  Known: {', '.join(active)}" if active else "")
-
-        guide_obstacle = ""
-        if session:
-            for inj in reversed(session.context_injections):
-                if "[SYSTEM] Obstacle" in inj["text"] and time.time() - inj["at"] < 20.0:
-                    guide_obstacle = inj["text"].replace("[SYSTEM] ", "")
-                    break
 
         return (
-            gr.update(selected=tab_id),  # ui_tabs
-            track_frame,                  # ui_track_image
-            track_status,                 # ui_track_status
-            reading_html,                 # ui_read_html
-            guide_dino,                   # ui_guide_dino
-            guide_depth,                  # ui_guide_depth
-            guide_map,                    # ui_guide_map
-            guide_status,                 # ui_guide_status
-            guide_obstacle,               # ui_guide_obstacle
-            frame_rgb,                    # ui_info_frame
-            chat_pairs,                   # ui_info_chatbot
-            injections_html,              # ui_injections
+            gr.update(selected=tab_id),
+            _client_mode_text(snap),
+            _annotate_tracking(snap["tracking"]),
+            _tracking_status(snap["tracking"]),
+            _annotate_perception(snap["perception"]),
+            _perception_status(snap["perception"]),
+            _annotate_mapping(snap["mapping"]),
+            _mapping_status(snap["mapping"]),
+            _render_occupancy(snap["mapping"]),
+            _log_html(snap["log"]),
         )
 
-    # ---------------------------------------------------------------- layout
-    with gr.Blocks(title="Vision Assistant Monitor") as app:
+    with gr.Blocks(title="Vision Assistant — Server Monitor") as app:
         gr.Markdown("## Vision Assistant — Server Monitor")
-        btn_reset = gr.Button("Clear Logs", variant="stop", size="sm")
+        ui_client_mode = gr.Textbox(label="", show_label=False, interactive=False)
 
-        ui_tabs = gr.Tabs(selected="tab_info")
+        ui_tabs = gr.Tabs(selected="tab_log")
         with ui_tabs:
-
-            with gr.Tab("Chat", id="tab_info"):
-                ui_info_frame = gr.Image(label="Latest Frame", type="numpy")
-                ui_info_chatbot = gr.Chatbot(
-                    label="Conversation (Gemini Live transcriptions)", height=350,
-                )
-
-            with gr.Tab("Tracking", id="tab_tracking"):
+            with gr.Tab("Tracking (TrackingService)", id="tab_tracking"):
                 with gr.Row():
                     with gr.Column(scale=2):
-                        ui_track_image = gr.Image(
-                            label="Live Frame (annotated)", type="numpy",
-                        )
+                        ui_track_image = gr.Image(label="Last frame (annotated)", type="numpy")
                     with gr.Column(scale=1):
-                        ui_track_status = gr.Textbox(
-                            label="Detection Info", lines=5, interactive=False,
-                        )
+                        ui_track_status = gr.Textbox(label="Detail", lines=8, interactive=False)
 
-            with gr.Tab("Reading", id="tab_reading"):
-                ui_read_html = gr.HTML()
-
-            with gr.Tab("Guiding", id="tab_nav"):
+            with gr.Tab("Perception (walking / OCR-adjacent)", id="tab_perception"):
                 with gr.Row():
-                    ui_guide_dino = gr.Image(label="Detection (DINO boxes)", type="numpy")
-                    ui_guide_depth = gr.Image(label="Depth Map (DA3)", type="numpy")
+                    with gr.Column(scale=2):
+                        ui_perc_image = gr.Image(label="Last frame (annotated)", type="numpy")
+                    with gr.Column(scale=1):
+                        ui_perc_status = gr.Textbox(label="Detail", lines=10, interactive=False)
+
+            with gr.Tab("Mapping (guiding / walking / scanning)", id="tab_mapping"):
+                gr.Markdown(
+                    "Occupancy grid only (no point cloud / voxel / confidence view — "
+                    "that stays scan_gui.py's separate, heavier offline debug tool)."
+                )
                 with gr.Row():
-                    ui_guide_det_interval = gr.Slider(
-                        0.5, 10.0, value=2.0, step=0.5, label="Detection Interval (s)",
-                    )
-                    ui_guide_rect_frac = gr.Slider(
-                        0.1, 1.0, value=0.5, step=0.05, label="Path Width (fraction of frame)",
-                    )
-                    ui_guide_depth_thr = gr.Slider(
-                        0.5, 10.0, value=3.0, step=0.5, label="Depth Threshold (m)",
-                    )
-                ui_guide_map = gr.Plot(label="Route Map")
-                ui_guide_status = gr.Textbox(
-                    label="Guiding Status", lines=2, interactive=False,
-                )
-                ui_guide_obstacle = gr.Textbox(
-                    label="Obstacle Alert", lines=1, interactive=False,
-                )
+                    ui_map_image = gr.Image(label="Last mapping frame", type="numpy")
+                    ui_occupancy_plot = gr.Plot(label="Occupancy Map (height)")
+                ui_map_status = gr.Textbox(label="Detail", lines=6, interactive=False)
 
-        with gr.Accordion("Context Injections ([SYSTEM] events + tool calls)", open=True):
-            ui_injections = gr.HTML()
-
-        def _set_walk_cfg(attr, value):
-            cfg = getattr(getattr(servicer, "tools_bundle", None), "walking_config", None) if servicer else None
-            if cfg is not None:
-                setattr(cfg, attr, value)
-
-        ui_guide_det_interval.change(
-            fn=lambda v: _set_walk_cfg("detection_interval", v),
-            inputs=[ui_guide_det_interval],
-        )
-        ui_guide_rect_frac.change(
-            fn=lambda v: _set_walk_cfg("inner_rect_fraction", v),
-            inputs=[ui_guide_rect_frac],
-        )
-        ui_guide_depth_thr.change(
-            fn=lambda v: _set_walk_cfg("depth_threshold_m", v),
-            inputs=[ui_guide_depth_thr],
-        )
+            with gr.Tab("Activity Log", id="tab_log"):
+                ui_log = gr.HTML()
 
         timer = gr.Timer(value=0.5)
         timer.tick(
@@ -362,25 +301,16 @@ def create_ui(gui_frame_queue, _vlm_unused, orchestrator=None, servicer=None) ->
             inputs=[],
             outputs=[
                 ui_tabs,
+                ui_client_mode,
                 ui_track_image,
                 ui_track_status,
-                ui_read_html,
-                ui_guide_dino,
-                ui_guide_depth,
-                ui_guide_map,
-                ui_guide_status,
-                ui_guide_obstacle,
-                ui_info_frame,
-                ui_info_chatbot,
-                ui_injections,
+                ui_perc_image,
+                ui_perc_status,
+                ui_map_image,
+                ui_map_status,
+                ui_occupancy_plot,
+                ui_log,
             ],
         )
-
-        def _reset():
-            if servicer and servicer.current_session:
-                servicer.current_session.conversation_log.clear()
-                servicer.current_session.context_injections.clear()
-
-        btn_reset.click(fn=_reset, inputs=[], outputs=[])
 
     return app

@@ -9,6 +9,27 @@ from interfaces import Detection, IObjectDetector
 logger = logging.getLogger(__name__)
 
 
+def _post_process_grounded(processor, outputs, input_ids, box_threshold, text_threshold, target_sizes):
+    """Layered backward-compat call, same style already used elsewhere in
+    this codebase (e.g. rtabmap_client.py's node_id/inlier_fraction parsing)
+    — transformers renamed post_process_grounded_object_detection's
+    confidence-threshold kwarg from `box_threshold` (<=4.46.x) to
+    `threshold` (>=5.x). Observed in practice: the installed version can
+    disagree with what's actually loaded at runtime (multiple Python
+    environments on the same machine), so this tries the current signature
+    first and falls back instead of assuming one or the other."""
+    try:
+        return processor.post_process_grounded_object_detection(
+            outputs, input_ids, threshold=box_threshold,
+            text_threshold=text_threshold, target_sizes=target_sizes,
+        )
+    except TypeError:
+        return processor.post_process_grounded_object_detection(
+            outputs, input_ids, box_threshold=box_threshold,
+            text_threshold=text_threshold, target_sizes=target_sizes,
+        )
+
+
 class GroundingDINODetector(IObjectDetector):
     def __init__(self, model_id: str = "IDEA-Research/grounding-dino-tiny"):
         from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
@@ -41,12 +62,8 @@ class GroundingDINODetector(IObjectDetector):
             with torch.no_grad():
                 outputs = self.model(**inputs)
 
-        results = self.processor.post_process_grounded_object_detection(
-            outputs,
-            input_ids,
-            threshold=box_threshold,
-            text_threshold=text_threshold,
-            target_sizes=[(height, width)],
+        results = _post_process_grounded(
+            self.processor, outputs, input_ids, box_threshold, text_threshold, [(height, width)],
         )[0]
 
         if len(results["boxes"]) == 0:
@@ -87,12 +104,8 @@ class GroundingDINODetector(IObjectDetector):
             with torch.no_grad():
                 outputs = self.model(**inputs)
 
-        results = self.processor.post_process_grounded_object_detection(
-            outputs,
-            input_ids,
-            threshold=box_threshold,
-            text_threshold=text_threshold,
-            target_sizes=[(height, width)],
+        results = _post_process_grounded(
+            self.processor, outputs, input_ids, box_threshold, text_threshold, [(height, width)],
         )[0]
 
         if len(results["boxes"]) == 0:

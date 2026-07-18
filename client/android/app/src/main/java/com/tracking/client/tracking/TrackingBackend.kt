@@ -71,7 +71,12 @@ class TrackingBackend(
         Log.d(TAG, "initialize: detectObject prompt='$prompt'")
 
         val detection = try {
-            stub.detectObject(Tracking.DetectionRequest.newBuilder().setPrompt(prompt).build())
+            stub.detectObject(
+                Tracking.DetectionRequest.newBuilder()
+                    .setPrompt(prompt)
+                    .setImageData(com.google.protobuf.ByteString.copyFrom(frameJpeg))
+                    .build()
+            )
         } catch (e: Exception) {
             Log.e(TAG, "detectObject failed", e)
             return@withContext null
@@ -113,7 +118,7 @@ class TrackingBackend(
         lastBox = box
         smoothCx = cx
         smoothCy = cy
-        refEmbedding = getEmbedding(box)
+        refEmbedding = getEmbedding(box, frameJpeg)
         active = true
         lastRenewalMs = System.currentTimeMillis()
         Log.d(TAG, "initialize: success box=${box.toList()} cx=$cx cy=$cy")
@@ -230,13 +235,18 @@ class TrackingBackend(
         if (!active || prompt.isBlank()) return
         val stub = grpcManager.trackingStub ?: return
         val detection = try {
-            stub.detectObject(Tracking.DetectionRequest.newBuilder().setPrompt(prompt).build())
+            stub.detectObject(
+                Tracking.DetectionRequest.newBuilder()
+                    .setPrompt(prompt)
+                    .setImageData(com.google.protobuf.ByteString.copyFrom(frameJpeg))
+                    .build()
+            )
         } catch (e: Throwable) {
             Log.w(TAG, "renewal detectObject failed", e); return
         }
         if (detection.score < 0.2f || detection.boxXyxyCount != 4) return
 
-        val currentEmbedding = getEmbedding(detection.boxXyxyList.toFloatArray()) ?: return
+        val currentEmbedding = getEmbedding(detection.boxXyxyList.toFloatArray(), frameJpeg) ?: return
         val previous = refEmbedding ?: return
         if (!isSimilar(previous, currentEmbedding)) return
 
@@ -264,10 +274,15 @@ class TrackingBackend(
         Log.d(TAG, "renewal: updated reference box=${box.toList()}")
     }
 
-    private suspend fun getEmbedding(box: FloatArray): FloatArray? {
+    private suspend fun getEmbedding(box: FloatArray, frameJpeg: ByteArray): FloatArray? {
         val stub = grpcManager.trackingStub ?: return null
         return try {
-            val resp = stub.getEmbedding(Tracking.EmbeddingRequest.newBuilder().addAllBoxXyxy(box.asList()).build())
+            val resp = stub.getEmbedding(
+                Tracking.EmbeddingRequest.newBuilder()
+                    .addAllBoxXyxy(box.asList())
+                    .setImageData(com.google.protobuf.ByteString.copyFrom(frameJpeg))
+                    .build()
+            )
             resp.embeddingList.toFloatArray()
         } catch (e: Exception) {
             Log.e(TAG, "getEmbedding failed", e); null

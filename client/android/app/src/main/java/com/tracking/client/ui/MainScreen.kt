@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -43,7 +42,6 @@ import com.tracking.client.model.ObjectTrack
 fun MainScreen(
     viewModel: MainViewModel,
     onOpenSettings: () -> Unit,
-    onOpenScan: () -> Unit = {}
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -165,15 +163,14 @@ fun MainScreen(
                     .fillMaxHeight()
             )
 
-            // Settings + Scan buttons — top-right
+            // Settings button — top-right (the old Scan button is gone;
+            // mapping now runs live during guiding mode, see CLAUDE.md's
+            // "Client-Orchestrated Live Session" section)
             Row(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(end = 308.dp, top = 4.dp)
             ) {
-                IconButton(onClick = onOpenScan) {
-                    Icon(Icons.Default.Map, contentDescription = "Scan", tint = Color.White)
-                }
                 IconButton(onClick = onOpenSettings) {
                     Icon(Icons.Default.Settings, contentDescription = "Settings", tint = Color.White)
                 }

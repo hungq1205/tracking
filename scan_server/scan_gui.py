@@ -27,6 +27,7 @@ Dataset folder layout (see camera.csv/imu.csv headers for exact columns):
         camera.csv    timestamp_ns,filename
 """
 
+import math
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
@@ -45,6 +46,7 @@ from scan_session import voxelize_cloud, DEFAULT_VOXEL_SIZE, MAX_VOXELS
 from timing_utils import timed
 from stream_session import StreamingScanSession
 from stream_simulator import replay_dataset, ManualDatasetReplayer
+from live_path_planner import LiveGridPathPlanner
 
 # Dropdown label -> ImuIntegrator's `orientation` key (see scan_session.IMU_ORIENTATIONS).
 # Only the raw imu.csv values are rotated; images are handled separately by the
@@ -682,6 +684,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         show_live_points: bool = True,
         show_voxelization: bool = True,
         show_occupancy: bool = True,
+        nav_state_value: Optional[dict] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Simulated-live counterpart to _run_local_scan: instead of reading a
@@ -705,6 +708,8 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         if not dataset_path or not Path(dataset_path).exists():
             yield {log_output: "Select a dataset folder first."}
             return
+
+        nav_state_value = nav_state_value or dict(target=None, route=None, confirmed=None, computed_at=-1)
 
         axis_perm = _perm_matrix(axis_roll, axis_pitch, axis_yaw)
         max_dim = int(resolution.split("×")[0]) if resolution != "Original" else 0
@@ -779,8 +784,35 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                     f"{event['progress']*100:.0f}% replayed"
                 ),
             }
+            # Live navigation preview — "constantly extend the navigation...
+            # as new data comes in": if a destination is set, recompute the
+            # route whenever the occupancy grid actually changed since the
+            # last computation (_update_count, not every single chunk —
+            # avoids redundant recomputation on a chunk that added nothing).
+            if (
+                nav_state_value.get("target") is not None
+                and session.occupancy_map._update_count != nav_state_value.get("computed_at")
+            ):
+                route, confirmed, reached_exactly, nav_status_text = _nav_route_full_and_status(
+                    session, nav_state_value["target"], nav_state_value.get("min_clearance", 0.0)
+                )
+                nav_state_value = dict(
+                    nav_state_value, route=route, confirmed=confirmed,
+                    reached_exactly=reached_exactly,
+                    computed_at=session.occupancy_map._update_count,
+                )
+                _yield[nav_status] = nav_status_text
+                _yield[nav_state] = nav_state_value
+
             if show_occupancy:
-                _yield[occupancy_plot] = session.occupancy_map.render_plotly(zones=session.zones)
+                _yield[occupancy_plot] = session.occupancy_map.render_plotly(
+                    zones=session.zones,
+                    route=nav_state_value.get("route"), route_confirmed=nav_state_value.get("confirmed"),
+                )
+                _yield[confidence_plot] = session.occupancy_map.render_confidence_plotly(
+                    zones=session.zones,
+                    route=nav_state_value.get("route"), route_confirmed=nav_state_value.get("confirmed"),
+                )
             # session.last_voxel_centers is already the single, incrementally-
             # accumulated voxelization the Occupancy Map feed itself computed
             # this chunk (see ScanSession._merge_voxels) — no separate
@@ -810,7 +842,10 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             log_output: f"Simulated live stream finished and exported map for '{location_id}'.",
         }
         if show_occupancy:
-            _final_yield[occupancy_plot] = session.occupancy_map.render_plotly(zones=zones)
+            _final_yield[occupancy_plot] = session.occupancy_map.render_plotly(
+                zones=zones, route=nav_state_value.get("route"), route_confirmed=nav_state_value.get("confirmed"))
+            _final_yield[confidence_plot] = session.occupancy_map.render_confidence_plotly(
+                zones=zones, route=nav_state_value.get("route"), route_confirmed=nav_state_value.get("confirmed"))
         if show_live_points:
             _final_yield[live_cloud_plot] = _cloud_to_glb(
                 session._cloud, zones=zones, ground_y=session.occupancy_map._ground_y
@@ -924,7 +959,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         if replayer is None:
             return (
                 replayer, None, gr.update(interactive=False),
-                gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), gr.update(),
                 gr.update(), gr.update(), gr.update(), gr.update(),
                 "Click 'Start / Reset Manual Stream' first.",
             )
@@ -941,6 +976,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             zone_names = ", ".join(z.label for z in zones) if zones else "none"
             gy = session.occupancy_map._ground_y
             occ = session.occupancy_map.render_plotly(zones=zones) if show_occupancy else gr.update()
+            conf = session.occupancy_map.render_confidence_plotly(zones=zones) if show_occupancy else gr.update()
             lp = _cloud_to_glb(session._cloud, zones=zones, ground_y=gy) if show_live_points else gr.update()
             vp = _voxel_centers_to_glb(
                 session.last_voxel_centers, session.last_voxel_colors, session.last_voxel_size,
@@ -949,7 +985,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             log = f"Manual stream finished and exported map for '{session.location_id}'."
             return (
                 replayer, None, gr.update(interactive=False),
-                lp, vp, occ,
+                lp, vp, occ, conf,
                 gr.update(), gr.update(),
                 f"Done | {len(session._cloud.points):,} pts | Zones: {zone_names}",
                 gr.update(),
@@ -967,7 +1003,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                    f"waiting for a full chunk.")
             return (
                 replayer, preview, gr.update(interactive=has_more),
-                gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), gr.update(),
                 gr.update(), gr.update(), gr.update(), gr.update(),
                 log,
             )
@@ -979,6 +1015,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         det_image, det_text = _build_detection_view(session)
 
         occ = session.occupancy_map.render_plotly(zones=session.zones) if show_occupancy else gr.update()
+        conf = session.occupancy_map.render_confidence_plotly(zones=session.zones) if show_occupancy else gr.update()
         lp_update = gr.update()
         vp_update = gr.update()
         # See _run_simulated_stream's identical check — skip rebuilding
@@ -1012,7 +1049,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         )
         return (
             replayer, preview, gr.update(interactive=has_more),
-            lp_update, vp_update, occ,
+            lp_update, vp_update, occ, conf,
             det_image, det_text, status, f"{src_tag}  {pos_str}", log,
         )
 
@@ -1020,7 +1057,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         location_id = (location_id or "").strip() or "default"
         session = scan_manager.get(location_id)
         if session is None:
-            return "No active session. Run Scan first.", None, None, go.Figure()
+            return "No active session. Run Scan first.", None, None, go.Figure(), go.Figure()
         out_dir = session.export()
         n_pts = len(session._cloud.points)
         # export() -> finalize_landmarks() only just populated zone.landmarks
@@ -1039,6 +1076,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                 session.last_voxel_size, zones=zones, ground_y=gy,
             ),
             session.occupancy_map.render_plotly(zones=zones),
+            session.occupancy_map.render_confidence_plotly(zones=zones),
         )
 
     def _clear_cloud(location_id: str):
@@ -1046,18 +1084,23 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         session = scan_manager.get(location_id)
         if session is not None:
             session.reset_cloud()
-        return None, None, go.Figure()
+        return None, None, go.Figure(), go.Figure()
 
     def _reload_occupancy(location_id: str):
-        """Manually re-render the Occupancy Map — a Scan run occasionally ends
-        without the plot updating (Gradio drops a mid-generator yield), so this
-        gives a reliable way to force a redraw from current session state."""
+        """Manually re-render the Occupancy Map + Confidence Map — a Scan run
+        occasionally ends without the plots updating (Gradio drops a
+        mid-generator yield), so this gives a reliable way to force a
+        redraw from current session state. Returns (occupancy_fig,
+        confidence_fig)."""
         location_id = (location_id or "").strip() or "default"
         session = scan_manager.get(location_id)
         if session is None:
-            return go.Figure()
+            return go.Figure(), go.Figure()
         session.preview_landmarks()  # no-op post-export (raw_landmarks already cleared by finalize_landmarks)
-        return session.occupancy_map.render_plotly(zones=session.zones)
+        return (
+            session.occupancy_map.render_plotly(zones=session.zones),
+            session.occupancy_map.render_confidence_plotly(zones=session.zones),
+        )
 
     def _reload_detections(location_id: str):
         location_id = (location_id or "").strip() or "default"
@@ -1103,13 +1146,16 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
     def _reload_all_views(location_id: str, voxel_size: float):
         """Single "Reload" button in the Live Reconstruction tab — refreshes
-        all 3 views at once (Live Points, Voxelization, Occupancy Map),
-        regardless of checkbox state (checkboxes only gate the automatic
-        per-chunk recompute + visibility, not this manual action)."""
+        all views at once (Live Points, Voxelization, Occupancy Map,
+        Confidence Map), regardless of checkbox state (checkboxes only gate
+        the automatic per-chunk recompute + visibility, not this manual
+        action)."""
+        occ, conf = _reload_occupancy(location_id)
         return (
             _reload_live_points(location_id),
             _voxelize(location_id, voxel_size),
-            _reload_occupancy(location_id),
+            occ,
+            conf,
         )
 
     def _toggle_live_points(show: bool, location_id: str):
@@ -1129,8 +1175,108 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
     def _toggle_occupancy(show: bool, location_id: str):
         if not show:
-            return gr.update(visible=False)
-        return gr.update(visible=True, value=_reload_occupancy(location_id))
+            return gr.update(visible=False), gr.update(visible=False)
+        occ, conf = _reload_occupancy(location_id)
+        return gr.update(visible=True, value=occ), gr.update(visible=True, value=conf)
+
+    # ── Live navigation preview ──────────────────────────────────────────────
+    # Destination is set via X/Z number inputs or a landmark dropdown (not by
+    # clicking the map — gr.Plot/Plotly doesn't fire select events in this
+    # Gradio version, confirmed by reading gradio/components/plot.py).
+    # LiveGridPathPlanner runs against the IN-PROGRESS occupancy grid
+    # (extract_full_grid(), rebuilt fresh each time — no exported map file
+    # needed) — same cost model as the deployed GridPathPlanner
+    # (server/tools/grid_path_planner.py), so a route through confirmed-free
+    # cells is naturally preferred, but the search still flows through
+    # unexplored (CLASS_UNKNOWN) territory when that's the only way to reach
+    # the destination, flagged as "speculative" rather than failing outright.
+
+    def _nav_route_full_and_status(session, target_xz, min_clearance: float = 0.0):
+        """Returns (route_including_start_point_or_None, confirmed_or_None,
+        reached_exactly_or_None, status_markdown). route includes the
+        current camera position as its first element —
+        LiveGridPathPlanner.find_path() itself omits the start point, so
+        it's prepended here for the map overlay."""
+        full_grid = session.occupancy_map.extract_full_grid()
+        if full_grid is None:
+            return None, None, None, "No occupancy data yet — scan a bit first."
+        if not session.occupancy_map._trajectory:
+            return None, None, None, "No camera position yet — scan a bit first."
+        cam_x, _, cam_z = session.occupancy_map._trajectory[-1]
+        planner = LiveGridPathPlanner(full_grid, min_path_clearance_m=min_clearance)
+        result = planner.find_path((cam_x, cam_z), target_xz)
+        if result is None:
+            return None, None, None, (
+                f"No route found toward ({target_xz[0]:.2f}, {target_xz[1]:.2f}) — "
+                f"not reachable even through unexplored territory."
+            )
+        route, confirmed, reached_exactly = result
+        full_route = [(cam_x, cam_z)] + route
+        dist = sum(
+            math.hypot(full_route[i][0] - full_route[i - 1][0], full_route[i][1] - full_route[i - 1][1])
+            for i in range(1, len(full_route))
+        )
+        reach_clause = (
+            "reached the destination exactly" if reached_exactly
+            else (
+                f"could NOT reach the exact destination — this is the "
+                f"**closest approach** found, "
+                f"{math.hypot(full_route[-1][0] - target_xz[0], full_route[-1][1] - target_xz[1]):.1f}m short"
+            )
+        )
+        confirmed_clause = (
+            "fully confirmed (all scanned ground)" if confirmed
+            else "crosses **unexplored territory** (dashed orange on the maps)"
+        )
+        status = f"Route found — **{dist:.1f}m**, {reach_clause}, {confirmed_clause}."
+        return full_route, confirmed, reached_exactly, status
+
+    def _nav_find(location_id: str, target_x, target_z, min_clearance: float, nav_state: dict):
+        location_id = (location_id or "").strip() or "default"
+        session = scan_manager.get(location_id)
+        if session is None:
+            return nav_state, "No active session. Run Scan first.", gr.update(), gr.update()
+        if target_x is None or target_z is None:
+            return nav_state, "Enter a target X/Z (or pick a landmark) first.", gr.update(), gr.update()
+        target_xz = (float(target_x), float(target_z))
+        min_clearance = float(min_clearance or 0.0)
+        route, confirmed, reached_exactly, status = _nav_route_full_and_status(
+            session, target_xz, min_clearance)
+        new_state = dict(
+            target=target_xz, route=route, confirmed=confirmed, reached_exactly=reached_exactly,
+            min_clearance=min_clearance, computed_at=session.occupancy_map._update_count,
+        )
+        occ_fig = session.occupancy_map.render_plotly(
+            zones=session.zones, route=route, route_confirmed=confirmed)
+        conf_fig = session.occupancy_map.render_confidence_plotly(
+            zones=session.zones, route=route, route_confirmed=confirmed)
+        return new_state, status, occ_fig, conf_fig
+
+    def _nav_landmark_selected(landmark_name: str, location_id: str):
+        location_id = (location_id or "").strip() or "default"
+        session = scan_manager.get(location_id)
+        if session is None or not landmark_name:
+            return gr.update(), gr.update()
+        for zone in session.labeler.zones:
+            for lm in zone.landmarks:
+                if lm.name == landmark_name:
+                    return lm.x, lm.z
+        return gr.update(), gr.update()
+
+    def _nav_landmark_choices(location_id: str) -> list:
+        location_id = (location_id or "").strip() or "default"
+        session = scan_manager.get(location_id)
+        if session is None:
+            return []
+        return sorted({lm.name for zone in session.labeler.zones for lm in zone.landmarks})
+
+    def _nav_refresh_landmarks(location_id: str):
+        """Manual 'Refresh Landmarks' button — session.labeler.zones[*]
+        .landmarks is only kept current by preview_landmarks(), which runs
+        once per processed chunk during an active stream; this lets the
+        dropdown be refreshed on demand too (e.g. after switching Location
+        ID to an existing session)."""
+        return gr.update(choices=_nav_landmark_choices(location_id))
 
     def _apply_vlm_model(model_id: str):
         if not scan_manager.semantic_mapper_available:
@@ -1154,6 +1300,10 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         all_frames_state    = gr.State(value=[])   # list of (rgb, DepthFrame, pose 4×4)
         video_rotation_state = gr.State(value=0)   # extra rotation in degrees (0/90/180/270)
         manual_replay_state = gr.State(value=None)  # ManualDatasetReplayer, see "Manual Live Stream"
+        nav_state = gr.State(value=dict(
+            target=None, route=None, confirmed=None, reached_exactly=None,
+            min_clearance=0.0, computed_at=-1,
+        ))
 
         with gr.Row():
 
@@ -1453,9 +1603,46 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                                     clear_color=[0.05, 0.05, 0.05, 1.0],
                                     label="Voxelization — voxelized point cloud",
                                 )
-                        occupancy_plot = gr.Plot(
-                            label="Occupancy Map (top-down X-Z) — fed from each chunk's voxelization"
-                        )
+                        with gr.Row():
+                            with gr.Column():
+                                occupancy_plot = gr.Plot(
+                                    label="Occupancy Map (top-down X-Z) — fed from each chunk's voxelization"
+                                )
+                            with gr.Column():
+                                confidence_plot = gr.Plot(
+                                    label="Confidence Map (top-down X-Z) — how much agreeing "
+                                          "evidence each cell has, independent of free/obstacle"
+                                )
+
+                        with gr.Accordion("Live Navigation Preview", open=False):
+                            gr.Markdown(
+                                "Pick a destination (typed X/Z, or a scanned landmark) and see "
+                                "a route computed against the **in-progress** map — prefers "
+                                "confirmed-free cells, but still routes through unexplored "
+                                "territory (flagged **speculative**, dashed orange) rather than "
+                                "failing when no confirmed route exists yet. During **Simulated "
+                                "Live Stream**, the route recomputes automatically as new data "
+                                "arrives; in Manual mode, click **Find Route** again after each "
+                                "step to refresh it."
+                            )
+                            with gr.Row():
+                                nav_target_x = gr.Number(label="Target X (m)", value=None)
+                                nav_target_z = gr.Number(label="Target Z (m)", value=None)
+                                nav_landmark_dropdown = gr.Dropdown(
+                                    label="Or pick a landmark", choices=[], value=None,
+                                )
+                                nav_refresh_landmarks_btn = gr.Button(
+                                    "↻ Landmarks", size="sm", scale=0,
+                                )
+                            with gr.Row():
+                                nav_min_clearance_input = gr.Slider(
+                                    minimum=0.0, maximum=1.0, step=0.05, value=0.0,
+                                    label="Minimum path width (m) — 0 disables; routes avoid "
+                                          "squeezing narrower than this when a wider option exists",
+                                )
+                            with gr.Row():
+                                nav_find_btn = gr.Button("Find Route", variant="primary", size="sm")
+                            nav_status = gr.Markdown("No destination set.")
 
                         with gr.Accordion("Frame Explorer", open=False):
                             gr.Markdown(
@@ -1625,7 +1812,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         export_btn.click(
             fn=_export_map,
             inputs=[location_id_input],
-            outputs=[export_log, live_cloud_plot, voxel_plot, occupancy_plot],
+            outputs=[export_log, live_cloud_plot, voxel_plot, occupancy_plot, confidence_plot],
         )
 
         simulated_stream_btn.click(
@@ -1640,11 +1827,13 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                     occ_logodds_hit, occ_logodds_miss,
                     occ_logodds_occ_thresh, occ_logodds_free_thresh, occ_height_ewma_alpha,
                     occ_enable_ray_casting, occ_enable_bayesian,
-                    show_live_points_cb, show_voxelization_cb, show_occupancy_cb],
+                    show_live_points_cb, show_voxelization_cb, show_occupancy_cb,
+                    nav_state],
             outputs=[
-                live_cloud_plot, voxel_plot, occupancy_plot,
+                live_cloud_plot, voxel_plot, occupancy_plot, confidence_plot,
                 detection_image, detection_text,
                 scan_status, scan_position, log_output,
+                nav_state, nav_status,
             ],
         )
 
@@ -1668,7 +1857,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                     show_live_points_cb, show_voxelization_cb, show_occupancy_cb],
             outputs=[
                 manual_replay_state, manual_preview_image, manual_feed_btn,
-                live_cloud_plot, voxel_plot, occupancy_plot,
+                live_cloud_plot, voxel_plot, occupancy_plot, confidence_plot,
                 detection_image, detection_text,
                 scan_status, scan_position, log_output,
             ],
@@ -1700,7 +1889,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         reload_all_btn.click(
             fn=_reload_all_views,
             inputs=[location_id_input, voxel_size_input],
-            outputs=[live_cloud_plot, voxel_plot, occupancy_plot],
+            outputs=[live_cloud_plot, voxel_plot, occupancy_plot, confidence_plot],
         )
 
         show_live_points_cb.change(
@@ -1716,13 +1905,29 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         show_occupancy_cb.change(
             fn=_toggle_occupancy,
             inputs=[show_occupancy_cb, location_id_input],
-            outputs=[occupancy_plot],
+            outputs=[occupancy_plot, confidence_plot],
         )
 
         clear_cloud_btn.click(
             fn=_clear_cloud,
             inputs=[location_id_input],
-            outputs=[live_cloud_plot, voxel_plot, occupancy_plot],
+            outputs=[live_cloud_plot, voxel_plot, occupancy_plot, confidence_plot],
+        )
+
+        nav_find_btn.click(
+            fn=_nav_find,
+            inputs=[location_id_input, nav_target_x, nav_target_z, nav_min_clearance_input, nav_state],
+            outputs=[nav_state, nav_status, occupancy_plot, confidence_plot],
+        )
+        nav_landmark_dropdown.change(
+            fn=_nav_landmark_selected,
+            inputs=[nav_landmark_dropdown, location_id_input],
+            outputs=[nav_target_x, nav_target_z],
+        )
+        nav_refresh_landmarks_btn.click(
+            fn=_nav_refresh_landmarks,
+            inputs=[location_id_input],
+            outputs=[nav_landmark_dropdown],
         )
 
         reload_detections_btn.click(

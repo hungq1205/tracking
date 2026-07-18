@@ -26,7 +26,19 @@ if _version_not_supported:
 
 
 class TrackingServiceStub(object):
-    """Missing associated documentation comment in .proto file."""
+    """Android is the only client this server talks to (see CLAUDE.md's
+    "Client-Orchestrated Live Session" section) — the Pi thin client,
+    Mediator, Desktop operator GUI, and offline-scan workflow (and every RPC/
+    message that existed only for them: MediatorService, the old MapService,
+    TrackingService's Chat/VoiceChat/VoiceChatStream/StreamFrame) have been
+    removed. Gemini Live orchestration runs entirely on-device now; this
+    server is a pure heavy-compute + live-mapping backend.
+
+    DetectObject/GetEmbedding stay heavy models called directly by Android's
+    TrackingBackend.kt for its local-ORB-tracking init/renewal — not merged
+    into PerceptionService.AnalyzeFrame since that call site predates it and
+    still works unchanged.
+    """
 
     def __init__(self, channel):
         """Constructor.
@@ -44,30 +56,22 @@ class TrackingServiceStub(object):
                 request_serializer=tracking__pb2.EmbeddingRequest.SerializeToString,
                 response_deserializer=tracking__pb2.EmbeddingResponse.FromString,
                 _registered_method=True)
-        self.Chat = channel.unary_unary(
-                '/tracking.TrackingService/Chat',
-                request_serializer=tracking__pb2.ChatRequest.SerializeToString,
-                response_deserializer=tracking__pb2.ChatResponse.FromString,
-                _registered_method=True)
-        self.VoiceChat = channel.unary_unary(
-                '/tracking.TrackingService/VoiceChat',
-                request_serializer=tracking__pb2.VoiceChatRequest.SerializeToString,
-                response_deserializer=tracking__pb2.ChatResponse.FromString,
-                _registered_method=True)
-        self.StreamFrame = channel.unary_unary(
-                '/tracking.TrackingService/StreamFrame',
-                request_serializer=tracking__pb2.FrameRequest.SerializeToString,
-                response_deserializer=tracking__pb2.FrameResponse.FromString,
-                _registered_method=True)
-        self.VoiceChatStream = channel.stream_stream(
-                '/tracking.TrackingService/VoiceChatStream',
-                request_serializer=tracking__pb2.VoiceChatChunk.SerializeToString,
-                response_deserializer=tracking__pb2.AudioChunk.FromString,
-                _registered_method=True)
 
 
 class TrackingServiceServicer(object):
-    """Missing associated documentation comment in .proto file."""
+    """Android is the only client this server talks to (see CLAUDE.md's
+    "Client-Orchestrated Live Session" section) — the Pi thin client,
+    Mediator, Desktop operator GUI, and offline-scan workflow (and every RPC/
+    message that existed only for them: MediatorService, the old MapService,
+    TrackingService's Chat/VoiceChat/VoiceChatStream/StreamFrame) have been
+    removed. Gemini Live orchestration runs entirely on-device now; this
+    server is a pure heavy-compute + live-mapping backend.
+
+    DetectObject/GetEmbedding stay heavy models called directly by Android's
+    TrackingBackend.kt for its local-ORB-tracking init/renewal — not merged
+    into PerceptionService.AnalyzeFrame since that call site predates it and
+    still works unchanged.
+    """
 
     def DetectObject(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -76,30 +80,6 @@ class TrackingServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def GetEmbedding(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def Chat(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def VoiceChat(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def StreamFrame(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def VoiceChatStream(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -118,26 +98,6 @@ def add_TrackingServiceServicer_to_server(servicer, server):
                     request_deserializer=tracking__pb2.EmbeddingRequest.FromString,
                     response_serializer=tracking__pb2.EmbeddingResponse.SerializeToString,
             ),
-            'Chat': grpc.unary_unary_rpc_method_handler(
-                    servicer.Chat,
-                    request_deserializer=tracking__pb2.ChatRequest.FromString,
-                    response_serializer=tracking__pb2.ChatResponse.SerializeToString,
-            ),
-            'VoiceChat': grpc.unary_unary_rpc_method_handler(
-                    servicer.VoiceChat,
-                    request_deserializer=tracking__pb2.VoiceChatRequest.FromString,
-                    response_serializer=tracking__pb2.ChatResponse.SerializeToString,
-            ),
-            'StreamFrame': grpc.unary_unary_rpc_method_handler(
-                    servicer.StreamFrame,
-                    request_deserializer=tracking__pb2.FrameRequest.FromString,
-                    response_serializer=tracking__pb2.FrameResponse.SerializeToString,
-            ),
-            'VoiceChatStream': grpc.stream_stream_rpc_method_handler(
-                    servicer.VoiceChatStream,
-                    request_deserializer=tracking__pb2.VoiceChatChunk.FromString,
-                    response_serializer=tracking__pb2.AudioChunk.SerializeToString,
-            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'tracking.TrackingService', rpc_method_handlers)
@@ -147,7 +107,19 @@ def add_TrackingServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class TrackingService(object):
-    """Missing associated documentation comment in .proto file."""
+    """Android is the only client this server talks to (see CLAUDE.md's
+    "Client-Orchestrated Live Session" section) — the Pi thin client,
+    Mediator, Desktop operator GUI, and offline-scan workflow (and every RPC/
+    message that existed only for them: MediatorService, the old MapService,
+    TrackingService's Chat/VoiceChat/VoiceChatStream/StreamFrame) have been
+    removed. Gemini Live orchestration runs entirely on-device now; this
+    server is a pure heavy-compute + live-mapping backend.
+
+    DetectObject/GetEmbedding stay heavy models called directly by Android's
+    TrackingBackend.kt for its local-ORB-tracking init/renewal — not merged
+    into PerceptionService.AnalyzeFrame since that call site predates it and
+    still works unchanged.
+    """
 
     @staticmethod
     def DetectObject(request,
@@ -203,8 +175,115 @@ class TrackingService(object):
             metadata,
             _registered_method=True)
 
+
+class PerceptionServiceStub(object):
+    """─────────────────────────────────────────────────────────────────────────
+    PerceptionService / MappingService
+
+    Consolidated heavy-compute surface for the Android client's on-device
+    Gemini Live tool-dispatch loop — see CLAUDE.md's "Client-Orchestrated
+    Live Session" section.
+    ─────────────────────────────────────────────────────────────────────────
+
+    Heavy, stateless-per-call perception primitives: object detection,
+    re-ID embedding, obstacle/depth estimation, neural TTS, text embedding.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.AnalyzeFrame = channel.unary_unary(
+                '/tracking.PerceptionService/AnalyzeFrame',
+                request_serializer=tracking__pb2.AnalyzeFrameRequest.SerializeToString,
+                response_deserializer=tracking__pb2.AnalyzeFrameResponse.FromString,
+                _registered_method=True)
+        self.Synthesize = channel.unary_stream(
+                '/tracking.PerceptionService/Synthesize',
+                request_serializer=tracking__pb2.SynthesizeRequest.SerializeToString,
+                response_deserializer=tracking__pb2.PcmChunk.FromString,
+                _registered_method=True)
+        self.Embed = channel.unary_unary(
+                '/tracking.PerceptionService/Embed',
+                request_serializer=tracking__pb2.EmbedRequest.SerializeToString,
+                response_deserializer=tracking__pb2.EmbedResponse.FromString,
+                _registered_method=True)
+
+
+class PerceptionServiceServicer(object):
+    """─────────────────────────────────────────────────────────────────────────
+    PerceptionService / MappingService
+
+    Consolidated heavy-compute surface for the Android client's on-device
+    Gemini Live tool-dispatch loop — see CLAUDE.md's "Client-Orchestrated
+    Live Session" section.
+    ─────────────────────────────────────────────────────────────────────────
+
+    Heavy, stateless-per-call perception primitives: object detection,
+    re-ID embedding, obstacle/depth estimation, neural TTS, text embedding.
+    """
+
+    def AnalyzeFrame(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Synthesize(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Embed(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_PerceptionServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'AnalyzeFrame': grpc.unary_unary_rpc_method_handler(
+                    servicer.AnalyzeFrame,
+                    request_deserializer=tracking__pb2.AnalyzeFrameRequest.FromString,
+                    response_serializer=tracking__pb2.AnalyzeFrameResponse.SerializeToString,
+            ),
+            'Synthesize': grpc.unary_stream_rpc_method_handler(
+                    servicer.Synthesize,
+                    request_deserializer=tracking__pb2.SynthesizeRequest.FromString,
+                    response_serializer=tracking__pb2.PcmChunk.SerializeToString,
+            ),
+            'Embed': grpc.unary_unary_rpc_method_handler(
+                    servicer.Embed,
+                    request_deserializer=tracking__pb2.EmbedRequest.FromString,
+                    response_serializer=tracking__pb2.EmbedResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'tracking.PerceptionService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('tracking.PerceptionService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class PerceptionService(object):
+    """─────────────────────────────────────────────────────────────────────────
+    PerceptionService / MappingService
+
+    Consolidated heavy-compute surface for the Android client's on-device
+    Gemini Live tool-dispatch loop — see CLAUDE.md's "Client-Orchestrated
+    Live Session" section.
+    ─────────────────────────────────────────────────────────────────────────
+
+    Heavy, stateless-per-call perception primitives: object detection,
+    re-ID embedding, obstacle/depth estimation, neural TTS, text embedding.
+    """
+
     @staticmethod
-    def Chat(request,
+    def AnalyzeFrame(request,
             target,
             options=(),
             channel_credentials=None,
@@ -217,9 +296,9 @@ class TrackingService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/tracking.TrackingService/Chat',
-            tracking__pb2.ChatRequest.SerializeToString,
-            tracking__pb2.ChatResponse.FromString,
+            '/tracking.PerceptionService/AnalyzeFrame',
+            tracking__pb2.AnalyzeFrameRequest.SerializeToString,
+            tracking__pb2.AnalyzeFrameResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -231,7 +310,34 @@ class TrackingService(object):
             _registered_method=True)
 
     @staticmethod
-    def VoiceChat(request,
+    def Synthesize(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/tracking.PerceptionService/Synthesize',
+            tracking__pb2.SynthesizeRequest.SerializeToString,
+            tracking__pb2.PcmChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Embed(request,
             target,
             options=(),
             channel_credentials=None,
@@ -244,9 +350,9 @@ class TrackingService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/tracking.TrackingService/VoiceChat',
-            tracking__pb2.VoiceChatRequest.SerializeToString,
-            tracking__pb2.ChatResponse.FromString,
+            '/tracking.PerceptionService/Embed',
+            tracking__pb2.EmbedRequest.SerializeToString,
+            tracking__pb2.EmbedResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -257,35 +363,119 @@ class TrackingService(object):
             metadata,
             _registered_method=True)
 
-    @staticmethod
-    def StreamFrame(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/tracking.TrackingService/StreamFrame',
-            tracking__pb2.FrameRequest.SerializeToString,
-            tracking__pb2.FrameResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
+
+class MappingServiceStub(object):
+    """Live SLAM-style mapping + localization, active whenever the client's
+    guiding/walking mode is on (there is no separate offline "scan session"
+    any more — see CLAUDE.md's "3D Scanning Pipeline" section).
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.UpdateMapping = channel.stream_stream(
+                '/tracking.MappingService/UpdateMapping',
+                request_serializer=tracking__pb2.MappingChunk.SerializeToString,
+                response_deserializer=tracking__pb2.MappingUpdate.FromString,
+                _registered_method=True)
+        self.GetMapSnapshot = channel.unary_unary(
+                '/tracking.MappingService/GetMapSnapshot',
+                request_serializer=tracking__pb2.GetMapSnapshotRequest.SerializeToString,
+                response_deserializer=tracking__pb2.MapSnapshot.FromString,
+                _registered_method=True)
+        self.ListMappedLocations = channel.unary_unary(
+                '/tracking.MappingService/ListMappedLocations',
+                request_serializer=tracking__pb2.ListMapsRequest.SerializeToString,
+                response_deserializer=tracking__pb2.ListMapsResponse.FromString,
+                _registered_method=True)
+        self.FindLandmark = channel.unary_unary(
+                '/tracking.MappingService/FindLandmark',
+                request_serializer=tracking__pb2.FindLandmarkRequest.SerializeToString,
+                response_deserializer=tracking__pb2.FindLandmarkResponse.FromString,
+                _registered_method=True)
+
+
+class MappingServiceServicer(object):
+    """Live SLAM-style mapping + localization, active whenever the client's
+    guiding/walking mode is on (there is no separate offline "scan session"
+    any more — see CLAUDE.md's "3D Scanning Pipeline" section).
+    """
+
+    def UpdateMapping(self, request_iterator, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetMapSnapshot(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListMappedLocations(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def FindLandmark(self, request, context):
+        """Deferred landmark lookup: GroundingDINO never runs proactively during
+        scanning any more (see scan_server/semantic_mapper.py's module
+        docstring) — this is the only place it runs, on demand, against the
+        session's in-memory frame store (tag-match first, else a first-hit
+        scan — see scan_server/scan_session.py's resolve_landmark()). Because
+        MappingUpdate.landmarks now stays empty for the duration of an active
+        stream (real positions only exist after finalize-time export or via
+        this RPC), the Android client always resolves a guiding destination
+        through this call rather than a live-streamed landmarks list.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_MappingServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'UpdateMapping': grpc.stream_stream_rpc_method_handler(
+                    servicer.UpdateMapping,
+                    request_deserializer=tracking__pb2.MappingChunk.FromString,
+                    response_serializer=tracking__pb2.MappingUpdate.SerializeToString,
+            ),
+            'GetMapSnapshot': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMapSnapshot,
+                    request_deserializer=tracking__pb2.GetMapSnapshotRequest.FromString,
+                    response_serializer=tracking__pb2.MapSnapshot.SerializeToString,
+            ),
+            'ListMappedLocations': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListMappedLocations,
+                    request_deserializer=tracking__pb2.ListMapsRequest.FromString,
+                    response_serializer=tracking__pb2.ListMapsResponse.SerializeToString,
+            ),
+            'FindLandmark': grpc.unary_unary_rpc_method_handler(
+                    servicer.FindLandmark,
+                    request_deserializer=tracking__pb2.FindLandmarkRequest.FromString,
+                    response_serializer=tracking__pb2.FindLandmarkResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'tracking.MappingService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('tracking.MappingService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class MappingService(object):
+    """Live SLAM-style mapping + localization, active whenever the client's
+    guiding/walking mode is on (there is no separate offline "scan session"
+    any more — see CLAUDE.md's "3D Scanning Pipeline" section).
+    """
 
     @staticmethod
-    def VoiceChatStream(request_iterator,
+    def UpdateMapping(request_iterator,
             target,
             options=(),
             channel_credentials=None,
@@ -298,9 +488,9 @@ class TrackingService(object):
         return grpc.experimental.stream_stream(
             request_iterator,
             target,
-            '/tracking.TrackingService/VoiceChatStream',
-            tracking__pb2.VoiceChatChunk.SerializeToString,
-            tracking__pb2.AudioChunk.FromString,
+            '/tracking.MappingService/UpdateMapping',
+            tracking__pb2.MappingChunk.SerializeToString,
+            tracking__pb2.MappingUpdate.FromString,
             options,
             channel_credentials,
             insecure,
@@ -311,85 +501,8 @@ class TrackingService(object):
             metadata,
             _registered_method=True)
 
-
-class MediatorServiceStub(object):
-    """Missing associated documentation comment in .proto file."""
-
-    def __init__(self, channel):
-        """Constructor.
-
-        Args:
-            channel: A grpc.Channel.
-        """
-        self.StreamFrameWithGuidance = channel.unary_unary(
-                '/tracking.MediatorService/StreamFrameWithGuidance',
-                request_serializer=tracking__pb2.FrameRequest.SerializeToString,
-                response_deserializer=tracking__pb2.GuidanceFrameResponse.FromString,
-                _registered_method=True)
-        self.Chat = channel.unary_unary(
-                '/tracking.MediatorService/Chat',
-                request_serializer=tracking__pb2.ChatRequest.SerializeToString,
-                response_deserializer=tracking__pb2.ChatResponse.FromString,
-                _registered_method=True)
-        self.VoiceChat = channel.unary_unary(
-                '/tracking.MediatorService/VoiceChat',
-                request_serializer=tracking__pb2.VoiceChatRequest.SerializeToString,
-                response_deserializer=tracking__pb2.ChatResponse.FromString,
-                _registered_method=True)
-
-
-class MediatorServiceServicer(object):
-    """Missing associated documentation comment in .proto file."""
-
-    def StreamFrameWithGuidance(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def Chat(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def VoiceChat(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-
-def add_MediatorServiceServicer_to_server(servicer, server):
-    rpc_method_handlers = {
-            'StreamFrameWithGuidance': grpc.unary_unary_rpc_method_handler(
-                    servicer.StreamFrameWithGuidance,
-                    request_deserializer=tracking__pb2.FrameRequest.FromString,
-                    response_serializer=tracking__pb2.GuidanceFrameResponse.SerializeToString,
-            ),
-            'Chat': grpc.unary_unary_rpc_method_handler(
-                    servicer.Chat,
-                    request_deserializer=tracking__pb2.ChatRequest.FromString,
-                    response_serializer=tracking__pb2.ChatResponse.SerializeToString,
-            ),
-            'VoiceChat': grpc.unary_unary_rpc_method_handler(
-                    servicer.VoiceChat,
-                    request_deserializer=tracking__pb2.VoiceChatRequest.FromString,
-                    response_serializer=tracking__pb2.ChatResponse.SerializeToString,
-            ),
-    }
-    generic_handler = grpc.method_handlers_generic_handler(
-            'tracking.MediatorService', rpc_method_handlers)
-    server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('tracking.MediatorService', rpc_method_handlers)
-
-
- # This class is part of an EXPERIMENTAL API.
-class MediatorService(object):
-    """Missing associated documentation comment in .proto file."""
-
     @staticmethod
-    def StreamFrameWithGuidance(request,
+    def GetMapSnapshot(request,
             target,
             options=(),
             channel_credentials=None,
@@ -402,9 +515,9 @@ class MediatorService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/tracking.MediatorService/StreamFrameWithGuidance',
-            tracking__pb2.FrameRequest.SerializeToString,
-            tracking__pb2.GuidanceFrameResponse.FromString,
+            '/tracking.MappingService/GetMapSnapshot',
+            tracking__pb2.GetMapSnapshotRequest.SerializeToString,
+            tracking__pb2.MapSnapshot.FromString,
             options,
             channel_credentials,
             insecure,
@@ -416,7 +529,7 @@ class MediatorService(object):
             _registered_method=True)
 
     @staticmethod
-    def Chat(request,
+    def ListMappedLocations(request,
             target,
             options=(),
             channel_credentials=None,
@@ -429,176 +542,7 @@ class MediatorService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/tracking.MediatorService/Chat',
-            tracking__pb2.ChatRequest.SerializeToString,
-            tracking__pb2.ChatResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def VoiceChat(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/tracking.MediatorService/VoiceChat',
-            tracking__pb2.VoiceChatRequest.SerializeToString,
-            tracking__pb2.ChatResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-
-class MapServiceStub(object):
-    """── Map service ────────────────────────────────────────────────────────────
-
-    """
-
-    def __init__(self, channel):
-        """Constructor.
-
-        Args:
-            channel: A grpc.Channel.
-        """
-        self.ListMaps = channel.unary_unary(
-                '/tracking.MapService/ListMaps',
-                request_serializer=tracking__pb2.ListMapsRequest.SerializeToString,
-                response_deserializer=tracking__pb2.ListMapsResponse.FromString,
-                _registered_method=True)
-        self.GetMapGeometry = channel.unary_stream(
-                '/tracking.MapService/GetMapGeometry',
-                request_serializer=tracking__pb2.GetMapRequest.SerializeToString,
-                response_deserializer=tracking__pb2.MapGeometryChunk.FromString,
-                _registered_method=True)
-        self.ScanFrame = channel.unary_unary(
-                '/tracking.MapService/ScanFrame',
-                request_serializer=tracking__pb2.ScanFrameRequest.SerializeToString,
-                response_deserializer=tracking__pb2.ScanFrameResponse.FromString,
-                _registered_method=True)
-        self.SetZoneLabel = channel.unary_unary(
-                '/tracking.MapService/SetZoneLabel',
-                request_serializer=tracking__pb2.SetZoneLabelRequest.SerializeToString,
-                response_deserializer=tracking__pb2.SetZoneLabelResponse.FromString,
-                _registered_method=True)
-        self.ExportScanMap = channel.unary_unary(
-                '/tracking.MapService/ExportScanMap',
-                request_serializer=tracking__pb2.ExportScanMapRequest.SerializeToString,
-                response_deserializer=tracking__pb2.ExportScanMapResponse.FromString,
-                _registered_method=True)
-
-
-class MapServiceServicer(object):
-    """── Map service ────────────────────────────────────────────────────────────
-
-    """
-
-    def ListMaps(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def GetMapGeometry(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ScanFrame(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def SetZoneLabel(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ExportScanMap(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-
-def add_MapServiceServicer_to_server(servicer, server):
-    rpc_method_handlers = {
-            'ListMaps': grpc.unary_unary_rpc_method_handler(
-                    servicer.ListMaps,
-                    request_deserializer=tracking__pb2.ListMapsRequest.FromString,
-                    response_serializer=tracking__pb2.ListMapsResponse.SerializeToString,
-            ),
-            'GetMapGeometry': grpc.unary_stream_rpc_method_handler(
-                    servicer.GetMapGeometry,
-                    request_deserializer=tracking__pb2.GetMapRequest.FromString,
-                    response_serializer=tracking__pb2.MapGeometryChunk.SerializeToString,
-            ),
-            'ScanFrame': grpc.unary_unary_rpc_method_handler(
-                    servicer.ScanFrame,
-                    request_deserializer=tracking__pb2.ScanFrameRequest.FromString,
-                    response_serializer=tracking__pb2.ScanFrameResponse.SerializeToString,
-            ),
-            'SetZoneLabel': grpc.unary_unary_rpc_method_handler(
-                    servicer.SetZoneLabel,
-                    request_deserializer=tracking__pb2.SetZoneLabelRequest.FromString,
-                    response_serializer=tracking__pb2.SetZoneLabelResponse.SerializeToString,
-            ),
-            'ExportScanMap': grpc.unary_unary_rpc_method_handler(
-                    servicer.ExportScanMap,
-                    request_deserializer=tracking__pb2.ExportScanMapRequest.FromString,
-                    response_serializer=tracking__pb2.ExportScanMapResponse.SerializeToString,
-            ),
-    }
-    generic_handler = grpc.method_handlers_generic_handler(
-            'tracking.MapService', rpc_method_handlers)
-    server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('tracking.MapService', rpc_method_handlers)
-
-
- # This class is part of an EXPERIMENTAL API.
-class MapService(object):
-    """── Map service ────────────────────────────────────────────────────────────
-
-    """
-
-    @staticmethod
-    def ListMaps(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/tracking.MapService/ListMaps',
+            '/tracking.MappingService/ListMappedLocations',
             tracking__pb2.ListMapsRequest.SerializeToString,
             tracking__pb2.ListMapsResponse.FromString,
             options,
@@ -612,34 +556,7 @@ class MapService(object):
             _registered_method=True)
 
     @staticmethod
-    def GetMapGeometry(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/tracking.MapService/GetMapGeometry',
-            tracking__pb2.GetMapRequest.SerializeToString,
-            tracking__pb2.MapGeometryChunk.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ScanFrame(request,
+    def FindLandmark(request,
             target,
             options=(),
             channel_credentials=None,
@@ -652,9 +569,9 @@ class MapService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/tracking.MapService/ScanFrame',
-            tracking__pb2.ScanFrameRequest.SerializeToString,
-            tracking__pb2.ScanFrameResponse.FromString,
+            '/tracking.MappingService/FindLandmark',
+            tracking__pb2.FindLandmarkRequest.SerializeToString,
+            tracking__pb2.FindLandmarkResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -665,8 +582,74 @@ class MapService(object):
             metadata,
             _registered_method=True)
 
+
+class StatusServiceStub(object):
+    """StatusService — the server has no other way to know what mode the client
+    is in (no server-side session/LiveSessionState any more — orchestration
+    runs on Android, see CLAUDE.md's "Client-Orchestrated Live Session"
+    section). ToolDispatcher.kt calls ReportMode once per LiveSessionState.mode
+    transition purely so server_gui.py's dashboard can display/select the
+    correct tab directly instead of inferring it from whichever RPC category
+    last happened to fire — this RPC carries no data any other service needs.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.ReportMode = channel.unary_unary(
+                '/tracking.StatusService/ReportMode',
+                request_serializer=tracking__pb2.ReportModeRequest.SerializeToString,
+                response_deserializer=tracking__pb2.ReportModeResponse.FromString,
+                _registered_method=True)
+
+
+class StatusServiceServicer(object):
+    """StatusService — the server has no other way to know what mode the client
+    is in (no server-side session/LiveSessionState any more — orchestration
+    runs on Android, see CLAUDE.md's "Client-Orchestrated Live Session"
+    section). ToolDispatcher.kt calls ReportMode once per LiveSessionState.mode
+    transition purely so server_gui.py's dashboard can display/select the
+    correct tab directly instead of inferring it from whichever RPC category
+    last happened to fire — this RPC carries no data any other service needs.
+    """
+
+    def ReportMode(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_StatusServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'ReportMode': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReportMode,
+                    request_deserializer=tracking__pb2.ReportModeRequest.FromString,
+                    response_serializer=tracking__pb2.ReportModeResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'tracking.StatusService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('tracking.StatusService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class StatusService(object):
+    """StatusService — the server has no other way to know what mode the client
+    is in (no server-side session/LiveSessionState any more — orchestration
+    runs on Android, see CLAUDE.md's "Client-Orchestrated Live Session"
+    section). ToolDispatcher.kt calls ReportMode once per LiveSessionState.mode
+    transition purely so server_gui.py's dashboard can display/select the
+    correct tab directly instead of inferring it from whichever RPC category
+    last happened to fire — this RPC carries no data any other service needs.
+    """
+
     @staticmethod
-    def SetZoneLabel(request,
+    def ReportMode(request,
             target,
             options=(),
             channel_credentials=None,
@@ -679,36 +662,9 @@ class MapService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/tracking.MapService/SetZoneLabel',
-            tracking__pb2.SetZoneLabelRequest.SerializeToString,
-            tracking__pb2.SetZoneLabelResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ExportScanMap(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/tracking.MapService/ExportScanMap',
-            tracking__pb2.ExportScanMapRequest.SerializeToString,
-            tracking__pb2.ExportScanMapResponse.FromString,
+            '/tracking.StatusService/ReportMode',
+            tracking__pb2.ReportModeRequest.SerializeToString,
+            tracking__pb2.ReportModeResponse.FromString,
             options,
             channel_credentials,
             insecure,

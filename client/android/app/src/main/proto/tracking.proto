@@ -2,17 +2,28 @@ syntax = "proto3";
 
 package tracking;
 
+// Android is the only client this server talks to (see CLAUDE.md's
+// "Client-Orchestrated Live Session" section) — the Pi thin client,
+// Mediator, Desktop operator GUI, and offline-scan workflow (and every RPC/
+// message that existed only for them: MediatorService, the old MapService,
+// TrackingService's Chat/VoiceChat/VoiceChatStream/StreamFrame) have been
+// removed. Gemini Live orchestration runs entirely on-device now; this
+// server is a pure heavy-compute + live-mapping backend.
+
+// DetectObject/GetEmbedding stay heavy models called directly by Android's
+// TrackingBackend.kt for its local-ORB-tracking init/renewal — not merged
+// into PerceptionService.AnalyzeFrame since that call site predates it and
+// still works unchanged.
 service TrackingService {
   rpc DetectObject (DetectionRequest) returns (DetectionResponse);
   rpc GetEmbedding (EmbeddingRequest) returns (EmbeddingResponse);
-  rpc Chat (ChatRequest) returns (ChatResponse);
-  rpc VoiceChat (VoiceChatRequest) returns (ChatResponse);
-  rpc StreamFrame (FrameRequest) returns (FrameResponse);
-  rpc VoiceChatStream (stream VoiceChatChunk) returns (stream AudioChunk);
 }
 
 message DetectionRequest {
   string prompt = 1;
+  bytes image_data = 2;   // JPEG-encoded frame — sent per-request now that there's
+                           // no continuous frame stream keeping a server-side
+                           // "latest frame" warm (Gemini Live runs on-device)
 }
 
 message DetectionResponse {
@@ -22,30 +33,15 @@ message DetectionResponse {
 
 message EmbeddingRequest {
   repeated float box_xyxy = 1;
+  bytes image_data = 2;   // JPEG-encoded frame, see DetectionRequest
 }
 
 message EmbeddingResponse {
   repeated float embedding = 1;
 }
 
-message ChatRequest {
-  string message = 1;
-}
-
-message ChatResponse {
-  string response = 1;
-  bytes audio_response = 2;
-  string agent_name = 3;
-  string agent_state = 4;
-  string agent_payload = 5;
-}
-
-message VoiceChatRequest {
-  bytes audio_data = 1;
-}
-
-// IMU measurement from the device (accelerometer + gyroscope).
-// timestamp_ns uses the same hardware clock as camera frame timestamps.
+// IMU measurement — used by MappingChunk.imu_samples (accepted on the wire,
+// not currently consumed server-side; MappingService is RTAB-Map-pose-only).
 message IMUFrame {
   int64 timestamp_ns = 1;
   float accel_x = 2;
@@ -56,93 +52,87 @@ message IMUFrame {
   float gyro_z = 7;
 }
 
-// A device-native tool call routed from Gemini → server → client.
-message DeviceToolCall {
-  string call_id   = 1;   // unique ID; echoed back in DeviceToolResult
-  string name      = 2;   // tool name, e.g. "make_phone_call"
-  string args_json = 3;   // JSON-encoded arguments dict
+// ─────────────────────────────────────────────────────────────────────────
+// PerceptionService / MappingService
+//
+// Consolidated heavy-compute surface for the Android client's on-device
+// Gemini Live tool-dispatch loop — see CLAUDE.md's "Client-Orchestrated
+// Live Session" section.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Heavy, stateless-per-call perception primitives: object detection,
+// re-ID embedding, obstacle/depth estimation, neural TTS, text embedding.
+service PerceptionService {
+  rpc AnalyzeFrame (AnalyzeFrameRequest) returns (AnalyzeFrameResponse);
+  rpc Synthesize (SynthesizeRequest) returns (stream PcmChunk);
+  rpc Embed (EmbedRequest) returns (EmbedResponse);
 }
 
-// Result of a device-native tool execution, sent client → server.
-message DeviceToolResult {
-  string call_id    = 1;  // matches DeviceToolCall.call_id
-  string result_json = 2; // JSON-encoded result dict, e.g. {"status":"dialing"}
+enum AnalysisOp {
+  DETECT = 0;  // GroundingDINO open-vocab detection (requires prompt)
+  EMBED = 1;   // DINOv2 re-ID embedding (requires box_xyxy)
+  DEPTH = 2;   // obstacle/depth estimate (SparseObstacleDetector/StereoDepthDetector/DA3)
 }
 
-// Multiplexed stream sent by client while PTT button is held.
-// capabilities is populated ONLY on the first chunk (handshake); empty thereafter.
-message VoiceChatChunk {
-  oneof payload {
-    bytes            audio_chunk  = 1;  // raw PCM 16-bit LE, 16 kHz mono
-    bytes            video_frame  = 2;  // JPEG-encoded camera frame
-    IMUFrame         imu_frame    = 3;  // IMU measurement (accelerometer + gyroscope)
-    DeviceToolResult tool_result  = 4;  // result of a device tool call
-  }
-  repeated string capabilities = 5;    // advertised device capabilities (first chunk only)
-  TrackingData     tracking_data = 6;  // optional: object+hand boxes, set alongside video_frame while tracking
+message AnalyzeFrameRequest {
+  bytes image_data = 1;          // JPEG-encoded frame
+  repeated AnalysisOp ops = 2;   // which analyses to run on this one frame (one round trip)
+  string prompt = 3;             // for DETECT
+  repeated float box_xyxy = 4;   // for EMBED — box to embed
 }
 
-// Single raw-PCM chunk streamed back by the server (24 kHz, 16-bit LE, mono).
-// Chunks with empty pcm_data carry either agent state metadata or a device tool call.
-message AudioChunk {
-  bytes          pcm_data      = 1;
-  string         agent_name    = 2;
-  string         agent_state   = 3;
-  string         agent_payload = 4;
-  DeviceToolCall tool_call     = 5;  // non-empty when server routes a tool call to the client
+message AnalyzeFrameResponse {
+  repeated Detection detections = 1;  // present if DETECT was requested
+  repeated float embedding = 2;       // present if EMBED was requested
+  ObstacleInfo obstacle = 3;          // present if DEPTH was requested
 }
 
-message HandData {
-  repeated float landmarks_x = 1;
-  repeated float landmarks_y = 2;
-}
-
-message TrackingData {
+message Detection {
   repeated float box_xyxy = 1;
-  repeated float keypoints_x = 2;
-  repeated float keypoints_y = 3;
-  float confidence = 4;
-  string status = 5;
-  repeated HandData hand_data = 6;
-  repeated float hand_box_xyxy = 7;  // hand bounding box from client-side hand detection
+  float score = 2;
+  string label = 3;
 }
 
-message FrameRequest {
-  bytes image_data = 1;
-  TrackingData tracking_data = 2;
+message ObstacleInfo {
+  bool detected = 1;
+  float distance_m = 2;
+  float angle_deg = 3;   // relative bearing, 0 = straight ahead
+  string description = 4;
 }
 
-message FrameResponse {
-  bool success = 1;
-  bytes audio_response = 2;
+message SynthesizeRequest {
+  string text = 1;
 }
 
-message GuidanceFrameResponse {
-  bool success = 1;
-  string instruction = 2;
-  string tracking_status = 3;
-  float object_confidence = 4;
-  repeated float object_box_xyxy = 5;
-  repeated float hand_box_xyxy = 6;
-  float delta_x = 7;
-  float delta_y = 8;
-  float distance_px = 9;
+message PcmChunk {
+  bytes pcm_data = 1;    // raw PCM, 24 kHz 16-bit LE mono (KokoroTTS)
 }
 
-service MediatorService {
-  rpc StreamFrameWithGuidance (FrameRequest) returns (GuidanceFrameResponse);
-  rpc Chat (ChatRequest) returns (ChatResponse);
-  rpc VoiceChat (VoiceChatRequest) returns (ChatResponse);
+message EmbedRequest {
+  string text = 1;
 }
 
-// ── Map service ────────────────────────────────────────────────────────────
+message EmbedResponse {
+  repeated float vector = 1;   // sentence-transformer (MiniLM) embedding
+}
 
-service MapService {
-  rpc ListMaps (ListMapsRequest) returns (ListMapsResponse);
-  rpc GetMapGeometry (GetMapRequest) returns (stream MapGeometryChunk);
-  rpc ScanFrame (ScanFrameRequest) returns (ScanFrameResponse);
-  rpc SetZoneLabel (SetZoneLabelRequest) returns (SetZoneLabelResponse);
-  rpc ExportScanMap (ExportScanMapRequest) returns (ExportScanMapResponse);
+// Live SLAM-style mapping + localization, active whenever the client's
+// guiding/walking mode is on (there is no separate offline "scan session"
+// any more — see CLAUDE.md's "3D Scanning Pipeline" section).
+service MappingService {
+  rpc UpdateMapping (stream MappingChunk) returns (stream MappingUpdate);
+  rpc GetMapSnapshot (GetMapSnapshotRequest) returns (MapSnapshot);
+  rpc ListMappedLocations (ListMapsRequest) returns (ListMapsResponse);
+  // Deferred landmark lookup: GroundingDINO never runs proactively during
+  // scanning any more (see scan_server/semantic_mapper.py's module
+  // docstring) — this is the only place it runs, on demand, against the
+  // session's in-memory frame store (tag-match first, else a first-hit
+  // scan — see scan_server/scan_session.py's resolve_landmark()). Because
+  // MappingUpdate.landmarks now stays empty for the duration of an active
+  // stream (real positions only exist after finalize-time export or via
+  // this RPC), the Android client always resolves a guiding destination
+  // through this call rather than a live-streamed landmarks list.
+  rpc FindLandmark (FindLandmarkRequest) returns (FindLandmarkResponse);
 }
 
 message ListMapsRequest {}
@@ -151,58 +141,152 @@ message ListMapsResponse {
   repeated string location_ids = 1;
 }
 
-message GetMapRequest {
+enum PoseSource {
+  IMU_VO = 0;
+  RTABMAP = 1;
+}
+
+message CameraIntrinsics {
+  float fx = 1;
+  float fy = 2;
+  float cx = 3;
+  float cy = 4;
+}
+
+message MappingChunk {
+  string location_id = 1;
+  bytes image_data = 2;                     // JPEG-encoded frame
+  int64 frame_timestamp_ns = 3;              // same clock domain as imu_samples' timestamps
+  repeated IMUFrame imu_samples = 4;         // IMU samples since the previous chunk
+  PoseSource pose_source = 5;               // only meaningful on the first chunk of a session
+  CameraIntrinsics intrinsics = 6;           // not yet consumed server-side — the mapping
+                                              // pipeline still estimates K from image dimensions
+                                              // (same _estimate_K fallback tools/depth.py already
+                                              // uses); wiring real intrinsics through is follow-up
+  SessionMode session_mode = 7;              // only meaningful on the first chunk of a stream —
+                                              // see StreamingScanSession(walking_lite=...) /
+                                              // ScanSession.process_frames_batch's walking_lite note
+}
+
+// SCAN: full pipeline (RTAB-Map get_cloud/SOR reconstruction + VLM/semantic
+// tagging) — the explicit, user-initiated "look around" pass a location's
+// landmarks/semantic map get built from.
+// WALKING/GUIDING: walking_lite=true — local back-projection feeds the
+// occupancy map directly (no RTAB-Map get_cloud/SOR pull, no TSDF), no VLM
+// tagging at all. Landmark lookups (FindLandmark) fall back to whatever a
+// prior SCAN already persisted for this location_id instead of discovering
+// anything live. See CLAUDE.md's "Client-Orchestrated Live Session" section.
+enum SessionMode {
+  SCAN = 0;
+  WALKING = 1;
+  GUIDING = 2;
+}
+
+message Pose {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+  float qx = 4;
+  float qy = 5;
+  float qz = 6;
+  float qw = 7;
+}
+
+// Flattened row-major grid (rows=Z, cols=X), cell (ix, iz) at index
+// ix + iz*width — mirrors occupancy_map.py's _build_grid_dict()/
+// extract_full_grid() schema exactly (same field names/semantics), so the
+// server side is a direct, untranslated pass-through of that dict.
+message OccupancyGrid {
+  int32 width = 1;
+  int32 height = 2;
+  float origin_x = 3;      // world X of cell (0, 0)
+  float origin_z = 4;      // world Z of cell (0, 0)
+  float cell_size = 5;     // metres per cell (occupancy_map.py's `resolution`)
+  repeated int32 cls = 6;          // 0=unknown, 1=ground, 2=low/step-over, 3=obstacle
+  repeated float height_norm = 7;  // 0.0=ground, (0,1]=normalized obstacle height, -1.0=unknown (same sentinel as occupancy_map.py's `data`)
+  repeated float clearance_m = 8;  // metres to nearest obstacle cell
+}
+
+message Landmark {
+  string name = 1;
+  float x = 2;
+  float z = 3;
+  float confidence = 4;
+}
+
+// One changed occupancy cell, addressed by GLOBAL grid index (ix, iz) — NOT
+// relative to any particular window/row/col — so indices stay valid across
+// deltas even as the map's overall bounding box grows between full resyncs.
+// See occupancy_map.py's extract_dirty_delta() and CLAUDE.md's "Occupancy
+// grid delta sync" note for the full design (why clearance can go briefly
+// stale for a cell near, but not touched by, the change that dirtied it).
+message OccupancyCellUpdate {
+  int32 ix = 1;
+  int32 iz = 2;
+  int32 cls = 3;           // same 0..3 convention as OccupancyGrid.cls
+  float height_norm = 4;   // same convention as OccupancyGrid.height_norm
+  float clearance_m = 5;
+}
+
+message OccupancyGridDelta {
+  float resolution = 1;             // == OccupancyGrid.cell_size of the last full grid this patches
+  repeated OccupancyCellUpdate cells = 2;
+}
+
+message MappingUpdate {
+  Pose pose = 1;
+  OccupancyGrid grid = 2;          // FULL grid — only set when full_resync is true
+  bool grid_updated = 3;           // mirrors occupancy_map.py's _update_count gating — false means
+                                    // "pose only, neither grid nor grid_delta carries new data"
+  repeated Landmark landmarks = 4; // stays EMPTY for the duration of an active stream now —
+                                    // GroundingDINO/backprojection is deferred (see FindLandmark
+                                    // RPC below); only populated in the final snapshot after
+                                    // finalize-time export runs at stream end
+  float confidence = 5;            // this update's depth-consistency confidence [0,1]
+  OccupancyGridDelta grid_delta = 6; // incremental cell patch — set when grid_updated is true AND
+                                    // full_resync is false (the common case after the first update)
+  bool full_resync = 7;            // true the first time a location streams this session, or
+                                    // whenever the map's bounding box itself grew — client must
+                                    // replace its whole local grid from `grid`, not patch it
+}
+
+message GetMapSnapshotRequest {
   string location_id = 1;
 }
 
-message ZoneMetadata {
-  string label = 1;
-  repeated float bbox_min = 2;
-  repeated float bbox_max = 3;
+message MapSnapshot {
+  bool found = 1;
+  OccupancyGrid grid = 2;
+  repeated Landmark landmarks = 3;
 }
 
-message MapMetadata {
+message FindLandmarkRequest {
   string location_id = 1;
-  string created_at = 2;
-  int32 point_count = 3;
-  repeated ZoneMetadata zones = 4;
+  string query = 2;         // free-text destination/object name, e.g. "the wardrobe", "water bottle"
 }
 
-message MapGeometryChunk {
-  bytes data = 1;
+message FindLandmarkResponse {
+  bool found = 1;
+  float x = 2;
+  float z = 3;
+  float confidence = 4;
+  string matched_label = 5; // the resolved landmark's own name/label (may differ from `query`)
 }
 
-message ScanFrameRequest {
-  bytes image_data = 1;
-  string location_id = 2;
-  string zone_label = 3;   // optional: if non-empty, create a zone at the current camera pos
-  float zone_radius = 4;   // zone half-extent in metres; 0 → server default (1.5 m)
+// StatusService — the server has no other way to know what mode the client
+// is in (no server-side session/LiveSessionState any more — orchestration
+// runs on Android, see CLAUDE.md's "Client-Orchestrated Live Session"
+// section). ToolDispatcher.kt calls ReportMode once per LiveSessionState.mode
+// transition purely so server_gui.py's dashboard can display/select the
+// correct tab directly instead of inferring it from whichever RPC category
+// last happened to fire — this RPC carries no data any other service needs.
+service StatusService {
+  rpc ReportMode (ReportModeRequest) returns (ReportModeResponse);
 }
 
-message ScanFrameResponse {
-  bool success = 1;
-  int32 point_count = 2;
-  repeated float camera_position = 3;
+message ReportModeRequest {
+  string mode = 1;    // "idle" | "reading" | "tracking" | "guiding" | "walking" | "scanning"
+  string target = 2;  // trackingTarget / guidingDestinationLabel / readingLabel, whichever applies — else ""
 }
 
-message SetZoneLabelRequest {
-  string location_id = 1;
-  string label = 2;
-  float radius = 3;
-}
-
-message SetZoneLabelResponse {
-  bool success = 1;
-  string message = 2;
-}
-
-message ExportScanMapRequest {
-  string location_id = 1;
-}
-
-message ExportScanMapResponse {
-  bool success = 1;
-  string output_path = 2;
-  int32 point_count = 3;
-  int32 zone_count = 4;
-}
+message ReportModeResponse {}

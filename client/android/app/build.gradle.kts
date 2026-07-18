@@ -86,6 +86,11 @@ dependencies {
 
     implementation("androidx.media3:media3-exoplayer:$media3Version")
     implementation("androidx.media3:media3-ui:$media3Version")
+
+    // Raw WebSocket client for GeminiLiveClient — grpc-okhttp shades its own
+    // okhttp internally (doesn't expose okhttp3.* on the compile classpath),
+    // so this is a separate, explicit dependency, not a reuse of grpc's.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
 
 protobuf {

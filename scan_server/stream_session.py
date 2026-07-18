@@ -65,11 +65,12 @@ class StreamingScanSession:
         imu_orientation: str = "portrait",
         zone_type: str = "",
         axis_perm: Optional[np.ndarray] = None,
-        mini_batch: int = 4,
+        mini_batch: int = 1,
         sor_nb_neighbors: int = 20,
         sor_std_ratio: float = 2.25,
         imu_stationary_s: float = 1.0,
         occupancy_voxel_size: float = DEFAULT_VOXEL_SIZE,
+        walking_lite: bool = False,
     ) -> None:
         self.session: ScanSession = scan_manager.get_or_create(location_id, zone_type=zone_type)
         # ScanSessionManager.get_or_create() returns the SAME ScanSession
@@ -99,6 +100,11 @@ class StreamingScanSession:
         # to what's displayed there. See ScanSession.process_frames_batch's
         # docstring.
         self._occupancy_voxel_size = occupancy_voxel_size
+        # See ScanSession.process_frames_batch's walking_lite docstring —
+        # skips VLM tagging + RTAB-Map's get_cloud()/SOR pull, local
+        # back-projection feeds the occupancy map instead. Intended for
+        # walking/guiding, not scanning — see mapping_servicer.py.
+        self._walking_lite = walking_lite
 
         self._imu: Optional[IncrementalImuIntegrator] = None
         self._frame_buffer: List[tuple] = []  # (rgb, ts_ns)
@@ -160,6 +166,7 @@ class StreamingScanSession:
             sor_nb_neighbors=self._sor_nb_neighbors,
             sor_std_ratio=self._sor_std_ratio,
             occupancy_voxel_size=self._occupancy_voxel_size,
+            walking_lite=self._walking_lite,
         )
         if self._zone_active and len(self.session.last_trajectory) > 0:
             self._zone_positions.extend(self.session.last_trajectory.tolist())

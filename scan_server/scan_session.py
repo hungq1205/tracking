@@ -16,7 +16,8 @@ import json
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -27,6 +28,7 @@ from da3_wrapper import BaseDepthEstimator
 from feature_tracker import FeatureTracker
 from map_exporter import export_map
 from occupancy_map import OccupancyMap
+from orb_novelty_gate import OrbNoveltyGate, _rotation_deg, _sharpness_score, decide_accept
 from pose_graph import PoseGraph
 from semantic_mapper import Landmark, SemanticMapper
 from timing_utils import timed
@@ -616,6 +618,36 @@ def _back_project_frame(
     return pts_world, colors
 
 
+# Default novelty-gate thresholds — GUI/configure_novelty_gate-overridable,
+# same "constructor default + live-tunable" pattern as OccupancyMap's own
+# constants (see ScanSession.configure_novelty_gate /
+# ScanSessionManager.configure_novelty_gate_defaults).
+DEFAULT_MIN_NEW_FRACTION = 0.85
+DEFAULT_MIN_NEW_COUNT = 60
+DEFAULT_MIN_ROTATION_DEG = 2.0
+DEFAULT_MIN_SHARPNESS = 0.0  # 0 disables blur-reject entirely
+
+
+@dataclass
+class StoredFrame:
+    """One novelty+blur-gated accepted frame, kept in ScanSession._frame_store
+    for the lifetime of one continuous mapping stream (session-scoped,
+    in-memory only — cleared by reset_cloud(), never persisted to disk; see
+    CLAUDE.md's "Client-Orchestrated Live Session" section for why). Used
+    both for on-demand landmark resolution (ScanSession.resolve_landmark())
+    and finalize-time export (_resolve_all_frame_store_landmarks())."""
+    jpeg_bytes: bytes           # cv2.imencode(".jpg", frame_bgr, ...) — compressed to bound memory
+    depth_map: np.ndarray       # float32 HxW, metres
+    world_pose: np.ndarray      # 4x4 float64, camera-to-world
+    K: np.ndarray                # 3x3 float64 intrinsics
+    frame_idx: int
+    timestamp_ns: Optional[int] = None
+    landmark_tags: List[str] = field(default_factory=list)  # filled in once its VLM batch completes
+
+    def decode_frame(self) -> np.ndarray:
+        return cv2.imdecode(np.frombuffer(self.jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+
+
 # ── ScanSession ────────────────────────────────────────────────────────────────
 
 
@@ -634,6 +666,7 @@ class ScanSession:
         semantic_mapper: Optional[SemanticMapper] = None,
         zone_type: str = "",
         occupancy_params: Optional[dict] = None,
+        novelty_params: Optional[dict] = None,
     ) -> None:
         self.location_id = location_id
         self.estimator = estimator
@@ -641,6 +674,31 @@ class ScanSession:
         self.semantic_mapper = semantic_mapper
         self.zone_type = zone_type
         self.labeler = ZoneLabeler()
+
+        # Novelty+blur gate (see orb_novelty_gate.py) — same "constructor
+        # default + live-tunable, remembered for reset_cloud()" pattern as
+        # _occupancy_params/OccupancyMap below. Frames failing this gate are
+        # excluded from cloud/TSDF fusion, the frame store, and VLM tagging —
+        # see process_frames_batch's Step 3.
+        self._novelty_params: dict = dict(novelty_params or {})
+        self._min_sharpness: float = self._novelty_params.get("min_sharpness", DEFAULT_MIN_SHARPNESS)
+        self._min_new_fraction: float = self._novelty_params.get("min_new_fraction", DEFAULT_MIN_NEW_FRACTION)
+        self._min_new_count: int = self._novelty_params.get("min_new_count", DEFAULT_MIN_NEW_COUNT)
+        self._min_rotation_deg: float = self._novelty_params.get("min_rotation_deg", DEFAULT_MIN_ROTATION_DEG)
+        self.novelty_gate = OrbNoveltyGate(**self._gate_ctor_kwargs())
+
+        # Session-scoped, in-memory frame store — see StoredFrame's docstring.
+        # _tag_pending is the subset of _frame_store still awaiting its
+        # batched VLM tagging call (SemanticMapper.tag_landmarks_batch);
+        # entries are the SAME StoredFrame objects as in _frame_store,
+        # mutated in place once tagged.
+        self._frame_store: List[StoredFrame] = []
+        self._tag_pending: List[StoredFrame] = []
+
+        # Approximate rotation-guard reference for RTAB-Map-pose-mode novelty
+        # (no per-frame ORB reference set exists for that mode — see
+        # orb_novelty_gate.py / process_frames_batch's RTAB-Map branch).
+        self._rtabmap_last_accepted_pose: Optional[np.ndarray] = None
 
         self.tracker = FeatureTracker(n_features=2000)
         self.pose_graph = PoseGraph()
@@ -685,6 +743,30 @@ class ScanSession:
         self._cloud_raw_accum = o3d.geometry.PointCloud()
         self._last_sor_nb_neighbors: int = SOR_NB_NEIGHBORS
         self._last_sor_std_ratio: float = SOR_STD_RATIO
+
+        # TSDF fusion — non-RTAB-Map (IMU+VO/VO) pose sources only. Unlike
+        # _raw_cloud_batches (first observation wins, never revised), TSDF
+        # averages every trusted frame's contribution to the same surface,
+        # denoising residual noise the depth-consistency gate doesn't reject
+        # outright (see feature_tracker.py's _triangulate_depth_agreement —
+        # that gate only rejects OBVIOUSLY bad frames; a frame that passes
+        # still gets fused here with no revision otherwise). Deliberately NOT
+        # used for RTAB-Map mode: RTAB-Map's own server-side reconstruction
+        # already gets retroactively re-transformed by its CURRENT
+        # graph-corrected pose on every loop-closure resync (see
+        # _rtabmap_full_resync) — a client-side TSDF volume integrated at
+        # pose-at-time-of-integration would reintroduce that exact staleness
+        # with no correction path, regressing a problem RTAB-Map mode's
+        # design already solves. ensure_cloud_built() branches on
+        # _session_uses_rtabmap to pick the right source.
+        self._tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
+            voxel_length=VOXEL_SIZE, sdf_trunc=VOXEL_SIZE * 4,
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+        )
+        self._tsdf_integrated_count: int = 0
+        self._tsdf_cloud_cache: Optional[o3d.geometry.PointCloud] = None
+        self._tsdf_extracted_at_count: int = -1
+        self._session_uses_rtabmap: bool = False
 
         self.latest_frame_rgb: Optional[np.ndarray] = None
         self.last_frames_rgb: list = []
@@ -746,6 +828,33 @@ class ScanSession:
         # bad frame with the node it produced.
         self._rtabmap_untrusted_node_ids: set = set()
 
+        # Per-node SOR (statistical outlier removal) keep-mask cache, keyed
+        # by node_id — a full resync (_rtabmap_full_resync, on loop closure)
+        # re-pulls EVERY node's cloud, re-transformed by its new corrected
+        # pose, but a rigid transform (rotation+translation) preserves every
+        # pairwise Euclidean distance — so SOR's outlier decision for a given
+        # node is IDENTICAL before and after a pose correction; only the
+        # points' world-space position changes, not which ones are outliers.
+        # Recomputing SOR for every already-seen node on every resync was
+        # pure redundant work (measured: ~7.8s for a 1.2M-point resync,
+        # almost entirely nodes seen before). _rtabmap_process_nodes() now
+        # only runs SOR for node ids not yet in this cache; a cached mask is
+        # applied directly to the freshly re-posed points instead. Falls
+        # back to recomputing for a node if its cached mask's length doesn't
+        # match the freshly-pulled point count (shouldn't normally happen —
+        # a node's own stored SensorData never changes — but defends against
+        # it rather than misapplying a wrong-length mask).
+        self._rtabmap_sor_keep_mask: Dict[int, np.ndarray] = {}
+
+        # Per-node depth confidence (see occupancy_map.py's update()
+        # docstring) — populated from the same side-channel FeatureTracker
+        # depth-consistency check that builds _rtabmap_untrusted_node_ids
+        # (process_frames_batch's RTAB-Map branch), just continuous instead
+        # of binary: 1 - frac_bad, or 1.0 if the check couldn't run (too few
+        # PnP inliers). Read by _rtabmap_process_nodes() per node when
+        # calling occupancy_map.update().
+        self._rtabmap_node_confidence: Dict[int, float] = {}
+
         # Diagnostics for the most recent process_frames_batch() call — read by
         # scan_gui.py to surface actual pose source + RTAB-Map tracking health
         # in the Gradio log panel (server-console prints alone are easy to miss).
@@ -753,12 +862,80 @@ class ScanSession:
         self.last_rtabmap_lost: int = 0
         self.last_rtabmap_total: int = 0
         self.last_rtabmap_loop_closure: bool = False
+        # Depth-consistency confidence behind the most recent occupancy_map.update()
+        # call (batch-level for IMU+VO/VO, last-processed-node for RTAB-Map) — read
+        # by MappingService (server/services/mapping_servicer.py) to report per-update
+        # confidence to the client without recomputing it from depth_checks.
+        self.last_batch_confidence: float = 1.0
 
         # Session-wide semantic landmark accumulation (raw, unmerged). Persists
         # across all segments/zones — global overlap merging happens once, at
         # export time, via finalize_landmarks().
         self._raw_landmarks: List[Landmark] = []
         self._current_area_name: str = ""
+
+    # ── private ───────────────────────────────────────────────────────────────
+
+    def _gate_ctor_kwargs(self) -> dict:
+        """Pulls only the OrbNoveltyGate-constructor-relevant subset out of
+        _novelty_params (n_features/ratio/min_raw_matches/
+        ransac_threshold_px/use_gpu) — the rest (min_sharpness/
+        min_new_fraction/min_new_count/min_rotation_deg) are runtime args to
+        evaluate_with_keypoints()/decide_accept(), not constructor args."""
+        keys = ("n_features", "ratio", "min_raw_matches", "ransac_threshold_px", "use_gpu")
+        return {k: self._novelty_params[k] for k in keys if k in self._novelty_params}
+
+    def _evaluate_novelty(self, rgb: np.ndarray) -> tuple:
+        """IMU+VO/VO branches only — call immediately after
+        self.tracker.track(rgb, ...) so self.tracker._prev holds THIS
+        frame's already-detected ORB keypoints/descriptors (reused here, no
+        redundant second detection pass — see orb_novelty_gate.py's module
+        docstring). Returns (accepted, sharpness, reject_reason); calls
+        self.novelty_gate.accept(...) when accepted."""
+        prev = self.tracker._prev
+        sharpness = _sharpness_score(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY))
+        (
+            _keypoints, _descriptors, _new_mask, new_count, _total,
+            new_fraction, best_match_inliers, rotation_deg, _translation_px,
+        ) = self.novelty_gate.evaluate_with_keypoints(
+            prev.keypoints, prev.descriptors, rgb.shape[:2],
+            self._min_new_fraction, self._min_new_count,
+        )
+        accepted = decide_accept(
+            new_fraction, new_count, best_match_inliers, rotation_deg, sharpness,
+            self._min_new_fraction, self._min_new_count, self._min_rotation_deg,
+            self._min_sharpness,
+        )
+        if accepted:
+            self.novelty_gate.accept(prev.keypoints, prev.descriptors)
+            reject_reason = ""
+        elif new_fraction < self._min_new_fraction or new_count < self._min_new_count:
+            reject_reason = f"not novel enough (new_fraction={new_fraction:.2f} < {self._min_new_fraction:.2f})"
+        elif best_match_inliers and rotation_deg < self._min_rotation_deg:
+            reject_reason = f"insufficient rotation ({rotation_deg:.1f}° < {self._min_rotation_deg:.1f}°)"
+        else:
+            reject_reason = f"too blurry (sharpness={sharpness:.0f} < min_sharpness={self._min_sharpness:.0f})"
+        return accepted, sharpness, reject_reason
+
+    def _flush_tag_pending(self) -> None:
+        """Runs SemanticMapper.tag_landmarks_batch() across whatever's
+        currently buffered in self._tag_pending (a full IMAGES_PER_PROMPT
+        batch, or a partial leftover at finalize time), assigns each
+        StoredFrame's landmark_tags in place, and clears the buffer. No-op
+        if semantic_mapper isn't configured or nothing's pending."""
+        if not self._tag_pending or self.semantic_mapper is None:
+            return
+        batch = self._tag_pending
+        self._tag_pending = []
+        try:
+            tag_lists = self.semantic_mapper.tag_landmarks_batch(
+                [sf.decode_frame() for sf in batch]
+            )
+        except Exception as e:
+            print(f"[ScanSession:{self.location_id}] tag_landmarks_batch failed: {e}")
+            return
+        for sf, tags in zip(batch, tag_lists):
+            sf.landmark_tags = tags
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -796,6 +973,7 @@ class ScanSession:
         sor_nb_neighbors: int = SOR_NB_NEIGHBORS,
         sor_std_ratio: float = SOR_STD_RATIO,
         occupancy_voxel_size: float = DEFAULT_VOXEL_SIZE,
+        walking_lite: bool = False,
     ) -> tuple[int, list[float], float]:
         """
         Run depth estimation and dense back-projection on a mini-batch.
@@ -849,9 +1027,72 @@ class ScanSession:
         would double-count old points and break the Bayesian log-odds
         design (see occupancy_map.py).
 
+        `walking_lite` (only meaningful together with `use_rtabmap_pose`):
+        skips VLM/semantic tagging (StoredFrame/_frame_store/_tag_pending)
+        AND skips Step 3b's RTAB-Map get_cloud()/SOR/server-side-voxelize
+        pull entirely — the two most expensive parts of a batch (observed
+        15s+ for get_cloud, 12s+ for SOR on a real session; VLM tagging is
+        pointless work outside an explicit scan pass anyway). Instead,
+        Step 3's LOCAL back-projection path (normally IMU+VO/VO-only) also
+        runs for RTAB-Map-posed frames, feeding the exact same generic
+        Step 4 occupancy update every other pose source already uses — RTAB-
+        Map's pose is still authoritative, only its OWN heavier server-side
+        reconstruction is bypassed. No TSDF fusion either (that's for
+        denoised Live Points/PLY-export quality, not needed for a live
+        occupancy grid). Intended for walking/guiding — modes that need a
+        live, responsive occupancy grid but not a persisted, semantically-
+        tagged reconstruction (that's what an explicit scan pass is for; see
+        CLAUDE.md's "Client-Orchestrated Live Session" walking-mode note).
+
         Returns (point_count, cam_pos, infer_ms).
         """
         with self._lock:
+            # ── Step 0: blur pre-check — skip DA3/pose entirely for a batch
+            # that's not worth it ────────────────────────────────────────────
+            # The novelty+blur gate below (Step 3) only vetoes FUSION — DA3
+            # depth estimation and RTAB-Map/VO pose computation already ran
+            # for every frame by the time it fires, regardless of outcome.
+            # Real cost data showed DA3 (600-1200ms) + RTAB-Map pose
+            # (300-1200ms) paid on every single mini-batch even when every
+            # frame in it turned out unusable — pure waste for a frame that
+            # was already known-blurry before either call started. This gate
+            # runs first and, for a batch with nothing worth keeping, skips
+            # Step 1 onward completely rather than paying for depth/pose work
+            # whose result gets thrown away a few lines later anyway.
+            # min_sharpness<=0 (DEFAULT_MIN_SHARPNESS) disables this
+            # entirely — same "0 = off" convention the novelty gate itself
+            # already uses, so a session that never calls
+            # configure_novelty_gate() sees byte-identical behavior to
+            # before this pre-check existed.
+            frame_sharpness: list = [None] * len(frames_rgb)
+            if self._min_sharpness > 0:
+                frame_sharpness = [
+                    _sharpness_score(cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)) for f in frames_rgb
+                ]
+                keep_idx = [i for i, s in enumerate(frame_sharpness) if s >= self._min_sharpness]
+                if not keep_idx:
+                    print(
+                        f"[blur-precheck] SKIPPED entire batch — {len(frames_rgb)}/{len(frames_rgb)} "
+                        f"frame(s) below min_sharpness={self._min_sharpness:.0f} "
+                        f"(scores={[f'{s:.0f}' for s in frame_sharpness]}); no DA3/pose work done."
+                    )
+                    cam_pos = (
+                        self.last_frame_poses[-1][:3, 3].tolist()
+                        if self.last_frame_poses else [0.0, 0.0, 0.0]
+                    )
+                    return self._raw_point_count, cam_pos, 0.0
+                if len(keep_idx) < len(frames_rgb):
+                    print(
+                        f"[blur-precheck] dropped {len(frames_rgb) - len(keep_idx)}/{len(frames_rgb)} "
+                        f"frame(s) below min_sharpness={self._min_sharpness:.0f} before DA3/pose."
+                    )
+                    frames_rgb = [frames_rgb[i] for i in keep_idx]
+                    frame_sharpness = [frame_sharpness[i] for i in keep_idx]
+                    if imu_poses is not None:
+                        imu_poses = [imu_poses[i] for i in keep_idx]
+                    if frame_timestamps_ns is not None:
+                        frame_timestamps_ns = [frame_timestamps_ns[i] for i in keep_idx]
+
             # ── Step 1: depth estimation ──────────────────────────────────────
             active_estimator = self.estimator
             _t0 = time.perf_counter()
@@ -861,10 +1102,14 @@ class ScanSession:
                 depth_frames = [active_estimator.estimate(f) for f in frames_rgb]
             infer_ms = (time.perf_counter() - _t0) * 1000
             _estimator_device = getattr(active_estimator, "device", "unknown")
-            print(
-                f"[timing] depth estimation ({len(frames_rgb)} frames, "
-                f"{type(active_estimator).__name__}, device={_estimator_device}): {infer_ms:.1f} ms"
-            )
+            if walking_lite:
+                # Debug prints trimmed to walking/guiding only — confirmed
+                # with the user; scan mode's own console output was getting
+                # too noisy to read through during live debugging.
+                print(
+                    f"[timing] depth estimation ({len(frames_rgb)} frames, "
+                    f"{type(active_estimator).__name__}, device={_estimator_device}): {infer_ms:.1f} ms"
+                )
 
             # Cache intrinsics from first available depth frame
             if self._camera_K is None:
@@ -881,6 +1126,7 @@ class ScanSession:
                     f"connected client — falling back to VO."
                 )
                 use_rtabmap_pose = False
+            self._session_uses_rtabmap = use_rtabmap_pose
 
             # Per-frame (trustworthy, frac_bad, n_checked) from FeatureTracker's
             # independent depth-consistency check — see feature_tracker.py's
@@ -895,6 +1141,13 @@ class ScanSession:
             # cloud for this list to gate directly. Gets overwritten with real
             # per-frame results in the imu_poses/VO branches below.
             depth_checks: list = [(True, None, 0)] * len(frames_rgb)
+
+            # Per-frame (accepted, sharpness) from the novelty+blur gate (see
+            # orb_novelty_gate.py) — populated per pose-source branch below,
+            # aligned with frames_rgb order. Consumed by Step 3 to gate cloud/
+            # TSDF fusion, frame-store admission, and VLM tagging (all three
+            # from one decision, computed once per frame — see Step 3).
+            novelty_flags: list = []
 
             if use_rtabmap_pose:
                 # RTAB-Map's own odometry+map/pose-graph is continuous for the
@@ -928,16 +1181,90 @@ class ScanSession:
                 # any) each frame became, via TrackedFrame.node_id (see
                 # rtabmap_server.cc), and veto pulling that node's geometry
                 # later in _rtabmap_process_nodes().
-                for rgb, df, t in zip(frames_rgb, depth_frames, tracked):
+                for _i, (rgb, df, t) in enumerate(zip(frames_rgb, depth_frames, tracked)):
                     self.tracker.track(rgb, df.depth_map, df.intrinsics)
+                    # Populated here (previously left at the hardcoded "trustworthy"
+                    # default above) so walking_lite's local back-projection path
+                    # below can gate on the SAME per-frame depth-consistency check
+                    # IMU+VO/VO already use, instead of trusting every frame blindly.
+                    depth_checks[_i] = (
+                        self.tracker.last_depth_trustworthy,
+                        self.tracker.last_depth_agree_err,
+                        self.tracker.last_depth_agree_n,
+                    )
+                    if t.node_id >= 0:
+                        err = self.tracker.last_depth_agree_err
+                        self._rtabmap_node_confidence[t.node_id] = 1.0 - err if err is not None else 1.0
                     if not self.tracker.last_depth_trustworthy and t.node_id >= 0:
+                        # State only, no print — this is scan-only-meaningful
+                        # bookkeeping (only _rtabmap_process_nodes/get_cloud
+                        # ever reads _rtabmap_untrusted_node_ids, and that
+                        # path is skipped entirely for walking_lite), trimmed
+                        # from console output per the walking-only debug
+                        # log policy above.
                         self._rtabmap_untrusted_node_ids.add(t.node_id)
-                        print(
-                            f"[depth-consistency] RTAB-Map node {t.node_id} flagged "
-                            f"untrustworthy (frac_bad={self.tracker.last_depth_agree_err:.2f}, "
-                            f"n={self.tracker.last_depth_agree_n}); its geometry will be "
-                            f"skipped when pulled via get_cloud()."
+
+                    # Novelty+blur gate (RTAB-Map branch): reuses RTAB-Map's
+                    # OWN already-computed frame-to-map registration
+                    # inlier_fraction (rtabmap_server.cc/rtabmap_client.py) as
+                    # the novelty signal, instead of a redundant Python-side
+                    # ORB pass — see orb_novelty_gate.py's module docstring
+                    # for why new_node_id isn't used for this instead. No
+                    # RTAB-Map-native equivalent of min_new_count exists (the
+                    # wire only carries a ratio, not a raw match count) — the
+                    # threshold itself is passed as new_count so that check
+                    # is a deliberate no-op for this branch (see CLAUDE.md).
+                    sharpness = (
+                        frame_sharpness[_i] if frame_sharpness[_i] is not None
+                        else _sharpness_score(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY))
+                    )
+                    if t.pose is None:
+                        accepted = False  # tracking lost — can't judge novelty this frame
+                        reject_reason = "RTAB-Map tracking lost this frame"
+                    elif walking_lite:
+                        # Walking/guiding never discover landmarks or persist
+                        # geometry the way a scan pass does (walking_lite
+                        # already skips VLM tagging/get_cloud entirely — see
+                        # this method's own docstring) — "is this view novel
+                        # compared to earlier ones" is a scan-only question,
+                        # since there's no frame store/reconstruction here for
+                        # novelty to protect against re-covering. Blur
+                        # filtering is disabled live-path-wide (self._min_sharpness
+                        # stays at DEFAULT_MIN_SHARPNESS=0.0, confirmed with
+                        # the user — see mapping_servicer.py's UpdateMapping),
+                        # so this reduces to "accept whenever RTAB-Map
+                        # actually produced a pose" — the `<= 0` branch is
+                        # what makes that true; still respects a future
+                        # nonzero threshold if configure_novelty_gate() is
+                        # ever called again.
+                        accepted = self._min_sharpness <= 0 or sharpness >= self._min_sharpness
+                        self._rtabmap_last_accepted_pose = t.pose
+                        reject_reason = (
+                            "" if accepted
+                            else f"too blurry (sharpness={sharpness:.0f} < min_sharpness={self._min_sharpness:.0f})"
                         )
+                    else:
+                        new_fraction = 1.0 - t.inlier_fraction
+                        if self._rtabmap_last_accepted_pose is None:
+                            rotation_deg, best_match_inliers = 0.0, 0
+                        else:
+                            R_delta = self._rtabmap_last_accepted_pose[:3, :3].T @ t.pose[:3, :3]
+                            rotation_deg, best_match_inliers = _rotation_deg(R_delta), 1
+                        accepted = decide_accept(
+                            new_fraction, self._min_new_count, best_match_inliers, rotation_deg,
+                            sharpness, self._min_new_fraction, self._min_new_count,
+                            self._min_rotation_deg, self._min_sharpness,
+                        )
+                        if accepted:
+                            self._rtabmap_last_accepted_pose = t.pose
+                            reject_reason = ""
+                        elif new_fraction < self._min_new_fraction:
+                            reject_reason = f"not novel enough (new_fraction={new_fraction:.2f} < {self._min_new_fraction:.2f})"
+                        elif best_match_inliers and rotation_deg < self._min_rotation_deg:
+                            reject_reason = f"insufficient rotation ({rotation_deg:.1f}° < {self._min_rotation_deg:.1f}°)"
+                        else:
+                            reject_reason = f"too blurry (sharpness={sharpness:.0f} < min_sharpness={self._min_sharpness:.0f})"
+                    novelty_flags.append((accepted, sharpness, reject_reason))
                 raw_poses = []
                 for t in tracked:
                     p = t.pose
@@ -967,6 +1294,7 @@ class ScanSession:
                         self.tracker.last_depth_agree_err,
                         self.tracker.last_depth_agree_n,
                     ))
+                    novelty_flags.append(self._evaluate_novelty(rgb))
                     # Replace VO rotation with IMU rotation, keep VO translation
                     fused = tracker_pose.copy()
                     fused[:3, :3] = imu_pose[:3, :3]
@@ -987,6 +1315,7 @@ class ScanSession:
                         self.tracker.last_depth_agree_err,
                         self.tracker.last_depth_agree_n,
                     ))
+                    novelty_flags.append(self._evaluate_novelty(rgb))
 
                     if df.camera_pose is not None:
                         if _da3_vo_anchor is None:
@@ -1046,7 +1375,8 @@ class ScanSession:
                 "RTAB-Map" if use_rtabmap_pose
                 else "IMU+VO" if imu_poses is not None else "VO"
             )
-            print(f"[timing] pose computation ({len(frames_rgb)} frames, {_pose_src_label}): {_pose_ms:.1f} ms")
+            if walking_lite:
+                print(f"[timing] pose computation ({len(frames_rgb)} frames, {_pose_src_label}): {_pose_ms:.1f} ms")
 
             # World-space output remap (see process_frames_batch docstring) —
             # applied after all pose sources/anchoring above, before anything
@@ -1059,9 +1389,10 @@ class ScanSession:
             # reconstructed surface is pulled separately below (Step 3b, via
             # rtabmap_client.get_cloud()), sourced from RTAB-Map's own
             # cloudRGBFromSensorData + its CURRENT graph-corrected poses
-            # rather than this project's DA3-depth back-projection. Semantic
-            # landmark extraction below still runs for every pose source —
-            # it's independent of which cloud-reconstruction path is active.
+            # rather than this project's DA3-depth back-projection. Frame-
+            # store admission + VLM tagging below still run for every pose
+            # source — independent of which cloud-reconstruction path is
+            # active (see StoredFrame/SemanticMapper.tag_landmarks_batch).
             new_cloud = o3d.geometry.PointCloud()
             _bp_counts = []
             _t0_bp = time.perf_counter()
@@ -1071,10 +1402,22 @@ class ScanSession:
                 else [None] * len(frames_rgb)
             )
             _n_depth_rejected = 0
-            for rgb, df, pose, ts_ns, depth_check in zip(
-                frames_rgb, depth_frames, raw_poses, _ts_slice, depth_checks
+            _n_novelty_rejected = 0
+            for rgb, df, pose, ts_ns, depth_check, novelty_flag in zip(
+                frames_rgb, depth_frames, raw_poses, _ts_slice, depth_checks, novelty_flags
             ):
-                if not use_rtabmap_pose:
+                accepted, sharpness, reject_reason = novelty_flag
+                if not accepted:
+                    _n_novelty_rejected += 1
+
+                # Local back-projection: normally IMU+VO/VO only — RTAB-Map mode's
+                # own server-side reconstruction (Step 3b below) replaces this. But
+                # walking_lite explicitly wants OUT of that heavier path (get_cloud/
+                # SOR/server-side-voxelize measured 15s+/12s+ on a real session) and
+                # back-projects locally here too, same as IMU+VO/VO, using RTAB-Map's
+                # pose (still authoritative) + this frame's own already-computed DA3
+                # depth. See process_frames_batch's walking_lite docstring note.
+                if not use_rtabmap_pose or walking_lite:
                     trustworthy, agree_err, agree_n = depth_check
                     if not trustworthy:
                         _bp_counts.append(0)
@@ -1085,6 +1428,12 @@ class ScanSession:
                             f"(frac_bad={agree_err:.2f}, n={agree_n}, "
                             f"thresh={self.tracker._depth_frac_bad_thresh:.2f}); "
                             f"not fused into map (pose/semantic extraction unaffected)."
+                        )
+                    elif not accepted:
+                        _bp_counts.append(0)
+                        print(
+                            f"[novelty-blur] frame REJECTED — {reject_reason}; "
+                            f"not fused into map (pose unaffected)."
                         )
                     else:
                         result = _back_project_frame(rgb, df, pose, max_depth=10.0)
@@ -1098,35 +1447,72 @@ class ScanSession:
                             pcd.colors = o3d.utility.Vector3dVector(cols)
                             new_cloud += pcd
 
-                # Semantic landmark extraction — every raw frame is offered to
-                # the mapper, which internally keeps only the sharpest frame
-                # per ~1s window of actual capture time (SemanticMapper.consider_frame).
-                if self.semantic_mapper is not None and self._current_area_name:
+                        # TSDF fusion (denoised Live Points/PLY) — non-RTAB-Map
+                        # sessions only, unchanged reasoning (see __init__'s
+                        # _tsdf_volume comment: RTAB-Map's own reconstruction
+                        # already gets corrected on loop closure, a client-side
+                        # TSDF integrated at pose-at-time would reintroduce that
+                        # staleness). walking_lite doesn't pull get_cloud() at
+                        # all, but has no need for PLY-quality denoising either
+                        # — a live occupancy grid tolerates raw back-projected
+                        # points fine (occupancy_map.py's Bayesian scheme is
+                        # explicitly self-correcting), so this stays off for it too.
+                        if not use_rtabmap_pose:
+                            h_f, w_f = df.depth_map.shape[:2]
+                            K_f = df.intrinsics if df.intrinsics is not None else _estimate_K(h_f, w_f)
+                            intrinsic = o3d.camera.PinholeCameraIntrinsic(
+                                w_f, h_f, float(K_f[0, 0]), float(K_f[1, 1]),
+                                float(K_f[0, 2]), float(K_f[1, 2]),
+                            )
+                            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                                o3d.geometry.Image(np.ascontiguousarray(rgb)),
+                                o3d.geometry.Image(np.ascontiguousarray(df.depth_map, dtype=np.float32)),
+                                depth_scale=1.0, depth_trunc=10.0,
+                                convert_rgb_to_intensity=False,
+                            )
+                            self._tsdf_volume.integrate(rgbd, intrinsic, np.linalg.inv(pose))
+                            self._tsdf_integrated_count += 1
+
+                # Frame store + VLM tagging — only novelty+blur-gated frames
+                # are kept/tagged (see StoredFrame's docstring and module
+                # docstrings on semantic_mapper.py/orb_novelty_gate.py for
+                # why GroundingDINO/backprojection is fully deferred now,
+                # not run here). No dependency on use_rtabmap_pose — this
+                # runs for every pose source identically. walking_lite is the
+                # one exception: semantic tagging is an explicit-scan-only
+                # concept now (see CLAUDE.md's walking-mode note) — walking/
+                # guiding rely on FindLandmark's persisted-snapshot fallback
+                # for whatever a prior scan already tagged, rather than
+                # re-discovering landmarks live.
+                if accepted and self.semantic_mapper is not None and not walking_lite:
                     K_eff = (
                         df.intrinsics if df.intrinsics is not None
                         else _estimate_K(*rgb.shape[:2])
                     )
-                    try:
-                        new_lms = self.semantic_mapper.consider_frame(
-                            frame_bgr=cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                    frame_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    ok, jpeg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if ok:
+                        stored = StoredFrame(
+                            jpeg_bytes=jpeg.tobytes(),
                             depth_map=df.depth_map,
                             world_pose=pose,
                             K=K_eff,
-                            zone_type=self.zone_type,
-                            area_name=self._current_area_name,
                             frame_idx=self._frame_count,
                             timestamp_ns=int(ts_ns) if ts_ns is not None else None,
                         )
-                        self._raw_landmarks.extend(new_lms)
-                    except Exception as _sem_err:
-                        print(f"[ScanSession] Semantic extraction error: {_sem_err}")
+                        self._frame_store.append(stored)
+                        self._tag_pending.append(stored)
+                        if len(self._tag_pending) >= SemanticMapper.IMAGES_PER_PROMPT:
+                            self._flush_tag_pending()
 
             _bp_ms = (time.perf_counter() - _t0_bp) * 1000
-            print(
-                f"[timing] back-projection + semantic extraction "
-                f"({len(frames_rgb)} frames, {sum(_bp_counts):,} raw pts, "
-                f"{_n_depth_rejected} depth-rejected): {_bp_ms:.1f} ms"
-            )
+            if walking_lite:
+                print(
+                    f"[timing] back-projection + frame-store tagging "
+                    f"({len(frames_rgb)} frames, {sum(_bp_counts):,} raw pts, "
+                    f"{_n_depth_rejected} depth-rejected, {_n_novelty_rejected} "
+                    f"novelty/blur-rejected): {_bp_ms:.1f} ms"
+                )
 
             self.last_pose_source = (
                 "RTAB-Map" if use_rtabmap_pose
@@ -1146,7 +1532,12 @@ class ScanSession:
             # differently, one node at a time so the Occupancy Map's ray
             # casting keeps its "one representative camera position per call"
             # invariant (see occupancy_map.py's sunburst-artifact note).
-            if use_rtabmap_pose and self.rtabmap_client is not None:
+            # Skipped entirely for walking_lite — Step 3 above already fed the
+            # occupancy map via local back-projection, and this pull (get_cloud
+            # + SOR + server-side voxelize) is the single most expensive part
+            # of a batch for exactly the quality (clean, persisted, loop-
+            # closure-correctable reconstruction) walking/guiding don't need.
+            if use_rtabmap_pose and self.rtabmap_client is not None and not walking_lite:
                 if self.last_rtabmap_loop_closure:
                     with timed("RTAB-Map full resync (get_cloud since=0)"):
                         self._rtabmap_full_resync(sor_nb_neighbors, sor_std_ratio, occupancy_voxel_size)
@@ -1204,8 +1595,17 @@ class ScanSession:
                     new_cloud_clean, voxel_size=occupancy_voxel_size, max_voxels=_NO_COARSEN_MAX_VOXELS
                 )
                 if len(occ_centers) > 0:
+                    # Batch-level depth confidence (see occupancy_map.py's
+                    # update() docstring) — mean of (1 - frac_bad) across
+                    # this batch's own frames (depth_checks, from Step 2),
+                    # skipping frames that couldn't be checked (too few PnP
+                    # inliers) rather than penalizing missing data. Defaults
+                    # to full confidence if NO frame had a usable check.
+                    _confs = [1.0 - fb for (_, fb, _) in depth_checks if fb is not None]
+                    batch_confidence = sum(_confs) / len(_confs) if _confs else 1.0
+                    self.last_batch_confidence = batch_confidence
                     with timed(f"occupancy_map.update ({len(occ_centers)} voxel centers)"):
-                        self.occupancy_map.update(traj, occ_centers)
+                        self.occupancy_map.update(traj, occ_centers, confidence=batch_confidence)
                     self._merge_voxels(occ_centers, occ_colors, occ_vsize)
 
             self.last_frames_rgb = list(frames_rgb)
@@ -1269,39 +1669,72 @@ class ScanSession:
         if not nodes:
             return
 
-        raw_clouds: List[o3d.geometry.PointCloud] = []
+        # Split into nodes whose SOR keep-mask is already cached (from an
+        # earlier pull of this same node_id — see self._rtabmap_sor_keep_
+        # mask's field comment for why a pose-only change never invalidates
+        # it) vs nodes that need SOR computed fresh. Only the latter pay the
+        # SOR cost; a full resync of a mostly-already-seen map is the common
+        # case this optimizes (measured: ~7.8s -> near-zero for an all-cached
+        # resync).
+        cleaned_by_id: Dict[int, o3d.geometry.PointCloud] = {}
+        uncached_nodes = []
         for node in nodes:
-            c = o3d.geometry.PointCloud()
-            if len(node.points) > 0:
-                c.points = o3d.utility.Vector3dVector(node.points.astype(np.float64))
-                c.colors = o3d.utility.Vector3dVector(node.colors.astype(np.float64) / 255.0)
-            raw_clouds.append(c)
-
-        sizes = [len(c.points) for c in raw_clouds]
-        total = sum(sizes)
-        if total > sor_nb_neighbors:
-            with timed(f"RTAB-Map batched cloud concat ({total} pts, {len(nodes)} nodes)"):
-                combined = o3d.geometry.PointCloud()
-                for c in raw_clouds:
-                    combined += c
-            _, keep_mask = _remove_statistical_outlier_accel_masked(
-                combined, sor_nb_neighbors, sor_std_ratio
-            )
-            combined_pts = np.asarray(combined.points)
-            combined_cols = np.asarray(combined.colors)
-            cleaned_clouds = []
-            offset = 0
-            for size in sizes:
-                node_mask = keep_mask[offset:offset + size]
-                offset += size
+            cached_mask = self._rtabmap_sor_keep_mask.get(node.node_id)
+            if cached_mask is not None and len(cached_mask) == len(node.points):
                 nc = o3d.geometry.PointCloud()
-                if node_mask.any():
-                    seg = slice(offset - size, offset)
-                    nc.points = o3d.utility.Vector3dVector(combined_pts[seg][node_mask])
-                    nc.colors = o3d.utility.Vector3dVector(combined_cols[seg][node_mask])
-                cleaned_clouds.append(nc)
-        else:
-            cleaned_clouds = raw_clouds
+                if cached_mask.any():
+                    nc.points = o3d.utility.Vector3dVector(
+                        node.points[cached_mask].astype(np.float64)
+                    )
+                    nc.colors = o3d.utility.Vector3dVector(
+                        node.colors[cached_mask].astype(np.float64) / 255.0
+                    )
+                cleaned_by_id[node.node_id] = nc
+            else:
+                uncached_nodes.append(node)
+
+        if uncached_nodes:
+            raw_clouds: List[o3d.geometry.PointCloud] = []
+            for node in uncached_nodes:
+                c = o3d.geometry.PointCloud()
+                if len(node.points) > 0:
+                    c.points = o3d.utility.Vector3dVector(node.points.astype(np.float64))
+                    c.colors = o3d.utility.Vector3dVector(node.colors.astype(np.float64) / 255.0)
+                raw_clouds.append(c)
+
+            sizes = [len(c.points) for c in raw_clouds]
+            total = sum(sizes)
+            if total > sor_nb_neighbors:
+                with timed(f"RTAB-Map batched cloud concat ({total} pts, {len(uncached_nodes)} nodes)"):
+                    combined = o3d.geometry.PointCloud()
+                    for c in raw_clouds:
+                        combined += c
+                _, keep_mask = _remove_statistical_outlier_accel_masked(
+                    combined, sor_nb_neighbors, sor_std_ratio
+                )
+                combined_pts = np.asarray(combined.points)
+                combined_cols = np.asarray(combined.colors)
+                offset = 0
+                for node, size in zip(uncached_nodes, sizes):
+                    node_mask = keep_mask[offset:offset + size]
+                    offset += size
+                    self._rtabmap_sor_keep_mask[node.node_id] = node_mask
+                    nc = o3d.geometry.PointCloud()
+                    if node_mask.any():
+                        seg = slice(offset - size, offset)
+                        nc.points = o3d.utility.Vector3dVector(combined_pts[seg][node_mask])
+                        nc.colors = o3d.utility.Vector3dVector(combined_cols[seg][node_mask])
+                    cleaned_by_id[node.node_id] = nc
+            else:
+                # Too few points for SOR to be meaningful — keep as-is, and
+                # still cache an all-True mask so a later resync of this
+                # same node (once it's part of a large-enough batch) is
+                # consistent rather than silently re-deciding differently.
+                for node, c in zip(uncached_nodes, raw_clouds):
+                    self._rtabmap_sor_keep_mask[node.node_id] = np.ones(len(node.points), dtype=bool)
+                    cleaned_by_id[node.node_id] = c
+
+        cleaned_clouds = [cleaned_by_id[node.node_id] for node in nodes]
 
         _voxelize_ms = 0.0
         _occ_update_ms = 0.0
@@ -1317,7 +1750,9 @@ class ScanSession:
                 _voxelize_ms += (time.perf_counter() - _t0) * 1000
                 if len(occ_centers) > 0:
                     _t0 = time.perf_counter()
-                    self.occupancy_map.update(traj, occ_centers)
+                    node_confidence = self._rtabmap_node_confidence.get(node.node_id, 1.0)
+                    self.last_batch_confidence = node_confidence
+                    self.occupancy_map.update(traj, occ_centers, confidence=node_confidence)
                     _occ_update_ms += (time.perf_counter() - _t0) * 1000
                     self._merge_voxels(occ_centers, occ_colors, occ_vsize)
         print(
@@ -1419,14 +1854,23 @@ class ScanSession:
 
     def ensure_cloud_built(self) -> o3d.geometry.PointCloud:
         """
-        Lazily merge every batch's already-cleaned (voxelized + outlier-
-        removed, see process_frames_batch's Step 3) point cloud into
-        self._cloud. Historically only called on demand (Reload on the Live
-        Points tab, Voxelize, Export, finalize_voxel_and_occupancy); now also
-        called once per processed chunk during Scan/Simulated Live Stream
-        when the "Live Points" GUI checkbox is on (see scan_gui.py), so this
-        needs to stay cheap on repeat calls with only a little new data each
-        time — see self._merged_batch_count's field comment for how.
+        For non-RTAB-Map sessions with any TSDF-integrated frames: returns
+        the TSDF-fused cloud (self._tsdf_volume.extract_point_cloud()),
+        re-extracted only when new frames were integrated since the last
+        call (self._tsdf_extracted_at_count) — denoised vs. the raw
+        first-observation-wins accumulation below, see __init__'s
+        _tsdf_volume comment for why. RTAB-Map sessions (no TSDF volume
+        populated — see that comment) fall through to the original path.
+
+        Original path — lazily merge every batch's already-cleaned
+        (voxelized + outlier-removed, see process_frames_batch's Step 3)
+        point cloud into self._cloud. Historically only called on demand
+        (Reload on the Live Points tab, Voxelize, Export,
+        finalize_voxel_and_occupancy); now also called once per processed
+        chunk during Scan/Simulated Live Stream when the "Live Points" GUI
+        checkbox is on (see scan_gui.py), so this needs to stay cheap on
+        repeat calls with only a little new data each time — see
+        self._merged_batch_count's field comment for how.
 
         Each batch was already voxel-downsampled + outlier-removed at batch
         time, so this just needs one more voxel pass to merge adjacent
@@ -1435,9 +1879,17 @@ class ScanSession:
         still O(current total accumulated size) every call — Open3D has no
         incremental voxel-merge primitive, so this can't be made fully O(new
         data) — the GUI checkbox is the actual cost control for a large scan,
-        not this method.
+        not this method. (TSDF extraction has the same O(total volume size)
+        per-call cost, for the same reason — no incremental extraction
+        primitive either.)
         """
         with self._lock:
+            if not self._session_uses_rtabmap and self._tsdf_integrated_count > 0:
+                if self._tsdf_extracted_at_count != self._tsdf_integrated_count:
+                    self._tsdf_cloud_cache = self._tsdf_volume.extract_point_cloud()
+                    self._tsdf_extracted_at_count = self._tsdf_integrated_count
+                return self._tsdf_cloud_cache
+
             new_batches = self._raw_cloud_batches[self._merged_batch_count:]
             if not new_batches:
                 return self._cloud
@@ -1486,6 +1938,14 @@ class ScanSession:
             self._raw_point_count = 0
             self._merged_batch_count = 0
             self._cloud_raw_accum = o3d.geometry.PointCloud()
+            self._tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
+                voxel_length=VOXEL_SIZE, sdf_trunc=VOXEL_SIZE * 4,
+                color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+            )
+            self._tsdf_integrated_count = 0
+            self._tsdf_cloud_cache = None
+            self._tsdf_extracted_at_count = -1
+            self._session_uses_rtabmap = False
             self.pose_graph = PoseGraph()
             self.occupancy_map = OccupancyMap(resolution=0.05, **self._occupancy_params)
             self.tracker.reset()
@@ -1502,8 +1962,14 @@ class ScanSession:
             self._rtabmap_last_pose = None
             self._rtabmap_last_pulled_node_id = 0
             self._rtabmap_untrusted_node_ids = set()
+            self._rtabmap_sor_keep_mask = {}
+            self._rtabmap_node_confidence = {}
             self.last_rtabmap_loop_closure = False
             self._raw_landmarks = []
+            self.novelty_gate = OrbNoveltyGate(**self._gate_ctor_kwargs())
+            self._frame_store = []
+            self._tag_pending = []
+            self._rtabmap_last_accepted_pose = None
         if self.rtabmap_client is not None:
             self.rtabmap_client.reset()
         print(f"[ScanSession:{self.location_id}] Cloud cleared.")
@@ -1519,6 +1985,31 @@ class ScanSession:
         """
         self._occupancy_params.update({k: v for k, v in kwargs.items() if v is not None})
         self.occupancy_map.set_params(**kwargs)
+
+    def configure_novelty_gate(self, **kwargs) -> None:
+        """
+        Apply new novelty/blur-gate tuning knobs (min_sharpness/
+        min_new_fraction/min_new_count/min_rotation_deg, plus OrbNoveltyGate
+        constructor knobs n_features/ratio/min_raw_matches/
+        ransac_threshold_px/use_gpu) and remember them for the next
+        reset_cloud()/fresh session, same pattern as configure_occupancy_map.
+
+        One real deviation from that pattern, worth noting: OpenCV gives no
+        way to reconfigure cv2.ORB_create's nfeatures post-construction, so
+        changing a constructor-relevant knob recreates self.novelty_gate —
+        which also discards its accumulated reference-frame set (unlike
+        OccupancyMap.set_params(), which mutates in place with no such side
+        effect).
+        """
+        clean = {k: v for k, v in kwargs.items() if v is not None}
+        self._novelty_params.update(clean)
+        self._min_sharpness = self._novelty_params.get("min_sharpness", self._min_sharpness)
+        self._min_new_fraction = self._novelty_params.get("min_new_fraction", self._min_new_fraction)
+        self._min_new_count = self._novelty_params.get("min_new_count", self._min_new_count)
+        self._min_rotation_deg = self._novelty_params.get("min_rotation_deg", self._min_rotation_deg)
+        ctor_keys = ("n_features", "ratio", "min_raw_matches", "ransac_threshold_px", "use_gpu")
+        if any(k in clean for k in ctor_keys):
+            self.novelty_gate = OrbNoveltyGate(**self._gate_ctor_kwargs())
 
     def set_label(self, label: str, radius: float = 1.5) -> Zone:
         """Creates a Zone AABB of the given radius around the current camera position."""
@@ -1553,10 +2044,104 @@ class ScanSession:
         print(f"[ScanSession:{self.location_id}] Zone '{label}' from path: {bbox_min} → {bbox_max}")
         return zone
 
+    def resolve_landmark(self, query: str) -> Optional[Landmark]:
+        """
+        Deferred landmark lookup — GroundingDINO only runs here, on demand,
+        never proactively during scanning (see StoredFrame's and
+        semantic_mapper.py's module docstrings for why). Tier 1: the first
+        stored frame whose VLM tag list already mentions `query`
+        (case-insensitive substring, either direction) — GroundingDINO runs
+        on just that ONE frame to get its box. Tier 2 (no tag hit, or the
+        tagged frame's GroundingDINO didn't confirm a box there): a
+        first-hit scan across every remaining stored frame, in order, until
+        one hits — this also covers objects the VLM never proactively
+        tagged (e.g. "water bottle"), since GroundingDINO is open-vocabulary.
+        Deliberately "first find wins," not "best confidence across all
+        frames" — cheap, and Tier 1 (the common case) costs exactly one
+        detection call. Returns None if nothing found, or if this session
+        has no semantic_mapper/frame store.
+        """
+        if self.semantic_mapper is None:
+            return None
+        query_norm = query.strip().lower()
+        if not query_norm:
+            return None
+        with self._lock:
+            ordered = list(self._frame_store)
+        if not ordered:
+            return None
+
+        tag_hit = next(
+            (sf for sf in ordered
+             if any(query_norm in t or t in query_norm for t in sf.landmark_tags)),
+            None,
+        )
+        if tag_hit is not None:
+            landmarks = self.semantic_mapper._detect_and_backproject(
+                tag_hit.decode_frame(), tag_hit.depth_map, tag_hit.world_pose, tag_hit.K,
+                query, tag_hit.frame_idx,
+            )
+            if landmarks:
+                return landmarks[0]
+            # VLM tagged it here but GroundingDINO didn't confirm a box on
+            # this exact frame — fall through to Tier 2 instead of giving up.
+
+        for sf in ordered:
+            if sf is tag_hit:
+                continue
+            landmarks = self.semantic_mapper._detect_and_backproject(
+                sf.decode_frame(), sf.depth_map, sf.world_pose, sf.K, query, sf.frame_idx,
+            )
+            if landmarks:
+                return landmarks[0]
+        return None
+
+    def _resolve_all_frame_store_landmarks(self) -> List[Landmark]:
+        """
+        Finalize-time export helper, shared by finalize_landmarks()/
+        finalize_landmarks_flat(): flushes any leftover partial VLM-tagging
+        batch, collects every unique tag seen across the session's frame
+        store (first-seen order), and resolves each one via
+        resolve_landmark() — replaces the old immediate-per-frame-
+        GroundingDINO accumulation with the same deferred pipeline used for
+        on-demand queries. One GroundingDINO call per UNIQUE TAG, not per
+        frame — cheaper than the old per-frame approach. A final
+        cluster_landmarks() pass catches near-duplicate resolutions from
+        synonym tags (e.g. "chair" vs "office chair" landing at nearly the
+        same spot). Must NOT be called while the caller already holds
+        self._lock — resolve_landmark() acquires it internally, and
+        threading.Lock() is not reentrant.
+        """
+        if self.semantic_mapper is None:
+            return []
+        with self._lock:
+            self._flush_tag_pending()
+            frame_store_snapshot = list(self._frame_store)
+        if not frame_store_snapshot:
+            return []
+
+        seen: set = set()
+        unique_tags: List[str] = []
+        for sf in frame_store_snapshot:
+            for t in sf.landmark_tags:
+                if t not in seen:
+                    seen.add(t)
+                    unique_tags.append(t)
+
+        resolved: List[Landmark] = []
+        for tag in unique_tags:
+            lm = self.resolve_landmark(tag)
+            if lm is not None:
+                resolved.append(lm)
+        if not resolved:
+            return []
+        return self.semantic_mapper.cluster_landmarks(resolved)
+
     def finalize_landmarks(self) -> None:
         """
-        Run once, at export time: globally merge every raw landmark accumulated
-        across the whole session (all segments/zones), then assign each merged
+        Run once, at export time: globally resolve every unique landmark tag
+        accumulated across the whole session's frame store (see
+        _resolve_all_frame_store_landmarks), then assign each merged
         Landmark to a Zone — first choice is whichever Zone's X-Z AABB
         footprint contains its centroid, but zone AABBs are built from the
         camera's walked path (+ a small margin, see set_label_from_positions)
@@ -1567,25 +2152,18 @@ class ScanSession:
         instead of dropping it as "unassigned" is what actually gets
         landmarks to show up in that common case.
         """
+        if self.semantic_mapper is None:
+            print(f"[ScanSession:{self.location_id}] finalize_landmarks: no semantic_mapper configured, skipping.")
+            return
+        merged = self._resolve_all_frame_store_landmarks()
         with self._lock:
-            if self.semantic_mapper is None:
-                print(f"[ScanSession:{self.location_id}] finalize_landmarks: no semantic_mapper configured, skipping.")
-                return
-            # Flush any partial batch (< IMAGES_PER_PROMPT frames) still
-            # buffered in the VLM-batching path — otherwise the last few
-            # sampled frames of the session are silently dropped.
-            flushed = self.semantic_mapper.flush()
-            if flushed:
-                print(f"[ScanSession:{self.location_id}] finalize_landmarks: flushed {len(flushed)} landmarks from a partial VLM batch.")
-                self._raw_landmarks.extend(flushed)
-            print(f"[ScanSession:{self.location_id}] finalize_landmarks: {len(self._raw_landmarks)} raw landmarks accumulated, {len(self.labeler.zones)} zones.")
+            print(f"[ScanSession:{self.location_id}] finalize_landmarks: {len(merged)} resolved landmarks, {len(self.labeler.zones)} zones.")
             for z in self.labeler.zones:
                 print(f"  zone '{z.label}': bbox_min={z.bbox_min} bbox_max={z.bbox_max}")
-            if not self._raw_landmarks:
-                print(f"[ScanSession:{self.location_id}] finalize_landmarks: no raw landmarks — nothing to assign. "
-                      f"(Check earlier logs for VLM/detector failures in extract_landmarks.)")
+            if not merged:
+                print(f"[ScanSession:{self.location_id}] finalize_landmarks: no landmarks resolved — nothing to assign. "
+                      f"(Check earlier logs for VLM/detector failures.)")
                 return
-            merged = self.semantic_mapper.cluster_landmarks(list(self._raw_landmarks))
             for zone in self.labeler.zones:
                 zone.landmarks = []
             contained, nearest_fallback, truly_unassigned = 0, 0, 0
@@ -1609,12 +2187,33 @@ class ScanSession:
                 else:
                     truly_unassigned += 1
                     print(f"  '{lm.name}' at ({lm.x:.2f}, {lm.z:.2f}) -> UNASSIGNED (no zones exist)")
-            self._raw_landmarks = []
             n_merged, n_zones = len(merged), len(self.labeler.zones)
         print(
             f"[ScanSession:{self.location_id}] finalize_landmarks: {n_merged} merged landmarks → "
             f"{n_zones} zones ({contained} contained, {nearest_fallback} nearest-fallback, {truly_unassigned} unassigned)"
         )
+
+    def finalize_landmarks_flat(self) -> List[Landmark]:
+        """
+        Zone-free counterpart to finalize_landmarks(), for MappingService
+        (server/services/mapping_servicer.py) — named zones/labels are being
+        dropped from the live-guiding architecture (see CLAUDE.md's
+        "Client-Orchestrated Live Session" section): navigation now targets
+        landmarks/functional objects directly, not zone containers, so
+        there's no AABB to assign a merged landmark into any more. Uses the
+        same _resolve_all_frame_store_landmarks() finalize-time resolution
+        finalize_landmarks() does, just returns the flat list instead of
+        bucketing it into self.labeler.zones.
+        """
+        if self.semantic_mapper is None:
+            print(f"[ScanSession:{self.location_id}] finalize_landmarks_flat: no semantic_mapper configured, skipping.")
+            return []
+        merged = self._resolve_all_frame_store_landmarks()
+        if not merged:
+            print(f"[ScanSession:{self.location_id}] finalize_landmarks_flat: no landmarks resolved.")
+        else:
+            print(f"[ScanSession:{self.location_id}] finalize_landmarks_flat: {len(merged)} merged landmarks.")
+        return merged
 
     def preview_landmarks(self) -> None:
         """
@@ -1717,6 +2316,9 @@ class ScanSessionManager:
         # Settings" accordion sticks across location switches, not just the
         # currently-open one. See configure_occupancy_defaults().
         self._occupancy_defaults: dict = {}
+        # Same pattern for the novelty+blur gate (ScanSession.
+        # configure_novelty_gate) — see configure_novelty_gate_defaults().
+        self._novelty_defaults: dict = {}
 
     @property
     def rtabmap_pose_available(self) -> bool:
@@ -1750,6 +2352,7 @@ class ScanSessionManager:
                     semantic_mapper=self._semantic_mapper,
                     zone_type=zone_type,
                     occupancy_params=self._occupancy_defaults,
+                    novelty_params=self._novelty_defaults,
                 )
             elif zone_type:
                 self._sessions[location_id].zone_type = zone_type
@@ -1771,3 +2374,16 @@ class ScanSessionManager:
             sessions = list(self._sessions.values())
         for session in sessions:
             session.configure_occupancy_map(**clean)
+
+    def configure_novelty_gate_defaults(self, **kwargs) -> None:
+        """
+        Remember these novelty+blur gate tuning knobs as the default for
+        every FUTURE session, and apply them immediately to every session
+        that already exists (in place — see ScanSession.configure_novelty_gate).
+        """
+        clean = {k: v for k, v in kwargs.items() if v is not None}
+        self._novelty_defaults.update(clean)
+        with self._lock:
+            sessions = list(self._sessions.values())
+        for session in sessions:
+            session.configure_novelty_gate(**clean)

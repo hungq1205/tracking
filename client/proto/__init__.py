@@ -1,1 +1,0 @@
-"""Generated gRPC and Protobuf message definitions."""

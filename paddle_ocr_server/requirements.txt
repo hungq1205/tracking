@@ -5,3 +5,4 @@ paddleocr[doc-parser]
 opencv-python-headless
 numpy
 python-multipart
+gradio

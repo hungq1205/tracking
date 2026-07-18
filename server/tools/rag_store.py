@@ -92,6 +92,14 @@ class RagStore:
 
     # ── public API ────────────────────────────────────────────────────────────
 
+    def embed_text(self, text: str) -> np.ndarray:
+        """Raw sentence-transformer encode with no storage/search — backs
+        PerceptionService.Embed for the Android client, which does its own
+        on-device vector storage/cosine search (see CLAUDE.md's
+        "Client-Orchestrated Live Session" section)."""
+        model = self._get_embedder()
+        return model.encode([text], show_progress_bar=False).astype(np.float32)[0]
+
     def add_text(self, label: str, text: str, source: str = "ocr") -> None:
         chunks = self._chunk_text(text)
         if not chunks:
@@ -210,6 +218,9 @@ class DummyRagStore:
     No-op RAG store that replicates RagStore interface but stores nothing and returns empty results.
     Useful for testing or when semantic search is disabled.
     """
+
+    def embed_text(self, text: str) -> np.ndarray:
+        return np.zeros(EMBED_DIM, dtype=np.float32)
 
     def add_text(self, label: str, text: str, source: str = "ocr") -> None:
         pass

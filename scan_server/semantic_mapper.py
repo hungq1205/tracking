@@ -1,26 +1,39 @@
 """
-SemanticMapper — VLM + GroundingDINO landmark extraction for offline scanning.
+SemanticMapper — VLM landmark tagging + deferred GroundingDINO backprojection.
+
+GroundingDINO detection (and therefore world (x,z) localization) no longer
+runs proactively per accepted frame during scanning — it's expensive and
+pointless for objects the user never asks about. Instead:
+  1. Accepted frames are batched (ScanSession owns the buffering now, keyed
+     off novelty+blur gating — see scan_session.py) and sent to the VLM via
+     tag_landmarks_batch(), which returns per-image landmark/object NAME
+     tags only (no boxes, no world coordinates).
+  2. GroundingDINO only runs later, on demand, via
+     _detect_and_backproject() — called from ScanSession.resolve_landmark()
+     when the user actually asks to navigate to something (tag-match first,
+     else a first-hit scan across stored frames — see scan_session.py) and
+     from ScanSession's finalize-time export path (once per unique tag seen
+     across a session's stored frames).
 
 Usage:
     from semantic_mapper import SemanticMapper, Landmark
 
     mapper = SemanticMapper(vlm_client, grounding_dino_detector)
-    raw = mapper.extract_landmarks(frame_bgr, depth_map, world_pose, K,
-                                   zone_type="hospital", area_name="lobby",
-                                   frame_idx=42)
-    clustered = mapper.cluster_landmarks(raw)
+    tag_lists = mapper.tag_landmarks_batch([frame_bgr_1, frame_bgr_2, ...])
+    # ... later, on demand ...
+    landmarks = mapper._detect_and_backproject(frame_bgr, depth_map, world_pose,
+                                               K, "water bottle", frame_idx=7)
+    clustered = mapper.cluster_landmarks(all_resolved_landmarks)
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import cv2
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -89,45 +102,35 @@ def _merge_landmark_group(members: List[Landmark]) -> Landmark:
     )
 
 
-_USER_PROMPT_TEMPLATE = """\
-Current zone: {zone_type}
-Current area: {area_name}
+_TAG_PROMPT_TEMPLATE = """\
+You are analyzing {n} images from a room/environment scan, numbered 1 to {n} in order.
 
-Analyze the image.
+For EACH image, list the distinct landmark/object names visible in it that would be \
+useful for indoor navigation or later finding a specific object (furniture, fixtures, \
+appliances, signage, containers, and other notable objects).
 
-The zone describes the type of environment. Select navigation-relevant landmarks \
-that are appropriate for this {area_clause} and visible in the image.
+Respond with EXACTLY {n} lines, one per image, in the same order as the images. Each \
+line must be a comma-separated list of short lowercase object names for that image \
+only — no numbering, no extra commentary, no markdown. If an image has no notable \
+objects, output an empty line for it.
 
-Examples:
-- Theater: stage, seat rows, aisle, exit door, vending machine, ticket counter, restroom sign
-- House: sofa, television, dining table, wardrobe, refrigerator, sink, door
-- Supermarket: checkout counter, shopping cart, produce aisle, beverage aisle, refrigerator, entrance, exit
-- Office: desk, meeting table, reception desk, elevator, staircase, printer
-- Hospital: reception desk, waiting chairs, elevator, nurse station, restroom, exit
+Example (for 3 images):
+chair, table, lamp
+door, shelf
 
-Output:
-{{ "zone": "{zone_type_val}", "area": "{area_name}", "grounding_dino_prompt": "<object1> . <object2> . <object3> . ..." }}
 """
 
 
 class SemanticMapper:
     """
-    Extracts semantic landmarks from single RGB-D frames using a VLM and GroundingDINO.
-
-    Typical call sequence per video segment:
-        1. For each sampled keyframe: extract_landmarks(...)  → List[Landmark]
-        2. After segment ends:        cluster_landmarks(all_raw) → List[Landmark]
+    Tags accepted frames with VLM-generated landmark/object names (batched,
+    no boxes/coordinates), and — only on demand — runs GroundingDINO +
+    backprojection to localize a specific query. See module docstring.
     """
 
-    SAMPLE_INTERVAL_S = 1.0      # pick the sharpest frame out of every ~1s of footage
-                                 # (by actual capture timestamp) to feed the VLM pipeline
-    SAMPLE_EVERY_N_FALLBACK = 5  # frame-count cadence used only when no capture
-                                 # timestamp is available (see consider_frame())
-    SHARPNESS_SCORING_MAX_DIM = 480  # downscale-before-scoring, same as CameraManager.kt
     OVERLAP_MERGE_RATIO = 0.5    # merge same-label footprints overlapping >= 50%
-    IMAGES_PER_PROMPT = 5        # sampled frames buffered per VLM call (multi-view context,
-                                 # shared grounding_dino_prompt) — net effect: one VLM call
-                                 # per SAMPLE_INTERVAL_S * IMAGES_PER_PROMPT ≈ 5s of footage.
+    IMAGES_PER_PROMPT = 5        # frames buffered per VLM tagging call (multi-view
+                                 # context) — buffering itself lives in ScanSession now.
 
     def __init__(self, vlm, detector) -> None:
         """
@@ -140,207 +143,67 @@ class SemanticMapper:
         # Debug snapshot of the most recently processed frame — surfaced by the
         # scan GUI's "Detections" tab so raw GroundingDINO boxes + the VLM
         # response can be inspected live, independent of the final Landmarks.
+        # Note: last_detections only updates now when _detect_and_backproject()
+        # actually runs (on-demand resolve_landmark()/finalize-time export),
+        # not on every accepted frame during scanning — see module docstring.
         self.last_frame_bgr: Optional[np.ndarray] = None
         self.last_detections: list = []
         self.last_vlm_response: str = ""
         self.last_error: Optional[str] = None
 
-        # Sampled frames awaiting a batched VLM call — see extract_landmarks().
-        self._pending: List[dict] = []
-
-        # Sharpest-frame-per-window accumulator — see consider_frame().
-        self._window_start_ns: Optional[int] = None
-        self._window_best: Optional[dict] = None
-        self._fallback_frame_count = 0
-
     # ── public ──────────────────────────────────────────────────────────────────
 
-    def consider_frame(
-        self,
-        frame_bgr: np.ndarray,
-        depth_map: np.ndarray,
-        world_pose: np.ndarray,
-        K: np.ndarray,
-        zone_type: str,
-        area_name: str,
-        frame_idx: int = 0,
-        timestamp_ns: Optional[int] = None,
-    ) -> List[Landmark]:
+    def tag_landmarks_batch(self, frames: List[np.ndarray]) -> List[List[str]]:
         """
-        Call on every raw frame (not pre-sampled) — internally keeps only the
-        sharpest frame (Variance-of-Laplacian, same metric as the Android
-        client's CameraManager.kt) seen within the current ~SAMPLE_INTERVAL_S
-        window of actual capture time, and forwards just that one frame into
-        the VLM-batching pipeline (extract_landmarks) once the window
-        elapses. This avoids baking a motion-blurred/rolling-shutter frame
-        into the semantic map just because it happened to land on a sampling
-        boundary.
-
-        Falls back to a fixed every-Nth-frame cadence (no sharpness scoring)
-        when timestamp_ns is None — i.e. a pose source that doesn't thread
-        frame_timestamps_ns through (see scan_session.py).
+        One VLM call across up to IMAGES_PER_PROMPT frames, asking for
+        per-image landmark/object NAME tags only — no GroundingDINO, no
+        boxes, no world coordinates (see module docstring for why that's
+        deferred). Returns one tag list per input frame, same order.
+        Stateless — the caller (ScanSession) owns buffering frames up to a
+        batch and mapping each result back onto its own stored frame.
         """
-        if timestamp_ns is None:
-            self._fallback_frame_count += 1
-            if self._fallback_frame_count % self.SAMPLE_EVERY_N_FALLBACK != 0:
-                return []
-            return self.extract_landmarks(
-                frame_bgr, depth_map, world_pose, K, zone_type, area_name, frame_idx
-            )
-
-        candidate = {
-            "frame_bgr": frame_bgr, "depth_map": depth_map, "world_pose": world_pose,
-            "K": K, "zone_type": zone_type, "area_name": area_name, "frame_idx": frame_idx,
-            "score": self._sharpness(frame_bgr),
-        }
-
-        if self._window_start_ns is None:
-            self._window_start_ns = timestamp_ns
-
-        landmarks: List[Landmark] = []
-        if (timestamp_ns - self._window_start_ns) / 1e9 >= self.SAMPLE_INTERVAL_S:
-            landmarks = self._forward_window_best()
-            self._window_start_ns = timestamp_ns
-
-        if self._window_best is None or candidate["score"] > self._window_best["score"]:
-            self._window_best = candidate
-
-        return landmarks
-
-    def extract_landmarks(
-        self,
-        frame_bgr: np.ndarray,
-        depth_map: np.ndarray,
-        world_pose: np.ndarray,
-        K: np.ndarray,
-        zone_type: str,
-        area_name: str,
-        frame_idx: int = 0,
-    ) -> List[Landmark]:
-        """
-        Buffers this frame; once IMAGES_PER_PROMPT frames are buffered, fires
-        ONE multi-image VLM call across all of them — one shared
-        grounding_dino_prompt from multi-view context instead of judging
-        landmarks off a single frame — then runs GroundingDINO + backprojection
-        per-frame as before (bounding boxes are inherently frame-specific).
-
-        Returns [] on every call except the one that fills the buffer, which
-        returns landmarks for the whole batch at once. Call flush() at
-        segment/session end so a partial leftover buffer isn't silently
-        dropped.
-
-        frame_bgr  : BGR numpy array (H×W×3 uint8)
-        depth_map  : float32 metric depth array (H×W), metres
-        world_pose : 4×4 float64 camera-to-world matrix
-        K          : 3×3 float64 camera intrinsics
-        """
-        self._pending.append({
-            "frame_bgr": frame_bgr,
-            "depth_map": depth_map,
-            "world_pose": world_pose,
-            "K": K,
-            "zone_type": zone_type,
-            "area_name": area_name,
-            "frame_idx": frame_idx,
-        })
-        if len(self._pending) < self.IMAGES_PER_PROMPT:
+        if not frames:
             return []
-        return self._process_pending()
+        n = len(frames)
+        prompt = _TAG_PROMPT_TEMPLATE.format(n=n)
 
-    def flush(self) -> List[Landmark]:
-        """Process a partial leftover buffer (fewer than IMAGES_PER_PROMPT
-        frames buffered), plus any not-yet-forwarded sharpest-in-window frame
-        — call at segment/session end."""
-        landmarks = self._forward_window_best()
-        if self._pending:
-            landmarks.extend(self._process_pending())
-        return landmarks
-
-    # ── private (windowing) ─────────────────────────────────────────────────────
-
-    def _forward_window_best(self) -> List[Landmark]:
-        best = self._window_best
-        self._window_best = None
-        if best is None:
-            return []
-        return self.extract_landmarks(
-            best["frame_bgr"], best["depth_map"], best["world_pose"], best["K"],
-            best["zone_type"], best["area_name"], best["frame_idx"],
-        )
-
-    @classmethod
-    def _sharpness(cls, frame_bgr: np.ndarray) -> float:
-        """Variance of the Laplacian — the standard fast blur metric (higher
-        = more in-focus detail). Scored on a downscaled copy since this runs
-        on every raw frame, not just the ones that end up kept."""
-        h, w = frame_bgr.shape[:2]
-        long_edge = max(h, w)
-        if long_edge > cls.SHARPNESS_SCORING_MAX_DIM:
-            scale = cls.SHARPNESS_SCORING_MAX_DIM / long_edge
-            small = cv2.resize(
-                frame_bgr, (max(1, int(w * scale)), max(1, int(h * scale))),
-                interpolation=cv2.INTER_AREA,
-            )
-        else:
-            small = frame_bgr
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-    # ── private ─────────────────────────────────────────────────────────────────
-
-    def _process_pending(self) -> List[Landmark]:
-        batch = self._pending
-        self._pending = []
-
-        # Use the most recent frame's zone/area context — a full batch
-        # normally sits entirely within one segment, so this only matters for
-        # a partial batch spanning a zone transition (rare, minor imprecision).
-        zone_type = batch[-1]["zone_type"]
-        area_name = batch[-1]["area_name"]
-        area_clause = (
-            f"{area_name} in the {zone_type}" if zone_type.strip() else area_name
-        )
-        prompt = _USER_PROMPT_TEMPLATE.format(
-            zone_type=zone_type or "",
-            area_name=area_name,
-            area_clause=area_clause,
-            zone_type_val=zone_type or "",
-        )
-
-        self.last_frame_bgr = batch[-1]["frame_bgr"]
-        self.last_detections = []
+        self.last_frame_bgr = frames[-1]
         self.last_error = None
 
-        frame_idxs = [item["frame_idx"] for item in batch]
-        print(f"[SemanticMapper] VLM call: {len(batch)} images, frames {frame_idxs}, "
-              f"zone='{zone_type}' area='{area_name}'")
         try:
-            vlm_response = self._vlm.query(
-                prompt, images=[item["frame_bgr"] for item in batch]
-            )
-            self.last_vlm_response = vlm_response
-            print(f"[SemanticMapper] VLM raw response: {vlm_response!r}")
-            dino_prompt = self._parse_vlm_response(vlm_response)
-            print(f"[SemanticMapper] Parsed grounding_dino_prompt: {dino_prompt!r}")
+            response = self._vlm.query(prompt, images=list(frames))
+            self.last_vlm_response = response
         except Exception as e:
-            print(f"[SemanticMapper] VLM call failed (frames {frame_idxs}): {e}")
+            print(f"[SemanticMapper] Tag batch VLM call failed ({n} images): {e}")
             self.last_error = f"VLM call failed: {e}"
-            return []
+            return [[] for _ in range(n)]
 
-        if not dino_prompt:
-            print(f"[SemanticMapper] Empty/unparseable grounding_dino_prompt for frames {frame_idxs} — "
-                  f"skipping detection for this batch. Raw response was: {vlm_response!r}")
-            self.last_error = "VLM response had no usable grounding_dino_prompt"
-            return []
+        tag_lists = self._parse_tag_response(response, n)
+        print(f"[SemanticMapper] Tag batch ({n} images): {tag_lists}")
+        return tag_lists
 
-        landmarks: List[Landmark] = []
-        for item in batch:
-            landmarks.extend(self._detect_and_backproject(
-                item["frame_bgr"], item["depth_map"], item["world_pose"], item["K"],
-                dino_prompt, item["frame_idx"],
-            ))
-        print(f"[SemanticMapper] Batch frames {frame_idxs}: {len(landmarks)} landmarks total.")
-        return landmarks
+    @staticmethod
+    def _parse_tag_response(response: str, n: int) -> List[List[str]]:
+        """Defensive parse: split on newlines, pad/truncate to exactly `n`
+        lines if the VLM didn't follow the requested format, then split each
+        line on commas. Never raises — worst case returns n empty lists."""
+        text = response.strip()
+        if text.startswith("```"):
+            text = "\n".join(
+                line for line in text.splitlines() if not line.startswith("```")
+            ).strip()
+
+        lines = text.split("\n") if text else []
+        if len(lines) < n:
+            lines = lines + [""] * (n - len(lines))
+        elif len(lines) > n:
+            print(f"[SemanticMapper] Tag response had {len(lines)} lines, expected {n} — truncating.")
+            lines = lines[:n]
+
+        return [
+            [t.strip().lower() for t in line.split(",") if t.strip()]
+            for line in lines
+        ]
 
     def _detect_and_backproject(
         self,
@@ -484,28 +347,3 @@ class SemanticMapper:
                 merged.append(_merge_landmark_group(members))
 
         return merged
-
-    # ── private ─────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _parse_vlm_response(response: str) -> str:
-        """
-        Extract grounding_dino_prompt from a VLM JSON response string.
-        Handles markdown code fences and extra whitespace. Returns "" on failure.
-        """
-        text = response.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()
-            text = "\n".join(
-                line for line in lines if not line.startswith("```")
-            ).strip()
-
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start == -1 or end == 0:
-            return ""
-        try:
-            data = json.loads(text[start:end])
-            return str(data.get("grounding_dino_prompt", "")).strip()
-        except json.JSONDecodeError:
-            return ""
