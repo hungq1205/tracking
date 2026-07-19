@@ -59,37 +59,23 @@ RUN pip install \
         typer==0.26.8 \
         pycolmap==4.1.0
 
+# Model weights live outside /app so /app can stay a clean git working
+# directory that entrypoint.sh clones/updates fresh on every container
+# start (no application code is copied into the image at build time at
+# all any more) — baked in here for a self-contained deployment (no host
+# volume mount needed at runtime just for the weights).
+ENV DA3_ONNX_PATH=/opt/models/DA3METRIC-LARGE.onnx
+COPY DA3METRIC-LARGE.onnx ${DA3_ONNX_PATH}
+
+ENV REPO_URL=https://github.com/hungq1205/tracking \
+    REPO_REF=vi-slam
+
 WORKDIR /app
 
-ARG REPO_URL=https://github.com/hungq1205/tracking
-ARG REPO_REF=vi-slam
-RUN git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" /tmp/tracking-src
-
-RUN mkdir -p /app/scan_server \
-    && cp -r /tmp/tracking-src/scan_server/Depth-Anything-3 /app/scan_server/Depth-Anything-3 \
-    && pip install --no-deps -e /app/scan_server/Depth-Anything-3
-
-RUN cp /tmp/tracking-src/scan_server/da3_wrapper.py \
-       /tmp/tracking-src/scan_server/scan_session.py \
-       /tmp/tracking-src/scan_server/stream_session.py \
-       /tmp/tracking-src/scan_server/rtabmap_client.py \
-       /tmp/tracking-src/scan_server/feature_tracker.py \
-       /tmp/tracking-src/scan_server/map_exporter.py \
-       /tmp/tracking-src/scan_server/occupancy_map.py \
-       /tmp/tracking-src/scan_server/orb_novelty_gate.py \
-       /tmp/tracking-src/scan_server/pose_graph.py \
-       /tmp/tracking-src/scan_server/semantic_mapper.py \
-       /tmp/tracking-src/scan_server/timing_utils.py \
-       /tmp/tracking-src/scan_server/zone_labeler.py \
-       /tmp/tracking-src/scan_server/gemma_vlm.py \
-       /app/scan_server/
-
-# ── server/ itself ──────────────────────────────────────────────────────
-RUN cp -r /tmp/tracking-src/server /app/server \
-    && rm -rf /tmp/tracking-src
-
-COPY DA3METRIC-LARGE.onnx /app/DA3METRIC-LARGE.onnx
+COPY server/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 EXPOSE 50051 7860
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "server/grpc_server.py"]

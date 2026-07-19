@@ -3169,11 +3169,28 @@ possible path on this particular machine).
 | Main server | 50051 + Gradio 7860 | `python server/grpc_server.py` — imports scan_server/ in-process for MappingService, no separate Scan server process any more |
 | RTAB-Map pose service (required) | 5556 (ZeroMQ, no ROS) | `docker compose up rtabmap` — see `scan_server/rtabmap_docker/README.md`; MappingService is disabled (logs and no-ops) without `RTABMAP_ADDR` set |
 
-Docker: `docker-compose up` (requires NVIDIA runtime; mounts model volume). The
-`rtabmap` service needs no per-device calibration (unlike the old `orbslam3`
-service it replaced) but still isn't brought up automatically by a bare
-`docker-compose up`-everything workflow — see
-`scan_server/rtabmap_docker/README.md` to build it.
+Docker: `docker build -f server/Dockerfile -t tracking-server .` (repo-root
+context — see `server/Dockerfile.dockerignore`). The image bakes in only
+the heavy, rarely-changing pieces (CUDA/Python/pip deps, `DA3METRIC-LARGE.onnx`
+at `DA3_ONNX_PATH=/opt/models/DA3METRIC-LARGE.onnx`) — **no application code
+is copied in at build time at all**. `server/entrypoint.sh` runs on every
+`docker run` instead: clones `${REPO_REF}` (default `vi-slam`) fresh into
+`/app` if it isn't already a checkout there, or `git fetch --depth 1` +
+`git reset --hard` to update it if it is (the `/app/.git` check supports
+both a fresh ephemeral container — always a clean clone — and a
+persistent-volume-mounted `/app` — incremental update), then `pip install
+--no-deps -e` the freshly-cloned `Depth-Anything-3` package before
+`exec`-ing the real `CMD`. This means rebuilding the image is only ever
+needed for a dependency change; a code change just needs `git push` +
+restarting the container. `docker-compose.yml`'s own `streaming-vlm-server`
+service is a **stale, unrelated leftover** (builds the root `Dockerfile`, a
+different Qwen-VLM setup with a Windows host path) — don't use it for the
+main server; build/run `server/Dockerfile` directly as above. The
+`rtabmap` service in that same compose file is current and fine (needs no
+per-device calibration, unlike the old `orbslam3` service it replaced) but
+still isn't brought up automatically by a bare `docker-compose up`
+everything-workflow — see `scan_server/rtabmap_docker/README.md` to build
+it, or `docker compose up rtabmap`.
 
 ### Development Environments
 
@@ -3186,7 +3203,8 @@ service it replaced) but still isn't brought up automatically by a bare
 Environment variables:
 - `GEMINI_API_KEY` — used server-side only by `MappingService`'s `SemanticMapper` (Gemma VLM landmark extraction); the Gemini Live API key itself is entered in the Android app's Settings screen and never touches the server
 - `RTABMAP_ADDR` — e.g. `tcp://localhost:5556` — **required** for `MappingService`; without it, `MappingService` registration is skipped entirely (logged, not fatal)
-- `DA3_ONNX_PATH` — ONNX weight path for `PerceptionService.AnalyzeFrame`'s `DEPTH` op, always `DA3DepthDetector` now (default `DA3METRIC-LARGE.onnx`) — uses the DA3-METRIC checkpoint's own `metric_depth` output directly, no separate scale-alignment step; `SparseObstacleDetector`/`StereoDepthDetector`/the DA3 torch backend were removed, so there's no longer a `DEPTH_MODEL` selector
+- `DA3_ONNX_PATH` — ONNX weight path for `PerceptionService.AnalyzeFrame`'s `DEPTH` op, always `DA3DepthDetector` now (default `DA3METRIC-LARGE.onnx`, or `/opt/models/DA3METRIC-LARGE.onnx` inside the Docker image — see Docker note above) — uses the DA3-METRIC checkpoint's own `metric_depth` output directly, no separate scale-alignment step; `SparseObstacleDetector`/`StereoDepthDetector`/the DA3 torch backend were removed, so there's no longer a `DEPTH_MODEL` selector
+- `REPO_URL`/`REPO_REF` — Docker-image-only (`server/entrypoint.sh`), default `https://github.com/hungq1205/tracking` / `vi-slam` — which repo/branch the container clones/updates `/app` from on every start; not read by `grpc_server.py` itself
 - `SCAN_DA3_TORCH_MODEL_ID` — DA3 torch model for `MappingService`'s live-mapping pipeline (default `depth-anything/DA3METRIC-LARGE`, monocular-metric — was `depth-anything/da3-large` until a live-debugging incident traced total RTAB-Map tracking failure to that non-metric default, see "DA3 model default + per-frame processing + pre-DA3 blur gate") — a separate subsystem (dense reconstruction depth, not obstacle checks), independent of `DA3_ONNX_PATH` above — see "Client-Orchestrated Live Session"
 - `SCAN_GEMMA_MODEL_ID` — Gemma model for `MappingService`'s landmark extraction via Gemini API (default `gemma-4-31b-it`); uses `GEMINI_API_KEY` above
 - `MEMORY_STORE_DIR` — on-disk dir for `RagStore`'s text-embedding storage (default `server/data/memory`)
