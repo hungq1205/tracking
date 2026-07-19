@@ -51,8 +51,8 @@ class MainActivity : ComponentActivity() {
                     composable("settings") {
                         SettingsScreen(
                             mainViewModel = mainViewModel,
-                            onConnect = { host, port, frameIntervalMs, scanIntervalMs, recentBufferMs, vadThreshold, startThreshold, apiKey, ocrUrl, locationId ->
-                                mainViewModel.connect(host, port, frameIntervalMs, scanIntervalMs, recentBufferMs, vadThreshold, startThreshold, apiKey, ocrUrl, locationId)
+                            onConnect = { host, port, frameIntervalMs, scanIntervalMs, recentBufferMs, avoidanceIntervalMs, vadThreshold, startThreshold, apiKey, ocrUrl, locationId ->
+                                mainViewModel.connect(host, port, frameIntervalMs, scanIntervalMs, recentBufferMs, avoidanceIntervalMs, vadThreshold, startThreshold, apiKey, ocrUrl, locationId)
                             },
                             onBack = { navController.popBackStack() }
                         )

@@ -31,9 +31,17 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
 
     // Rolling recent-frame buffer for tracking/reading/Q&A modes (see
     // CameraManager.kt) — separate from frameIntervalMs/scanIntervalMs
-    // above, which only govern mapping-mode (walking/guiding/scanning).
+    // above, which only govern mapping-mode (guiding/scanning).
     private val _recentBufferMs = MutableStateFlow(prefs.getInt("recent_buffer_ms", 100))
     val recentBufferMs: StateFlow<Int> = _recentBufferMs
+
+    // Local reactive HRTF obstacle-dodge tick rate (walking AND guiding —
+    // see ToolDispatcher.runAvoidanceTick()/CLAUDE.md's "Local reactive
+    // HRTF obstacle-dodge" note). Independent of frameIntervalMs above,
+    // which only governs guiding's separate, slower MappingService route
+    // stream — this is the faster, no-world-map reactive layer.
+    private val _avoidanceIntervalMs = MutableStateFlow(prefs.getInt("avoidance_interval_ms", 350))
+    val avoidanceIntervalMs: StateFlow<Int> = _avoidanceIntervalMs
 
     private val _vadThreshold = MutableStateFlow(
         java.lang.Float.intBitsToFloat(prefs.getInt("vad_threshold_bits", java.lang.Float.floatToIntBits(0.03f)))
@@ -67,6 +75,7 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     fun setFrameIntervalMs(ms: Int) { _frameIntervalMs.value = ms }
     fun setScanIntervalMs(ms: Int) { _scanIntervalMs.value = ms }
     fun setRecentBufferMs(ms: Int) { _recentBufferMs.value = ms }
+    fun setAvoidanceIntervalMs(ms: Int) { _avoidanceIntervalMs.value = ms }
     fun setVadThreshold(v: Float) { _vadThreshold.value = v }
     fun setStartThreshold(v: Float) { _startThreshold.value = v }
     fun setGeminiApiKey(key: String) { _geminiApiKey.value = key }
@@ -80,6 +89,7 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
             .putInt("frame_interval_ms", _frameIntervalMs.value)
             .putInt("scan_interval_ms", _scanIntervalMs.value)
             .putInt("recent_buffer_ms", _recentBufferMs.value)
+            .putInt("avoidance_interval_ms", _avoidanceIntervalMs.value)
             .putInt("vad_threshold_bits", java.lang.Float.floatToIntBits(_vadThreshold.value))
             .putInt("start_threshold_bits", java.lang.Float.floatToIntBits(_startThreshold.value))
             .putString("gemini_api_key", _geminiApiKey.value)

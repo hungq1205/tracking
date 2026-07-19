@@ -37,7 +37,6 @@ from scipy.spatial.transform import Rotation
 import tracking_pb2
 import tracking_pb2_grpc
 from stream_session import StreamingScanSession
-from services.beacon_preview import find_most_open_direction_world_point, project_world_point_to_pixel
 
 SNAPSHOT_FILENAME = "occupancy_snapshot.json"
 
@@ -98,18 +97,6 @@ class MappingServiceServicer(tracking_pb2_grpc.MappingServiceServicer):
         self.scan_manager = scan_manager
         self.maps_root_dir = maps_root_dir
         self.activity_monitor = activity_monitor
-        # Visualization-only caches for beacon_preview.py — see UpdateMapping.
-        # Guiding's destination world point is cached (not recomputed) since
-        # resolving it runs GroundingDINO (session.resolve_landmark) — never
-        # want a debug circle to trigger that on every grid update alongside
-        # the client's own real FindLandmark calls. Keyed by
-        # (location_id, destination query).
-        self._resolved_destinations: dict = {}
-        # Walking's open-direction point, recomputed only when the grid
-        # actually changes (same cost-avoidance reasoning, though cheaper);
-        # keyed by location_id, reused on non-grid-updated iterations so the
-        # preview doesn't just disappear between grid updates.
-        self._last_open_direction: dict = {}
         # (ix_lo, iz_lo, width, height) as of the last FULL grid sent per
         # location_id — see UpdateMapping's full-vs-delta decision. Absent
         # entry means "never sent a full grid this stream", forcing one.
@@ -206,7 +193,6 @@ class MappingServiceServicer(tracking_pb2_grpc.MappingServiceServicer):
                     # on this stream's very first update, when the client actually
                     # has no local grid at all yet and needs a full resync.
                     self._last_full_bounds.pop(location_id, None)
-                    self._last_open_direction.pop(location_id, None)
                     saved = self._load_snapshot(location_id)
                     if saved is not None:
                         stream.session.occupancy_map.seed_from_summary(saved["grid"], saved["ground_y"])
@@ -272,39 +258,6 @@ class MappingServiceServicer(tracking_pb2_grpc.MappingServiceServicer):
                       f"confidence={session.last_batch_confidence:.2f} "
                       f"(chunks_received={chunks_received})")
 
-                # Visualization-only "where does the HRTF beacon point" reconstruction —
-                # see beacon_preview.py's module docstring. Never affects the real
-                # audio (computed entirely on Android); purely feeds server_gui.py's
-                # dashboard circles. Recomputed only on a full_resync (grid_dict is
-                # only built then now — see the full-vs-delta split above), reusing
-                # the cached point on delta/pose-only ticks in between: this is a
-                # debug preview, not the real navigation signal, so refreshing it
-                # less often than every tick is an acceptable tradeoff rather than
-                # paying for a second extract_full_grid() call purely to keep it
-                # maximally fresh.
-                beacon_world_xz = None
-                mode_snap = self.activity_monitor.snapshot() if self.activity_monitor is not None else {}
-                client_mode = mode_snap.get("client_mode", "")
-                if client_mode == "walking":
-                    if full_resync and grid_dict is not None:
-                        beacon_world_xz = find_most_open_direction_world_point(
-                            session.last_frame_poses[-1], grid_dict
-                        )
-                        self._last_open_direction[location_id] = beacon_world_xz
-                    else:
-                        beacon_world_xz = self._last_open_direction.get(location_id)
-                elif client_mode == "guiding":
-                    destination = mode_snap.get("client_mode_target", "")
-                    beacon_world_xz = self._resolved_destinations.get((location_id, destination))
-
-                beacon_pixel = None
-                if beacon_world_xz is not None:
-                    beacon_pixel = project_world_point_to_pixel(
-                        session.last_frame_poses[-1], beacon_world_xz,
-                        session.occupancy_map._ground_y or 0.0,
-                        frame_rgb.shape[1], frame_rgb.shape[0],
-                    )
-
                 if self.activity_monitor is not None:
                     self.activity_monitor.record_mapping(
                         f"UpdateMapping location='{location_id}' pose=({pose_proto.x:.2f},{pose_proto.z:.2f}) "
@@ -318,8 +271,6 @@ class MappingServiceServicer(tracking_pb2_grpc.MappingServiceServicer):
                         # render_confidence_plotly(), no point-cloud/voxel rendering
                         # here, that's scan_gui.py's separate, heavier debug tool).
                         occupancy_map=session.occupancy_map,
-                        beacon_world_xz=beacon_world_xz,
-                        beacon_pixel=beacon_pixel,
                         # RTAB-Map's own per-batch tracking-lost count (see
                         # process_frames_batch's Step 2) — server_gui.py
                         # surfaces this directly so pose freezing is visible
@@ -409,9 +360,6 @@ class MappingServiceServicer(tracking_pb2_grpc.MappingServiceServicer):
             if saved_lm is not None:
                 print(f"[MappingService] FindLandmark -> '{saved_lm['name']}' "
                       f"(from persisted snapshot, not live session)")
-                self._resolved_destinations[(request.location_id, request.query)] = (
-                    saved_lm["x"], saved_lm["z"],
-                )
                 if self.activity_monitor is not None:
                     self.activity_monitor.record_mapping(
                         f"FindLandmark query='{request.query}' -> '{saved_lm['name']}' (snapshot)",
@@ -430,11 +378,6 @@ class MappingServiceServicer(tracking_pb2_grpc.MappingServiceServicer):
                     op="FindLandmark", location_id=request.location_id, query=request.query, found=False,
                 )
             return tracking_pb2.FindLandmarkResponse(found=False)
-        # Cache for beacon_preview's guiding-mode dashboard circle (UpdateMapping) —
-        # never re-resolved from there, only reused: resolve_landmark() runs
-        # GroundingDINO, and the dashboard must not trigger that on every grid
-        # update alongside the client's own real FindLandmark calls.
-        self._resolved_destinations[(request.location_id, request.query)] = (lm.x, lm.z)
         if self.activity_monitor is not None:
             self.activity_monitor.record_mapping(
                 f"FindLandmark query='{request.query}' -> '{lm.name}'",

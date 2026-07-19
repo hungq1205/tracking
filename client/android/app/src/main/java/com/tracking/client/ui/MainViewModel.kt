@@ -93,6 +93,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun connect(
         host: String, port: Int, frameIntervalMs: Int, scanIntervalMs: Int, recentBufferMs: Int,
+        avoidanceIntervalMs: Int = 350,
         vadThreshold: Float = 0.03f, startThreshold: Float = 0.05f,
         geminiApiKey: String, ocrServerUrl: String, locationId: String,
     ) {
@@ -109,6 +110,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             deviceToolHandler = deviceToolHandler,
             state = sessionState,
             locationId = locationId,
+            avoidanceIntervalMs = avoidanceIntervalMs,
             scope = viewModelScope,
             latestFrame = { cameraManager.clearestRecentFrame() },
             sendVideoFrame = { jpeg -> liveClient?.sendVideoFrame(jpeg) },
@@ -203,18 +205,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 .conflate()
                 .catch { e -> appendSystemMessage("[Flow error] ${e.message}") }
                 .collect { jpegBytes ->
-                    // Guiding/walking/scanning mode: feed frames into the live
-                    // mapping stream (MappingService.UpdateMapping) — see
-                    // ToolDispatcher.feedMappingFrame. sessionState.mode is
-                    // also forwarded as-is into CameraManager.mappingMode so
-                    // it can pick the right window size per submode
-                    // (frameIntervalMs for walking/guiding, scanIntervalMs
-                    // for scanning) — see CameraManager.kt's frame-selection
-                    // note. Set here rather than from ToolDispatcher so no
-                    // new callback wiring is needed; cheap to re-check every
-                    // processed frame.
-                    val mappingModeActive = sessionState.mode == "guiding" || sessionState.mode == "walking" ||
-                        sessionState.mode == "scanning"
+                    // Guiding/scanning mode: feed frames into the live mapping
+                    // stream (MappingService.UpdateMapping) — see
+                    // ToolDispatcher.feedMappingFrame. Walking is NOT included
+                    // any more — it dropped MappingService/RTAB-Map entirely
+                    // in favor of a local per-frame reactive obstacle-dodge
+                    // (see ToolDispatcher.runAvoidanceTick(), which pulls its
+                    // own frames on demand via clearestRecentFrame() instead).
+                    // sessionState.mode is forwarded as-is into
+                    // CameraManager.mappingMode so it can pick the right
+                    // window size per submode (frameIntervalMs for guiding,
+                    // scanIntervalMs for scanning) — see CameraManager.kt's
+                    // frame-selection note. Set here rather than from
+                    // ToolDispatcher so no new callback wiring is needed;
+                    // cheap to re-check every processed frame.
+                    val mappingModeActive = sessionState.mode == "guiding" || sessionState.mode == "scanning"
                     cameraManager.mappingMode = if (mappingModeActive) sessionState.mode else ""
                     if (mappingModeActive) {
                         toolDispatcher?.feedMappingFrame(jpegBytes)

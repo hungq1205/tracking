@@ -604,6 +604,11 @@ class StatusServiceStub(object):
                 request_serializer=tracking__pb2.ReportModeRequest.SerializeToString,
                 response_deserializer=tracking__pb2.ReportModeResponse.FromString,
                 _registered_method=True)
+        self.ReportBeaconDirection = channel.unary_unary(
+                '/tracking.StatusService/ReportBeaconDirection',
+                request_serializer=tracking__pb2.ReportBeaconDirectionRequest.SerializeToString,
+                response_deserializer=tracking__pb2.ReportBeaconDirectionResponse.FromString,
+                _registered_method=True)
 
 
 class StatusServiceServicer(object):
@@ -622,6 +627,19 @@ class StatusServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReportBeaconDirection(self, request, context):
+        """Dashboard-only, fire-and-forget, same precedent as ReportMode above —
+        carries no data any other service needs. The server has no other way
+        to learn the beacon's actual final azimuth: goal-biasing + EMA
+        smoothing now happen client-side (see ToolDispatcher's local-avoidance
+        tick), so server_gui.py can't reconstruct it from the raw
+        TraversabilityInfo fan alone. Called once per avoidance tick while
+        walking/guiding is active.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_StatusServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -629,6 +647,11 @@ def add_StatusServiceServicer_to_server(servicer, server):
                     servicer.ReportMode,
                     request_deserializer=tracking__pb2.ReportModeRequest.FromString,
                     response_serializer=tracking__pb2.ReportModeResponse.SerializeToString,
+            ),
+            'ReportBeaconDirection': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReportBeaconDirection,
+                    request_deserializer=tracking__pb2.ReportBeaconDirectionRequest.FromString,
+                    response_serializer=tracking__pb2.ReportBeaconDirectionResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -665,6 +688,33 @@ class StatusService(object):
             '/tracking.StatusService/ReportMode',
             tracking__pb2.ReportModeRequest.SerializeToString,
             tracking__pb2.ReportModeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReportBeaconDirection(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tracking.StatusService/ReportBeaconDirection',
+            tracking__pb2.ReportBeaconDirectionRequest.SerializeToString,
+            tracking__pb2.ReportBeaconDirectionResponse.FromString,
             options,
             channel_credentials,
             insecure,

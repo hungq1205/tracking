@@ -39,33 +39,38 @@ class CameraManager(private val context: Context) {
     // Two independent client-side frame-selection policies, replacing the
     // old fixed targetFps.
     //
-    // 1. Mapping-mode (walking/guiding/scanning) — no blur/clarity
-    //    filtering (confirmed with the user — removed both here and
-    //    server-side): whichever frame arrives once frameIntervalMs
-    //    (walking/guiding) or scanIntervalMs (scanning) has elapsed since
-    //    the last one sent is forwarded directly — see the mapping-mode
-    //    branch in processFrame(). Walking/guiding share frameIntervalMs
-    //    (100..5000ms); scanning uses its OWN, much tighter scanIntervalMs
-    //    (50..500ms) — a scan pass wants denser coverage for
-    //    reconstruction/landmark tagging than ambient walking/guiding
-    //    steering needs, so the two are independently tunable rather than
-    //    sharing one slider. mappingMode tracks which one is in effect
-    //    (also used to reset the send-gate on any submode change, so
-    //    switching mid-interval doesn't inherit a stale gate from a
-    //    different window size).
-    // 2. Everything else (tracking/reading/Q&A/idle) — still blur-aware: a
-    //    small rolling buffer of the last recentBufferMs of frames;
-    //    consumers that need "the current frame" pull clearestRecentFrame()
-    //    on demand, and continuous per-frame consumers (hand tracking,
-    //    local ORB tracking) still get a steady trickle via frameFlow,
-    //    emitted at most once per recentBufferMs from whatever's currently
-    //    sharpest in the buffer.
-    var frameIntervalMs: Int = 1000       // SettingsScreen slider: 100..5000 — walking/guiding
+    // 1. Mapping-mode (guiding/scanning — NOT walking any more: walking
+    //    dropped MappingService/RTAB-Map entirely, see CLAUDE.md's "Local
+    //    reactive HRTF obstacle-dodge" note; its frames now flow through
+    //    policy 2 below instead) — no blur/clarity filtering (confirmed
+    //    with the user — removed both here and server-side): whichever
+    //    frame arrives once frameIntervalMs (guiding) or scanIntervalMs
+    //    (scanning) has elapsed since the last one sent is forwarded
+    //    directly — see the mapping-mode branch in processFrame().
+    //    Scanning uses its OWN, much tighter scanIntervalMs (50..500ms) —
+    //    a scan pass wants denser coverage for reconstruction/landmark
+    //    tagging than ambient guiding steering needs, so the two are
+    //    independently tunable rather than sharing one slider. mappingMode
+    //    tracks which one is in effect (also used to reset the send-gate
+    //    on any submode change, so switching mid-interval doesn't inherit
+    //    a stale gate from a different window size).
+    // 2. Everything else (tracking/reading/Q&A/idle/walking) — still
+    //    blur-aware: a small rolling buffer of the last recentBufferMs of
+    //    frames; consumers that need "the current frame" pull
+    //    clearestRecentFrame() on demand (this is what walking's local
+    //    avoidance tick pulls from now — a reactive per-tick pull is
+    //    exactly what this path was already designed for, see
+    //    ToolDispatcher.runAvoidanceTick()), and continuous per-frame
+    //    consumers (hand tracking, local ORB tracking) still get a steady
+    //    trickle via frameFlow, emitted at most once per recentBufferMs
+    //    from whatever's currently sharpest in the buffer.
+    var frameIntervalMs: Int = 1000       // SettingsScreen slider: 100..5000 — guiding only
     var scanIntervalMs: Int = 100         // SettingsScreen slider: 50..500, 50ms steps — scanning only
     var recentBufferMs: Int = 100         // SettingsScreen slider: 0..1000, 50ms steps
-    /** "", "walking", "guiding", or "scanning" — set every processed frame
-     * by MainViewModel.kt from sessionState.mode. Empty means non-mapping
-     * (tracking/reading/Q&A/idle), which uses the rolling buffer instead. */
+    /** "", "guiding", or "scanning" — set every processed frame by
+     * MainViewModel.kt from sessionState.mode. Empty means non-mapping
+     * (tracking/reading/Q&A/idle/walking), which uses the rolling buffer
+     * instead. */
     @Volatile var mappingMode: String = ""
 
     private data class TimedFrame(val jpeg: ByteArray, val sharpness: Double, val atMs: Long)

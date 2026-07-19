@@ -37,6 +37,7 @@ class ToolDispatcher(
     private val deviceToolHandler: DeviceToolHandler,
     private val state: LiveSessionState,
     private val locationId: String,
+    private val avoidanceIntervalMs: Int = 350,
     private val scope: CoroutineScope,
     private val latestFrame: () -> ByteArray?,
     private val sendVideoFrame: (ByteArray) -> Unit,
@@ -49,6 +50,7 @@ class ToolDispatcher(
     private var visionStreamJob: Job? = null
     private var mappingJob: Job? = null
     private var mappingChunkChannel: Channel<Tracking.MappingChunk>? = null
+    private var avoidanceJob: Job? = null
 
     /** Ensures mode exclusivity — every mode-entry tool calls this first.
      * Found via a real bug: state.mode is documented as a single exclusive
@@ -67,6 +69,7 @@ class ToolDispatcher(
         if (state.mode == "guiding" || state.mode == "walking" || state.mode == "scanning") {
             stopMappingStream()
         }
+        stopLocalAvoidanceTicks()
         hrtfBeacon.stop()
     }
 
@@ -87,6 +90,25 @@ class ToolDispatcher(
                 )
             } catch (e: Exception) {
                 Log.w(TAG, "reportMode('$mode') failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Dashboard-only, same fire-and-forget precedent as reportMode() above
+     * — the server has no other way to learn the beacon's actual final
+     * azimuth, since goal-biasing + EMA smoothing now happen entirely
+     * client-side (see runAvoidanceTick()). Called once per avoidance tick
+     * while walking/guiding is active. */
+    private fun reportBeaconDirection(azimuthDeg: Float, muted: Boolean) {
+        val stub = grpc.statusStub ?: return
+        scope.launch(Dispatchers.IO) {
+            try {
+                stub.reportBeaconDirection(
+                    Tracking.ReportBeaconDirectionRequest.newBuilder()
+                        .setAzimuthDeg(azimuthDeg).setMuted(muted).build()
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "reportBeaconDirection failed: ${e.message}")
             }
         }
     }
@@ -388,7 +410,9 @@ class ToolDispatcher(
         stopActiveModes()
         state.mode = "guiding"
         state.guidingDestinationLabel = destination
-        startMappingStream()
+        state.smoothedBeaconAzimuthDeg = null
+        startMappingStream()  // global layer: route/pose via RTAB-Map + LocalPathPlanner's A*
+        startLocalAvoidanceTicks()  // local layer: the actual beacon output — see runAvoidanceTick()
         hrtfBeacon.start()
         onGuidanceUpdate("guiding", state.navWaypoints)
         reportMode("guiding", destination)
@@ -398,6 +422,7 @@ class ToolDispatcher(
 
     private fun toolStopGuiding(): JSONObject {
         stopMappingStream()
+        stopLocalAvoidanceTicks()
         hrtfBeacon.stop()
         state.mode = "idle"; state.guidingDestinationLabel = ""; state.navWaypoints = emptyList()
         onGuidanceUpdate("idle", emptyList())
@@ -440,7 +465,6 @@ class ToolDispatcher(
                         recomputeRoute()
                     }
                     checkWaypointProgress()
-                    updateHrtfBeacon()
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Mapping stream ended: ${e.message}")
@@ -529,34 +553,82 @@ class ToolDispatcher(
         onGuidanceUpdate(state.mode, state.navWaypoints)
     }
 
-    /** Points the continuous HRTF beacon (see HrtfBeaconPlayer) — at the
-     * current waypoint for guiding, or at the most open direction ahead for
-     * walking (no destination to route toward — see LocalPathPlanner.
-     * findMostOpenDirection(), which replaced the old fixed-interval
-     * AnalyzeFrame(DEPTH) polling + spoken obstacle alert entirely). Mutes
-     * when there's nothing useful to point at yet. Called on every
-     * MappingUpdate alongside checkWaypointProgress(). */
-    private fun updateHrtfBeacon() {
-        val pose = state.lastMappingPose ?: run { hrtfBeacon.mute(); return }
+    // ── Local reactive HRTF obstacle-dodge (the ONLY thing that actually
+    //    points the beacon now, for both walking and guiding) ────────────
+    //
+    // Replaces the old occupancy-grid ray-cast steering entirely: that
+    // signal only ever updated as fast as RTAB-Map's own batch cycle
+    // (too slow to react to something that just stepped into view) and
+    // required a full world map walking never actually needed. This runs
+    // on its own cadence (avoidanceIntervalMs), independent of guiding's
+    // slower MappingService frame cadence — global route vs. immediate
+    // local dodge are different layers with different latency needs. See
+    // CLAUDE.md's "Local reactive HRTF obstacle-dodge" note.
 
-        if (state.mode == "walking") {
-            val grid = state.lastMappingGrid
-            val az = grid?.let { LocalPathPlanner(it).findMostOpenDirection(pose) }
-            if (az == null) {
-                hrtfBeacon.mute()
-            } else {
-                hrtfBeacon.updateDirection(az, 0f, OPEN_DIRECTION_DISTANCE_M)
+    private fun startLocalAvoidanceTicks() {
+        stopLocalAvoidanceTicks()
+        avoidanceJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                runAvoidanceTick()
+                delay(avoidanceIntervalMs.toLong())
             }
-            return
         }
+    }
 
-        if (state.navWaypoints.isEmpty() || state.navWaypointIdx >= state.navWaypoints.size) {
-            hrtfBeacon.mute()
+    private fun stopLocalAvoidanceTicks() {
+        avoidanceJob?.cancel(); avoidanceJob = null
+    }
+
+    /** One tick: current frame -> server's per-angle clearance fan
+     * (AnalyzeFrame TRAVERSABILITY, no world state involved) ->
+     * TraversabilityScorer picks a steering azimuth (goal-biased toward
+     * the current waypoint for guiding — HrtfBeacon.directionTo()'s
+     * azimuth only, not its elevation/distance; unbiased pure-clearance
+     * for walking, which has no destination) -> EMA-smoothed -> beacon.
+     * Elevation and distance are always fixed now (see HrtfBeacon call
+     * below) — the beacon is a pure steering command, a fixed-radius
+     * circle around the user, never a position. */
+    private suspend fun runAvoidanceTick() {
+        val frame = latestFrame() ?: return
+        val stub = grpc.perceptionStub ?: return
+        val resp = try {
+            stub.analyzeFrame(
+                Tracking.AnalyzeFrameRequest.newBuilder()
+                    .setImageData(com.google.protobuf.ByteString.copyFrom(frame))
+                    .addOps(Tracking.AnalysisOp.TRAVERSABILITY)
+                    .build()
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "avoidance tick AnalyzeFrame failed: ${e.message}")
             return
         }
-        val (wx, wz) = state.navWaypoints[state.navWaypointIdx]
-        val dir = HrtfBeacon.directionTo(pose, wx, wz)
-        hrtfBeacon.updateDirection(dir.azimuthDeg, dir.elevationDeg, dir.distanceM)
+        val trav = resp.traversability
+        if (trav.clearanceMCount == 0) return
+
+        val goalAzimuthDeg = if (state.mode == "guiding") {
+            val pose = state.lastMappingPose
+            if (pose != null && state.navWaypointIdx < state.navWaypoints.size) {
+                val (wx, wz) = state.navWaypoints[state.navWaypointIdx]
+                HrtfBeacon.directionTo(pose, wx, wz).azimuthDeg
+            } else null
+        } else null
+
+        val picked = TraversabilityScorer.pickSteeringAngle(
+            clearanceM = trav.clearanceMList,
+            minAngleDeg = trav.minAngleDeg,
+            stepDeg = trav.angleStepDeg,
+            goalAzimuthDeg = goalAzimuthDeg,
+            currentAzimuthDeg = state.smoothedBeaconAzimuthDeg,
+        )
+        if (picked == null) {
+            hrtfBeacon.mute()
+            reportBeaconDirection(0f, muted = true)
+            return
+        }
+        val smoothed = TraversabilityScorer.smoothAzimuth(state.smoothedBeaconAzimuthDeg, picked)
+        state.smoothedBeaconAzimuthDeg = smoothed
+        hrtfBeacon.updateDirection(smoothed, 0f, OPEN_DIRECTION_DISTANCE_M)
+        reportBeaconDirection(smoothed, muted = false)
     }
 
     private fun checkWaypointProgress() {
@@ -574,22 +646,23 @@ class ToolDispatcher(
         }
     }
 
-    // ── Walking (free-walk guiding — ambient HRTF only, no destination,
-    //    no spoken obstacle alerts; see LocalPathPlanner.findMostOpenDirection
-    //    and updateHrtfBeacon() above) ──────────────────────────────────────
+    // ── Walking (free-walk — ambient HRTF only, no destination, no spoken
+    //    obstacle alerts, NO MappingService/RTAB-Map at all any more; see
+    //    runAvoidanceTick() above) ─────────────────────────────────────────
 
     private fun toolStartWalking(): JSONObject {
         stopActiveModes()
         state.mode = "walking"
-        startMappingStream()
-        hrtfBeacon.start()  // plays constantly but muted until the grid has an open direction — see updateHrtfBeacon()
+        state.smoothedBeaconAzimuthDeg = null
+        startLocalAvoidanceTicks()  // the only signal walking uses now — no world map
+        hrtfBeacon.start()  // plays constantly but muted until a tick finds a safe direction
         onGuidanceUpdate("walking", emptyList())
         reportMode("walking")
         return JSONObject().put("status", "walking_started")
     }
 
     private fun toolStopWalking(): JSONObject {
-        stopMappingStream()
+        stopLocalAvoidanceTicks()
         hrtfBeacon.stop()
         state.mode = "idle"
         onGuidanceUpdate("idle", emptyList())
@@ -620,16 +693,18 @@ class ToolDispatcher(
     fun shutdown() {
         visionStreamJob?.cancel()
         stopMappingStream()
+        stopLocalAvoidanceTicks()
         hrtfBeacon.stop()
     }
 
     companion object {
         private const val TAG = "ToolDispatcher"
 
-        // Nominal, not a real measurement — "most open direction" is a
-        // direction, not a point target, so there's no real distance to
-        // report. Chosen so HrtfBeaconPlayer's distance-based gain sits
-        // mid-range (audible, not maxed), same reasoning as
+        // Fixed, not a real measurement — the beacon is a pure steering
+        // command now (a fixed-radius circle around the user, azimuth
+        // only), never a position, for both walking and guiding (see
+        // runAvoidanceTick()). Chosen so HrtfBeaconPlayer's distance-based
+        // gain sits mid-range (audible, not maxed), same reasoning as
         // HrtfBeacon.directionFromBox()'s own fixed distanceM.
         private const val OPEN_DIRECTION_DISTANCE_M = 5f
     }

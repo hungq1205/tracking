@@ -41,12 +41,13 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.tracking.client.model.ConnectionState
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     mainViewModel: MainViewModel,
-    onConnect: (String, Int, Int, Int, Int, Float, Float, String, String, String) -> Unit,
+    onConnect: (String, Int, Int, Int, Int, Int, Float, Float, String, String, String) -> Unit,
     onBack: () -> Unit
 ) {
     val settingsVm: SettingsViewModel = viewModel()
@@ -55,6 +56,7 @@ fun SettingsScreen(
     val savedFrameIntervalMs by settingsVm.frameIntervalMs.collectAsState()
     val savedScanIntervalMs by settingsVm.scanIntervalMs.collectAsState()
     val savedRecentBufferMs by settingsVm.recentBufferMs.collectAsState()
+    val savedAvoidanceIntervalMs by settingsVm.avoidanceIntervalMs.collectAsState()
     val savedVad by settingsVm.vadThreshold.collectAsState()
     val savedStart by settingsVm.startThreshold.collectAsState()
     val savedApiKey by settingsVm.geminiApiKey.collectAsState()
@@ -67,8 +69,12 @@ fun SettingsScreen(
 
     var host by rememberSaveable { mutableStateOf(savedHost) }
     var portStr by rememberSaveable { mutableStateOf(savedPort.toString()) }
-    var frameIntervalMs by rememberSaveable { mutableStateOf(savedFrameIntervalMs.toFloat()) }
-    var scanIntervalMs by rememberSaveable { mutableStateOf(savedScanIntervalMs.toFloat()) }
+    // FPS in the UI, milliseconds internally (CameraManager.kt/persistence
+    // both stay ms-based — see the two number-input fields below for the
+    // fps<->ms conversion, kept local to this screen).
+    var frameFpsStr by rememberSaveable { mutableStateOf("%.2f".format(1000f / savedFrameIntervalMs)) }
+    var scanFpsStr by rememberSaveable { mutableStateOf("%.2f".format(1000f / savedScanIntervalMs)) }
+    var avoidanceFpsStr by rememberSaveable { mutableStateOf("%.2f".format(1000f / savedAvoidanceIntervalMs)) }
     var recentBufferMs by rememberSaveable { mutableStateOf(savedRecentBufferMs.toFloat()) }
     var noiseGateStr by rememberSaveable { mutableStateOf("%.3f".format(savedVad)) }
     var startVolStr by rememberSaveable { mutableStateOf("%.3f".format(savedStart)) }
@@ -80,8 +86,15 @@ fun SettingsScreen(
 
     fun doConnect() {
         val port = portStr.toIntOrNull() ?: 50051
-        val intervalMs = frameIntervalMs.toInt()
-        val scanMs = scanIntervalMs.toInt()
+        // fps -> ms, no artificial min/max — only guarding against a
+        // zero/negative/unparseable value, which would otherwise divide
+        // into an infinite or nonsensical interval.
+        val frameFps = frameFpsStr.toFloatOrNull()?.takeIf { it > 0f } ?: 1f
+        val scanFps = scanFpsStr.toFloatOrNull()?.takeIf { it > 0f } ?: 10f
+        val avoidanceFps = avoidanceFpsStr.toFloatOrNull()?.takeIf { it > 0f } ?: 2.86f
+        val intervalMs = (1000f / frameFps).roundToInt()
+        val scanMs = (1000f / scanFps).roundToInt()
+        val avoidanceMs = (1000f / avoidanceFps).roundToInt()
         val bufferMs = recentBufferMs.toInt()
         val noiseGate = noiseGateStr.toFloatOrNull()?.coerceIn(0.001f, 1f) ?: 0.03f
         val startVol = startVolStr.toFloatOrNull()?.coerceIn(0.001f, 1f) ?: 0.05f
@@ -90,6 +103,7 @@ fun SettingsScreen(
         settingsVm.setFrameIntervalMs(intervalMs)
         settingsVm.setScanIntervalMs(scanMs)
         settingsVm.setRecentBufferMs(bufferMs)
+        settingsVm.setAvoidanceIntervalMs(avoidanceMs)
         settingsVm.setVadThreshold(noiseGate)
         settingsVm.setStartThreshold(startVol)
         settingsVm.setGeminiApiKey(apiKey)
@@ -97,7 +111,7 @@ fun SettingsScreen(
         settingsVm.setLocationId(locationId)
         settingsVm.save()
         focusManager.clearFocus()
-        onConnect(host, port, intervalMs, scanMs, bufferMs, noiseGate, startVol, apiKey, ocrUrl, locationId)
+        onConnect(host, port, intervalMs, scanMs, bufferMs, avoidanceMs, noiseGate, startVol, apiKey, ocrUrl, locationId)
         onBack()
     }
 
@@ -157,33 +171,80 @@ fun SettingsScreen(
                 )
             }
 
-            // Row 2: mapping-mode send interval — governs walking/guiding
-            // only. No blur/clarity filtering (removed client- and
-            // server-side) — whichever frame arrives once this interval has
-            // elapsed since the last send is forwarded directly.
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Text("Mapping frame interval: ${frameIntervalMs.toInt()} ms — walking/guiding")
-                Slider(
-                    value = frameIntervalMs,
-                    onValueChange = { frameIntervalMs = it },
-                    valueRange = 100f..5000f,
-                    steps = 48,
-                    modifier = Modifier.fillMaxWidth()
+            // Row 2: mapping-mode send rate — governs guiding's MappingService
+            // route stream only now (walking dropped MappingService
+            // entirely, see the Avoidance FPS field below for its actual
+            // steering-signal rate). No blur/clarity filtering (removed
+            // client- and server-side) — whichever frame arrives once 1/fps
+            // seconds have elapsed since the last send is forwarded
+            // directly. Entered as FPS (0.2..10), converted to
+            // CameraManager's internal ms interval at connect.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                OutlinedTextField(
+                    value = frameFpsStr,
+                    onValueChange = { frameFpsStr = it },
+                    label = { Text("Mapping FPS") },
+                    placeholder = { Text("1.0") },
+                    supportingText = { Text("guiding route only") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Decimal,
+                        imeAction = ImeAction.Next
+                    ),
+                    keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) })
                 )
             }
 
-            // Row 2a: scan mode's own, much tighter send interval — same
-            // no-filtering behavior as above, just a separate slider since a
+            // Row 2a: scan mode's own, much higher send rate — same
+            // no-filtering behavior as above, just a separate field since a
             // scan pass wants denser coverage than ambient walking/guiding
             // steering needs.
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Text("Scan frame interval: ${scanIntervalMs.toInt()} ms — scanning only")
-                Slider(
-                    value = scanIntervalMs,
-                    onValueChange = { scanIntervalMs = it },
-                    valueRange = 50f..500f,
-                    steps = 8,
-                    modifier = Modifier.fillMaxWidth()
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                OutlinedTextField(
+                    value = scanFpsStr,
+                    onValueChange = { scanFpsStr = it },
+                    label = { Text("Scan FPS") },
+                    placeholder = { Text("10.0") },
+                    supportingText = { Text("scanning only") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Decimal,
+                        imeAction = ImeAction.Next
+                    ),
+                    keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) })
+                )
+            }
+
+            // Row 2c: local reactive HRTF obstacle-dodge tick rate — governs
+            // walking AND guiding's actual beacon-steering signal now (see
+            // CLAUDE.md's "Local reactive HRTF obstacle-dodge" note), fully
+            // independent from Mapping FPS above (which now only drives
+            // guiding's separate, slower MappingService route stream).
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                OutlinedTextField(
+                    value = avoidanceFpsStr,
+                    onValueChange = { avoidanceFpsStr = it },
+                    label = { Text("Avoidance FPS") },
+                    placeholder = { Text("2.86") },
+                    supportingText = { Text("walking/guiding HRTF steering") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Decimal,
+                        imeAction = ImeAction.Next
+                    ),
+                    keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) })
                 )
             }
 

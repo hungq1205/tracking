@@ -35,6 +35,14 @@ class ActivityMonitor:
         self.client_mode: str = ""
         self.client_mode_target: str = ""
         self.client_mode_at: float = 0.0
+        # Explicit client-reported HRTF beacon azimuth (StatusService.
+        # ReportBeaconDirection) — the actual final steering angle after
+        # goal-bias + EMA smoothing, all computed client-side, so the
+        # server has no other way to know it. Dashboard-only, like
+        # client_mode above; not logged to `log` (too frequent).
+        self.beacon_azimuth_deg: float = 0.0
+        self.beacon_muted: bool = True
+        self.beacon_at: float = 0.0
 
     def _record(self, category: str, bucket: Dict[str, Any], fields: Dict[str, Any], log_text: str) -> None:
         with self._lock:
@@ -70,6 +78,12 @@ class ActivityMonitor:
                 "text": f"mode -> '{mode}'" + (f" ({target})" if target else ""),
             })
 
+    def record_beacon_direction(self, azimuth_deg: float, muted: bool) -> None:
+        with self._lock:
+            self.beacon_azimuth_deg = azimuth_deg
+            self.beacon_muted = muted
+            self.beacon_at = time.time()
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -81,5 +95,8 @@ class ActivityMonitor:
                 "client_mode": self.client_mode,
                 "client_mode_target": self.client_mode_target,
                 "client_mode_at": self.client_mode_at,
+                "beacon_azimuth_deg": self.beacon_azimuth_deg,
+                "beacon_muted": self.beacon_muted,
+                "beacon_at": self.beacon_at,
                 "log": list(self.log),
             }

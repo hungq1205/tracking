@@ -34,7 +34,11 @@ _TAB_BY_CATEGORY = {
 _TAB_BY_CLIENT_MODE = {
     "tracking": "tab_tracking",
     "guiding": "tab_mapping",
-    "walking": "tab_mapping",
+    # Walking no longer touches MappingService at all (see CLAUDE.md's
+    # "Local reactive HRTF obstacle-dodge" note) — its only server traffic
+    # is PerceptionService.AnalyzeFrame(TRAVERSABILITY) + StatusService, so
+    # its activity shows up on the Perception tab now, not Mapping.
+    "walking": "tab_perception",
     "scanning": "tab_mapping",
 }
 
@@ -131,16 +135,11 @@ def _annotate_mapping(snap: dict) -> Optional[np.ndarray]:
     rtabmap_lost = snap.get("rtabmap_lost", 0)
     if rtabmap_lost:
         # frame_rgb is RGB order (see _decode_image_rgb) — (255,0,0) is red
-        # here, matching the green/magenta text above which are also RGB.
+        # here, matching the green text above which is also RGB.
         cv2.putText(
             vis, f"RTAB-Map TRACKING LOST ({rtabmap_lost}/{snap.get('rtabmap_total', 0)})",
             (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2, cv2.LINE_AA,
         )
-    beacon_pixel = snap.get("beacon_pixel")
-    if beacon_pixel is not None:
-        cv2.circle(vis, beacon_pixel, 14, (255, 0, 255), 3, cv2.LINE_AA)
-        cv2.putText(vis, "HRTF", (beacon_pixel[0] + 16, beacon_pixel[1] + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2, cv2.LINE_AA)
     return vis
 
 
@@ -150,29 +149,71 @@ def _render_occupancy(snap: dict):
     colorscale logic. Deliberately no point-cloud/voxel view here (that
     stays scan_gui.py's separate, heavier offline debug tool — see
     CLAUDE.md's server_gui.py note); this is occupancy-grid-only, matching
-    what the client actually navigates/plays HRTF audio against.
+    what the client actually navigates against (routing only now — the
+    HRTF beacon itself is no longer grid-derived, see the Perception tab's
+    beacon-direction panel instead).
     Wrapped in try/except: occupancy_map is a live object reference,
     mutated concurrently by the gRPC streaming thread while this renders on
     the Gradio polling thread — a render racing a mutation should degrade
-    (skip this tick, try again next poll) rather than crash the dashboard.
-    Also overlays beacon_world_xz (beacon_preview.py's server-side,
-    visualization-only reconstruction of where the HRTF beacon points —
-    the real audio direction is computed entirely on Android) as a magenta
-    circle marker, same color/meaning as the frame-view circle above."""
+    (skip this tick, try again next poll) rather than crash the dashboard."""
     occ_map = snap.get("occupancy_map")
     if occ_map is None:
         return None
     try:
-        fig = occ_map.render_plotly()
-        beacon_xz = snap.get("beacon_world_xz")
-        if beacon_xz is not None:
-            fig.add_trace(go.Scatter(
-                x=[beacon_xz[0]], y=[beacon_xz[1]], mode="markers", name="HRTF",
-                marker=dict(size=16, color="magenta", symbol="circle-open", line=dict(width=3)),
-            ))
-        return fig
+        return occ_map.render_plotly()
     except Exception:
         return None
+
+
+def _render_beacon_polar(snap: dict):
+    """Polar view of the HRTF beacon's current direction relative to the
+    user's forward view — replaces the old beacon_preview.py world-point
+    reconstruction (which modeled the beacon as a position; it's a pure
+    steering angle now, see CLAUDE.md's "Local reactive HRTF obstacle-
+    dodge" note). Forward = 12 o'clock, azimuth-right reads clockwise
+    (matches HrtfBeacon.kt's convention). Bars are the last
+    AnalyzeFrame(TRAVERSABILITY) fan (perception bucket); the marker is the
+    ACTUAL final azimuth the client is playing (post goal-bias, post EMA
+    smoothing — client-computed, reported via StatusService.
+    ReportBeaconDirection since the server has no other way to know it)."""
+    trav = snap.get("perception", {}).get("traversability")
+    if trav is None:
+        return None
+    clearances = trav["clearance_m"]
+    n = len(clearances)
+    angles = [trav["min_angle_deg"] + i * trav["angle_step_deg"] for i in range(n)]
+    fig = go.Figure()
+    fig.add_trace(go.Barpolar(
+        r=clearances, theta=angles, width=[trav["angle_step_deg"]] * n,
+        marker=dict(color=clearances, colorscale="Viridis", cmin=0, cmax=trav["max_range_m"]),
+        name="clearance",
+    ))
+    muted = snap.get("beacon_muted", True)
+    az = snap.get("beacon_azimuth_deg", 0.0)
+    if snap.get("beacon_at", 0.0) > 0:
+        fig.add_trace(go.Scatterpolar(
+            r=[trav["max_range_m"] * 0.95], theta=[az], mode="markers+text",
+            marker=dict(size=18, color=("#888" if muted else "magenta"), symbol="circle-open", line=dict(width=3)),
+            text=["HRTF (muted)" if muted else "HRTF"], textposition="top center",
+            name="beacon",
+        ))
+    fig.update_layout(
+        polar=dict(
+            angularaxis=dict(rotation=90, direction="clockwise", range=[trav["min_angle_deg"], trav["max_angle_deg"]]),
+            radialaxis=dict(range=[0, trav["max_range_m"]]),
+        ),
+        showlegend=False, margin=dict(l=20, r=20, t=20, b=20), height=360,
+    )
+    return fig
+
+
+def _beacon_status(snap: dict) -> str:
+    if snap.get("beacon_at", 0.0) <= 0:
+        return "No beacon direction reported yet."
+    muted = snap.get("beacon_muted", True)
+    if muted:
+        return f"HRTF: muted (nothing safe to point at)  ·  reported {_ago(snap.get('beacon_at', 0))}"
+    return f"HRTF azimuth: {snap.get('beacon_azimuth_deg', 0.0):.1f}°  ·  reported {_ago(snap.get('beacon_at', 0))}"
 
 
 def _mapping_status(snap: dict) -> str:
@@ -256,6 +297,8 @@ def create_ui(activity_monitor) -> gr.Blocks:
             _tracking_status(snap["tracking"]),
             _annotate_perception(snap["perception"]),
             _perception_status(snap["perception"]),
+            _render_beacon_polar(snap),
+            _beacon_status(snap),
             _annotate_mapping(snap["mapping"]),
             _mapping_status(snap["mapping"]),
             _render_occupancy(snap["mapping"]),
@@ -281,6 +324,17 @@ def create_ui(activity_monitor) -> gr.Blocks:
                         ui_perc_image = gr.Image(label="Last frame (annotated)", type="numpy")
                     with gr.Column(scale=1):
                         ui_perc_status = gr.Textbox(label="Detail", lines=10, interactive=False)
+                gr.Markdown(
+                    "**HRTF beacon direction** — the local per-frame obstacle-clearance fan "
+                    "(AnalyzeFrame TRAVERSABILITY) and the beacon's actual final steering angle "
+                    "(client-computed: goal-biased + smoothed, reported via ReportBeaconDirection "
+                    "purely for this display)."
+                )
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        ui_beacon_plot = gr.Plot(label="Beacon direction (forward = up)")
+                    with gr.Column(scale=1):
+                        ui_beacon_status = gr.Textbox(label="Detail", lines=4, interactive=False)
 
             with gr.Tab("Mapping (guiding / walking / scanning)", id="tab_mapping"):
                 gr.Markdown(
@@ -306,6 +360,8 @@ def create_ui(activity_monitor) -> gr.Blocks:
                 ui_track_status,
                 ui_perc_image,
                 ui_perc_status,
+                ui_beacon_plot,
+                ui_beacon_status,
                 ui_map_image,
                 ui_map_status,
                 ui_occupancy_plot,

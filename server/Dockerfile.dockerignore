@@ -1,27 +1,52 @@
 # Applies to `docker build -f server/Dockerfile .` (repo root context) —
-# without this, the build would tar up the whole 13+ GB monorepo (server/.venv/
-# alone is ~12 GB; DA3METRIC-LARGE.onnx is 698 MB; client/ is 754 MB).
+# without this, the build would tar up the whole 13+ GB monorepo
+# (server/.venv/ alone is ~12 GB; client/ is 754 MB).
+#
+# Rewritten alongside server/Dockerfile against ACTUAL imports (see that
+# file's own comments) — the old version here only allowed scan_server/
+# da3_wrapper.py through, which predates the MappingService live-mapping
+# rewrite; MappingService needs a much larger scan_server/ subset now.
+#
+# DA3METRIC-LARGE.onnx (698MB) is DELIBERATELY NOT excluded any more — the
+# Dockerfile now bakes it into the image for a self-contained cloud
+# deployment (no host volume mount at runtime).
 
 .git
 client
 depth-anything-3
 onnx_models
 paddle_ocr_server
+frame_extractor
 test_module
 ros2-depth-anything-v3-trt
-DA3METRIC-LARGE.onnx
 docker-compose.yml
 Dockerfile
 setup.sh
 navigation-state.md
 CLAUDE.md
 
-# Only server/tools/depth.py's optional DEPTH_MODEL=da3 path and
-# server/grpc_server.py's DA3-ONNX walking mode need anything from scan_server/,
-# and only da3_wrapper.py — the rest (VIO/GTSAM, mvs.py, map exporting) is
-# Scan Server-only tooling, never imported by the live server.
+# scan_server/ — allow only the .py modules server/ actually reaches into
+# at runtime (see server/Dockerfile's own comment for exactly why each one
+# is needed) plus the Depth-Anything-3/ package source. Everything else
+# (scan_gui.py/scan_css.py/stream_simulator.py/live_path_planner.py —
+# scan_server's own offline Gradio tool — and qwen_vlm.py/voxel_ops.py/
+# vio/ — unused by the live path) stays excluded.
 scan_server/*
 !scan_server/da3_wrapper.py
+!scan_server/scan_session.py
+!scan_server/stream_session.py
+!scan_server/rtabmap_client.py
+!scan_server/feature_tracker.py
+!scan_server/map_exporter.py
+!scan_server/occupancy_map.py
+!scan_server/orb_novelty_gate.py
+!scan_server/pose_graph.py
+!scan_server/semantic_mapper.py
+!scan_server/timing_utils.py
+!scan_server/zone_labeler.py
+!scan_server/gemma_vlm.py
+!scan_server/Depth-Anything-3
+!scan_server/Depth-Anything-3/**
 
 server/.venv
 server/__pycache__

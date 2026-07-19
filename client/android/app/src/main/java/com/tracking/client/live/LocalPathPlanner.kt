@@ -91,58 +91,6 @@ class LocalPathPlanner(
         inBounds(row, col) && cls[idx(row, col)] != GridClass.OBSTACLE
 
     /**
-     * "Steer toward the most open space" — walking mode's ambient HRTF
-     * beacon has no destination/waypoint to route toward (unlike guiding,
-     * which uses findPath() above), so it needs a different signal: which
-     * direction, relative to the current heading, has the most clear space
-     * ahead right now. Replaces the old fixed-interval AnalyzeFrame(DEPTH)
-     * polling + spoken "[SYSTEM] Obstacle ~Xm ahead" alert (see CLAUDE.md's
-     * "Mode exclusivity" / walking-mode notes) — this is continuous and
-     * purely audio-directional, no spoken interruptions.
-     *
-     * Casts a short ray per candidate egocentric azimuth (via
-     * HrtfBeacon.worldYawRad + straightforward 2D rotation — floor-
-     * constrained navigation, pitch/roll don't matter) through this same
-     * grid, stepping in `resolution`-sized increments up to [maxRangeM],
-     * and returns whichever azimuth traveled farthest before hitting an
-     * obstacle or leaving passable cells. Ties favor the smallest
-     * |azimuth| (prefer continuing straight over an equally-open sharp
-     * turn). Returns null only when even the very first step in every
-     * candidate direction is already blocked/out of bounds.
-     */
-    fun findMostOpenDirection(
-        pose: Tracking.Pose, maxRangeM: Float = 5f, coneDeg: Float = 90f, stepDeg: Float = 15f,
-    ): Float? {
-        val yawRad = HrtfBeacon.worldYawRad(pose)
-        var bestAz: Float? = null
-        var bestDist = 0f
-        var az = -coneDeg
-        while (az <= coneDeg) {
-            val candidateRad = yawRad + Math.toRadians(az.toDouble())
-            val dx = kotlin.math.sin(candidateRad).toFloat()
-            val dz = kotlin.math.cos(candidateRad).toFloat()
-            val dist = castOpenRay(pose.x, pose.z, dx, dz, maxRangeM)
-            if (dist > bestDist || (dist == bestDist && bestAz != null && abs(az) < abs(bestAz))) {
-                bestDist = dist
-                bestAz = az
-            }
-            az += stepDeg
-        }
-        return bestAz
-    }
-
-    private fun castOpenRay(fromX: Float, fromZ: Float, dirX: Float, dirZ: Float, maxRangeM: Float): Float {
-        val steps = (maxRangeM / resolution).toInt().coerceAtLeast(1)
-        var traveled = 0f
-        for (i in 1..steps) {
-            val (row, col) = worldToCell(fromX + dirX * resolution * i, fromZ + dirZ * resolution * i)
-            if (!passable(row, col)) break
-            traveled = resolution * i
-        }
-        return traveled
-    }
-
-    /**
      * 8-connected A* with an octile heuristic, from startXz to goalXz (world
      * metres). Returns null only when nothing useful can be offered at all
      * (start itself not passable, or the search couldn't move anywhere).

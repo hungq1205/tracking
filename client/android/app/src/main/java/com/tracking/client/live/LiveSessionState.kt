@@ -19,11 +19,10 @@ class LiveSessionState {
     // Tracking mode
     var trackingTarget: String = ""
 
-    // Guiding mode (MappingService-backed live navigation) — also used by
-    // walking mode for lastMappingPose/lastMappingGrid (walking has no
-    // destination, so guidingDestinationLabel/navWaypoints stay unused for
-    // it; see ToolDispatcher.updateHrtfBeacon()'s "walking" branch, which
-    // reads the grid directly instead).
+    // Guiding mode (MappingService-backed global route: RTAB-Map pose +
+    // occupancy grid + LocalPathPlanner's A*). Walking mode uses neither —
+    // it has no MappingService stream at all any more (see
+    // ToolDispatcher.runAvoidanceTick()).
     var guidingDestinationLabel: String = ""
     var navWaypoints: List<Pair<Float, Float>> = emptyList()
     var navWaypointIdx: Int = 0
@@ -36,11 +35,21 @@ class LiveSessionState {
     // the first full_resync of a stream.
     var mutableGrid: MutableOccupancyGrid? = null
 
+    // Local reactive HRTF obstacle-dodge (walking AND guiding — see
+    // ToolDispatcher.runAvoidanceTick() / TraversabilityScorer). The
+    // beacon's current EMA-smoothed azimuth, carried across ticks so
+    // smoothing has something to smooth FROM; null at the start of a fresh
+    // walking/guiding session (nothing to smooth from yet) and whenever a
+    // tick mutes (kept as-is while muted, so a brief mute doesn't reset
+    // continuity — see runAvoidanceTick()'s own comment).
+    var smoothedBeaconAzimuthDeg: Float? = null
+
     fun reset() {
         mode = "idle"
         readingBuffer = ""; readingLabel = ""; readingDirection = "ltr"; pageSummaries.clear()
         trackingTarget = ""
         guidingDestinationLabel = ""; navWaypoints = emptyList(); navWaypointIdx = 0
         lastMappingGrid = null; mutableGrid = null
+        smoothedBeaconAzimuthDeg = null
     }
 }

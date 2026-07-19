@@ -3,6 +3,8 @@ import os
 import numpy as np
 from typing import Optional
 
+from tools.traversability import TraversabilityResult, estimate_traversability
+
 CORRIDOR_FRACTION = 1 / 3
 
 
@@ -18,8 +20,12 @@ class DA3DepthDetector:
     anchors via a since-removed scan_server/mvs.py helper; that was solving
     for a *relative*-depth model, which this one isn't.)
 
-    Per frame: DA3 inference → metric depth map → corridor 10th-percentile
-    depth → obstacle decision.
+    Per frame: DA3 inference → metric depth map → either a corridor
+    10th-percentile obstacle decision (check_obstacle) or a full polar
+    traversability fan (estimate_traversability, see traversability.py) —
+    both share one _depth_map() call so a caller requesting both DEPTH and
+    TRAVERSABILITY in one AnalyzeFrame round trip doesn't pay for DA3
+    inference twice.
     """
 
     OBSTACLE_THRESHOLD_M = 1.5
@@ -44,12 +50,16 @@ class DA3DepthDetector:
 
         self._da3 = build_estimator(onnx_path=onnx_path, device=device or "cpu")
 
+    def _depth_map(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """HxW float32 metric depth, metres — shared DA3 call for both
+        check_obstacle and estimate_traversability."""
+        rgb = frame_bgr[:, :, ::-1]
+        return self._da3.estimate(rgb).depth_map
+
     def check_obstacle(self, frame_bgr: np.ndarray) -> tuple[bool, float]:
         """Returns (obstacle_present, min_depth_metres)."""
         w_bgr = frame_bgr.shape[1]
-        rgb = frame_bgr[:, :, ::-1]
-
-        depth_metric = self._da3.estimate(rgb).depth_map  # HxW float32, metres
+        depth_metric = self._depth_map(frame_bgr)
 
         cx_start = int(w_bgr * (0.5 - CORRIDOR_FRACTION / 2))
         cx_end = int(w_bgr * (0.5 + CORRIDOR_FRACTION / 2))
@@ -60,3 +70,13 @@ class DA3DepthDetector:
 
         min_depth = float(np.percentile(corridor[valid_c], 10))
         return min_depth < self.OBSTACLE_THRESHOLD_M, min_depth
+
+    def estimate_traversability(
+        self, frame_bgr: np.ndarray, num_bins: int = 25, max_range_m: float = 5.0,
+    ) -> TraversabilityResult:
+        """Per-angle obstacle-clearance fan for THIS frame alone — see
+        traversability.py's module docstring for the full design (local
+        reactive HRTF obstacle-dodge, replaces the old occupancy-grid
+        ray-cast steering)."""
+        depth_metric = self._depth_map(frame_bgr)
+        return estimate_traversability(depth_metric, num_bins=num_bins, max_range_m=max_range_m)

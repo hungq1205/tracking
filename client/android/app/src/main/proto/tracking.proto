@@ -69,9 +69,13 @@ service PerceptionService {
 }
 
 enum AnalysisOp {
-  DETECT = 0;  // GroundingDINO open-vocab detection (requires prompt)
-  EMBED = 1;   // DINOv2 re-ID embedding (requires box_xyxy)
-  DEPTH = 2;   // obstacle/depth estimate (SparseObstacleDetector/StereoDepthDetector/DA3)
+  DETECT = 0;         // GroundingDINO open-vocab detection (requires prompt)
+  EMBED = 1;           // DINOv2 re-ID embedding (requires box_xyxy)
+  DEPTH = 2;           // obstacle/depth estimate (SparseObstacleDetector/StereoDepthDetector/DA3)
+  TRAVERSABILITY = 3;  // per-angle obstacle clearance fan — see TraversabilityInfo. The local,
+                       // per-frame, no-world-map obstacle-dodge signal walking/guiding's HRTF
+                       // beacon is now driven from (replaced the old occupancy-grid ray-cast
+                       // steering — see CLAUDE.md's "Local reactive HRTF obstacle-dodge" note).
 }
 
 message AnalyzeFrameRequest {
@@ -82,9 +86,10 @@ message AnalyzeFrameRequest {
 }
 
 message AnalyzeFrameResponse {
-  repeated Detection detections = 1;  // present if DETECT was requested
-  repeated float embedding = 2;       // present if EMBED was requested
-  ObstacleInfo obstacle = 3;          // present if DEPTH was requested
+  repeated Detection detections = 1;      // present if DETECT was requested
+  repeated float embedding = 2;           // present if EMBED was requested
+  ObstacleInfo obstacle = 3;              // present if DEPTH was requested
+  TraversabilityInfo traversability = 4;  // present if TRAVERSABILITY was requested
 }
 
 message Detection {
@@ -98,6 +103,22 @@ message ObstacleInfo {
   float distance_m = 2;
   float angle_deg = 3;   // relative bearing, 0 = straight ahead
   string description = 4;
+}
+
+// Self-describing polar clearance fan (mirrors OccupancyGrid's own
+// self-describing width/height/cell_size convention) — one nearest-obstacle
+// clearance value per egocentric azimuth bin, computed fresh from THIS
+// frame alone (no world state, no accumulation across frames). Azimuth 0 =
+// straight ahead, positive = right, same convention as HrtfBeacon.kt.
+// clearance_m[i] corresponds to azimuth (min_angle_deg + i * angle_step_deg);
+// a bin with no obstacle within max_range_m reads max_range_m itself (fully
+// open, not a missing value).
+message TraversabilityInfo {
+  repeated float clearance_m = 1;
+  float min_angle_deg = 2;
+  float max_angle_deg = 3;
+  float angle_step_deg = 4;
+  float max_range_m = 5;
 }
 
 message SynthesizeRequest {
@@ -282,6 +303,14 @@ message FindLandmarkResponse {
 // last happened to fire — this RPC carries no data any other service needs.
 service StatusService {
   rpc ReportMode (ReportModeRequest) returns (ReportModeResponse);
+  // Dashboard-only, fire-and-forget, same precedent as ReportMode above —
+  // carries no data any other service needs. The server has no other way
+  // to learn the beacon's actual final azimuth: goal-biasing + EMA
+  // smoothing now happen client-side (see ToolDispatcher's local-avoidance
+  // tick), so server_gui.py can't reconstruct it from the raw
+  // TraversabilityInfo fan alone. Called once per avoidance tick while
+  // walking/guiding is active.
+  rpc ReportBeaconDirection (ReportBeaconDirectionRequest) returns (ReportBeaconDirectionResponse);
 }
 
 message ReportModeRequest {
@@ -290,3 +319,10 @@ message ReportModeRequest {
 }
 
 message ReportModeResponse {}
+
+message ReportBeaconDirectionRequest {
+  float azimuth_deg = 1;  // meaningless when muted=true
+  bool muted = 2;
+}
+
+message ReportBeaconDirectionResponse {}

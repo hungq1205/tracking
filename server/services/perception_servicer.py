@@ -71,6 +71,18 @@ class PerceptionServiceServicer(tracking_pb2_grpc.PerceptionServiceServicer):
                         ),
                     )
                 )
+
+            if tracking_pb2.TRAVERSABILITY in ops and self.depth_detector is not None:
+                trav = self.depth_detector.estimate_traversability(frame)
+                response.traversability.CopyFrom(
+                    tracking_pb2.TraversabilityInfo(
+                        clearance_m=trav.clearance_m,
+                        min_angle_deg=trav.min_angle_deg,
+                        max_angle_deg=trav.max_angle_deg,
+                        angle_step_deg=trav.angle_step_deg,
+                        max_range_m=trav.max_range_m,
+                    )
+                )
         except Exception as e:
             traceback.print_exc()
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -88,6 +100,16 @@ class PerceptionServiceServicer(tracking_pb2_grpc.PerceptionServiceServicer):
                 obstacle=(
                     {"detected": obstacle.detected, "distance_m": obstacle.distance_m}
                     if obstacle is not None else None
+                ),
+                traversability=(
+                    {
+                        "clearance_m": list(response.traversability.clearance_m),
+                        "min_angle_deg": response.traversability.min_angle_deg,
+                        "max_angle_deg": response.traversability.max_angle_deg,
+                        "angle_step_deg": response.traversability.angle_step_deg,
+                        "max_range_m": response.traversability.max_range_m,
+                    }
+                    if response.HasField("traversability") else None
                 ),
             )
         return response

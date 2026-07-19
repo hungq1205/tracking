@@ -114,6 +114,7 @@ tool calls actually use — see "Client-Orchestrated Live Session".
 | RPC | Input | Output | What it does |
 |-----|-------|--------|--------------|
 | `ReportMode` | mode string + target string | (empty) | Tells the server which `LiveSessionState.mode` the client just entered — carries no data any other service needs, exists purely so `server_gui.py`'s dashboard can select the right tab directly. See "Client-reported mode" below. |
+| `ReportBeaconDirection` | azimuth_deg + muted bool | (empty) | Tells the server the HRTF beacon's actual final steering angle (post goal-bias, post EMA smoothing — all computed client-side). Same "dashboard-only, no other consumer" precedent as `ReportMode` — the server has no other way to know it. Called once per local-avoidance tick while walking/guiding is active. See "Local reactive HRTF obstacle-dodge" below. |
 
 ---
 
@@ -154,13 +155,18 @@ call goes through the two services below.
   in `server/services/perception_servicer.py`, thin wrappers around the same
   `tools/*.py` model wrappers `TrackingServiceServicer` already uses (no new
   model code):
-  - `AnalyzeFrame(image, ops: {DETECT, EMBED, DEPTH}, prompt?, box?) →
-    detections[], embedding?, obstacle?` — one round trip for whatever combo
-    a caller needs (`run_detection`/`check_obstacle` on-demand tools; walking
-    mode's own periodic DEPTH-op polling was removed, see "Walking mode
-    redesign" below), via `detector.detect_all()` (sorted by score, replaces
-    the old single-best `detect()` for this path)/`embedder.get_embedding()`/
-    `depth_detector.check_obstacle()`.
+  - `AnalyzeFrame(image, ops: {DETECT, EMBED, DEPTH, TRAVERSABILITY}, prompt?,
+    box?) → detections[], embedding?, obstacle?, traversability?` — one round
+    trip for whatever combo a caller needs (`run_detection`/`check_obstacle`
+    on-demand tools; walking mode's own periodic DEPTH-op polling was removed
+    long ago, see "Local reactive HRTF obstacle-dodge" below), via
+    `detector.detect_all()` (sorted by score, replaces the old single-best
+    `detect()` for this path)/`embedder.get_embedding()`/
+    `depth_detector.check_obstacle()`/`depth_detector.estimate_traversability()`
+    (new — per-angle obstacle-clearance fan, see "Local reactive HRTF
+    obstacle-dodge" below; shares the same DA3 inference call `check_obstacle`
+    already makes, so requesting both `DEPTH` and `TRAVERSABILITY` in one call
+    doesn't pay for DA3 twice).
   - `Synthesize(text) → stream(PcmChunk)` — KokoroTTS, unchanged voice.
   - `Embed(text) → vector` — `RagStore.embed_text()` (new method, raw
     sentence-transformer encode with no storage/search attached — Android
@@ -399,33 +405,41 @@ verbatim into `cameraManager.mappingMode` every processed frame — `""` for
 non-mapping modes) — replacing the old fixed `targetFps` and an earlier,
 now-superseded window+clearest-frame design:
 
-- **Mapping modes (walking/guiding/scanning)** — NO blur/clarity
-  filtering: whichever frame arrives once the interval has elapsed since
-  the last send is forwarded directly, no window/candidate comparison at
-  all. **Walking/guiding share `frameIntervalMs`** (SettingsScreen slider,
-  100–5000ms, default 1000); **scanning uses its own `scanIntervalMs`**
-  (SettingsScreen slider, 50–500ms, default 100, 50ms steps) — confirmed
-  with the user: a scan pass wants denser frame coverage for
-  reconstruction/landmark tagging than ambient walking/guiding steering
-  needs, so the two are independently tunable rather than sharing one
-  slider. Switching mode away from mapping, OR between walking/guiding/
-  scanning (different interval), resets the send-gate so a stale timestamp
-  from a different mode doesn't suppress the new mode's first send —
-  tracked via `activeMappingSubmode`, reset whenever `mappingMode` changes.
-- **Everything else (tracking/reading/Q&A/idle)** — still blur-aware:
-  `recentBufferMs` (SettingsScreen slider, 0–1000ms, 50ms steps, default
-  100) drives a small
-  rolling buffer of the last `recentBufferMs` of frames, no window
-  boundaries or send-gap logic at all. `clearestRecentFrame()` is a
-  pull-based accessor — the sharpest frame currently in the buffer, used
-  exactly where `ToolDispatcher.kt`'s `latestFrame()` closure is called
-  (OCR, `run_detection`, tracking-init retries): each of those wants
-  "the current frame" on demand, not a subscribed stream. Continuous
-  per-frame consumers (hand tracking, local ORB tracking, the UI overlay)
-  still get a steady trickle via the same `frameFlow`, emitted by
-  `handleRecentEmit()` at most once per `recentBufferMs` from whatever's
-  currently sharpest in the buffer — a real-time counterpart to the same
-  pull, not a second independent mechanism.
+- **Mapping modes (guiding/scanning — walking REMOVED from this set, see
+  below)** — NO blur/clarity filtering: whichever frame arrives once the
+  interval has elapsed since the last send is forwarded directly, no
+  window/candidate comparison at all. **Guiding uses `frameIntervalMs`**;
+  **scanning uses its own `scanIntervalMs`** — confirmed with the user: a
+  scan pass wants denser frame coverage for reconstruction/landmark
+  tagging than ambient guiding steering needs, so the two are
+  independently tunable rather than sharing one control. Both stay
+  ms-based internally (CameraManager.kt/persistence unchanged) but
+  SettingsScreen exposes them as plain FPS number-input fields (not
+  sliders) — "Mapping FPS" (0.2–10, default 1.0 = 1000ms) and "Scan FPS"
+  (2–20, default 10.0 = 100ms) — converted fps↔ms only at the UI boundary
+  (`doConnect()`'s `(1000f / fps).roundToInt()`), confirmed with the user
+  as the preferred input style over a slider. Switching mode away from
+  mapping, OR between guiding/scanning (different interval), resets the
+  send-gate so a stale timestamp from a different mode doesn't suppress
+  the new mode's first send — tracked via `activeMappingSubmode`, reset
+  whenever `mappingMode` changes.
+- **Everything else (tracking/reading/Q&A/idle/walking)** — still
+  blur-aware: `recentBufferMs` (SettingsScreen slider, 0–1000ms, 50ms
+  steps, default 100) drives a small rolling buffer of the last
+  `recentBufferMs` of frames, no window boundaries or send-gap logic at
+  all. `clearestRecentFrame()` is a pull-based accessor — the sharpest
+  frame currently in the buffer, used exactly where `ToolDispatcher.kt`'s
+  `latestFrame()` closure is called (OCR, `run_detection`, tracking-init
+  retries, AND now walking/guiding's own local-avoidance tick — see "Local
+  reactive HRTF obstacle-dodge"): each of those wants "the current frame"
+  on demand, not a subscribed stream. Continuous per-frame consumers (hand
+  tracking, local ORB tracking, the UI overlay) still get a steady trickle
+  via the same `frameFlow`, emitted by `handleRecentEmit()` at most once
+  per `recentBufferMs` from whatever's currently sharpest in the buffer —
+  a real-time counterpart to the same pull, not a second independent
+  mechanism. **Walking moved here from the mapping-modes bucket above**
+  once it dropped `MappingService`/RTAB-Map entirely — see "Local reactive
+  HRTF obstacle-dodge."
 
 See the Key Files Map entry above for the exact algorithm.
 
@@ -583,6 +597,16 @@ harmless.
 
 ### Walking mode redesign — ambient occupancy-grid steering, no spoken alerts
 
+**Superseded — see "Local reactive HRTF obstacle-dodge" below.** The
+occupancy-grid ray-cast steering this section describes
+(`LocalPathPlanner.findMostOpenDirection()`/`castOpenRay()`,
+`HrtfBeacon.worldYawRad()`, `ToolDispatcher.updateHrtfBeacon()`) has been
+removed outright, not deprecated — walking dropped `MappingService`/
+RTAB-Map entirely in favor of a per-frame local reactive signal with no
+world map at all. Kept here for history: the "no spoken alerts, one
+continuous ambient signal" framing established in this section is still
+current, just now fed by a different (and much lower-latency) mechanism.
+
 Confirmed with the user during this work: walking mode used to run TWO
 overlapping mechanisms simultaneously — it already opened the same
 `MappingService.UpdateMapping` stream guiding does (RTAB-Map occupancy
@@ -630,6 +654,197 @@ estimation inside `scan_session.py`'s live mapping/reconstruction pipeline
 itself) from `PerceptionService.AnalyzeFrame`'s `DEPTH` op, which is what
 got removed from walking mode's polling loop specifically.
 
+### Local reactive HRTF obstacle-dodge (replaces walking's occupancy-grid steering)
+
+Worked out with the user across several rounds of design discussion, then
+implemented. Two problems with the occupancy-grid-based steering documented
+in "Walking mode redesign" above drove this:
+
+1. **Latency.** The occupancy grid only updates once RTAB-Map has processed
+   a mini-batch and the map has been rebuilt — too slow to react to
+   something that just stepped into view. Walking has no destination
+   either, so a *world map* was never actually needed for it in the first
+   place.
+2. **What the sound should mean.** The beacon must be a pure **steering
+   command**, not a position: a fixed-radius circle around the user's head,
+   azimuth-only (elevation pinned to 0°) — "turn until the sound is ahead,"
+   not "the thing is over there at this distance." Guiding's old
+   `directionTo()`-driven beacon (real elevation + real distance to a
+   waypoint) doesn't match this either, going forward.
+
+**Chosen design** (standard two-layer navigation split — global planner
+decides *where to ultimately go*, local planner decides *what's safe to
+step toward right now*, HRTF only ever expresses the local layer as a
+steering angle):
+
+- **Walking** drops `MappingService`/RTAB-Map entirely — no pose, no grid,
+  no world state of any kind. Every tick: current frame → server computes a
+  per-frame, ground-segmented obstacle-clearance fan across a polar range
+  of egocentric angles (no accumulation, no memory of earlier frames) →
+  client picks the most open direction, EMA-smooths it, points the beacon
+  there.
+- **Guiding** keeps `MappingService`/RTAB-Map for the *global* layer exactly
+  as before (route to a landmark via `LocalPathPlanner`'s A*, arrival
+  detection), but the beacon itself is now driven by the same local fan,
+  **goal-biased**: score = clearance − distance-from-goal-bearing −
+  steering-effort, so the beacon nudges around an obstacle while still
+  pulling generally toward the route, instead of blindly maximizing open
+  space (ignoring the destination) or blindly pointing at the waypoint
+  through a wall (the old `directionTo()`-only behavior).
+- Both modes' beacon output is now azimuth-only / fixed-radius —
+  `directionTo()` is still used for guiding, but only to supply the *goal
+  azimuth* fed into the local scorer, never to place the beacon directly.
+
+**Server — the traversability fan (`server/tools/traversability.py`,
+new)**: `estimate_traversability(depth_map, num_bins, max_range_m)` is
+stateless and single-frame — no IMU, no persisted `ground_y` (unlike
+`occupancy_map.py`'s mapping-mode Bayesian grid, which this deliberately
+does NOT reuse). Per call: back-projects a subsampled pixel grid to
+camera-space 3D points via the same pinhole-K fallback used everywhere else
+in this codebase (`fx=fy=0.8*max(w,h)`), RANSAC-fits a ground plane from
+the bottom ~40% of the frame, classifies obstacle vs. ground by signed
+height above that plane, buckets obstacle points by azimuth
+(`atan2(X,Z)`), and returns the nearest-obstacle clearance per bin (a bin
+with nothing in range reads `max_range_m` — fully open, not a missing
+value). The angular range is derived from the frame's own estimated FOV,
+not a fixed cone — this only ever reacts to what's actually in view this
+frame, no side/rear awareness (an accepted limitation, discussed with the
+user).
+
+**Two real bugs found via synthetic ground-truth testing (RANSAC plane fit
+against a hand-built floor+box scene, back-projected through the exact same
+pinhole model the function itself uses) before this shipped**:
+
+1. **Sign-flip bug.** The obvious way to decide which side of the fitted
+   plane counts as "up" — check whether the ground points themselves read a
+   positive or negative signed distance — doesn't work: ground points read
+   ≈0 under *either* orientation of the plane normal (that's what makes them
+   inliers in the first place), so their own sign carries no information.
+   Fixed by using the CAMERA ORIGIN's signed distance instead (the `d`
+   coefficient, since `normal·(0,0,0)+d = d`) — the camera and any real
+   obstacle are always on the same side of the floor plane (both are
+   between the floor and the camera), so flipping when `d < 0` reliably
+   orients "obstacle-positive" regardless of which way RANSAC happened to
+   point the normal. Verified: 0/20 failures detecting a synthetic box
+   after the fix, vs. ~40% before it.
+2. **Frontal-obstacle-as-floor bug.** A flat obstacle filling most/all of
+   the frame (e.g. the user standing right up against a wall) is itself a
+   perfectly good RANSAC plane fit — just not a horizontal one — and would
+   get silently accepted as "the floor," reading back as fully open exactly
+   when it's most dangerously wrong. Fixed by rejecting any candidate plane
+   whose normal isn't substantially vertical (`_MIN_GROUND_NORMAL_
+   VERTICALITY`) during RANSAC scoring itself, not just after the fact —
+   a plane that fails this never wins, so the "no confident floor" fallback
+   (treat every visible point as an obstacle) correctly engages instead.
+   Verified: a synthetic fully-blocked frame now reads as fully blocked in
+   20/20 trials, not fully open.
+
+`server/tools/depth.py`'s `DA3DepthDetector` was refactored to share one
+`_depth_map()` call between `check_obstacle()` (existing corridor check)
+and the new `estimate_traversability()` — a caller requesting both `DEPTH`
+and `TRAVERSABILITY` in one `AnalyzeFrame` round trip doesn't pay for DA3
+inference twice.
+
+**Proto (`tracking.proto`)**: `AnalysisOp.TRAVERSABILITY` (new), new
+self-describing `TraversabilityInfo` message (mirrors `OccupancyGrid`'s own
+self-describing width/height/cell_size convention — `min_angle_deg`/
+`max_angle_deg`/`angle_step_deg`/`max_range_m` alongside the clearance
+array, so the client never hardcodes bin count or FOV), and
+`StatusService.ReportBeaconDirection` (azimuth_deg + muted, dashboard-only,
+same fire-and-forget precedent as `ReportMode` — see that RPC's own entry
+above).
+
+**Android (`client/android/app/src/main/java/com/tracking/client/live/`)**:
+
+- **`TraversabilityScorer.kt`** (new) — `pickSteeringAngle()`: classic
+  Vector-Field-Histogram-style scoring. Each candidate bin's score is its
+  own corridor-windowed clearance (minimum over a small window of
+  neighboring bins — approximates the user's body needing to actually fit
+  through a gap, not just one ray missing an obstacle), minus a
+  goal-bearing penalty (guiding only — `null` for walking, which has no
+  destination) and a steering-effort penalty against the beacon's current
+  smoothed azimuth. Returns `null` (mute) when even the best bin's own
+  clearance is below a floor threshold. `smoothAzimuth()` — EMA toward the
+  picked angle, shortest-path around the ±180° wrap.
+- **`ToolDispatcher.kt`** — `updateHrtfBeacon()` (old, grid-driven) is gone;
+  replaced by `startLocalAvoidanceTicks()`/`runAvoidanceTick()`, a
+  `Dispatchers.IO` loop on its own cadence (`avoidanceIntervalMs`,
+  independent of guiding's slower `MappingService` frame cadence — the two
+  are different layers with different latency needs). Each tick: pull the
+  current frame via `latestFrame()` (`clearestRecentFrame()` — already
+  blur-aware and pull-based, the right fit for a reactive per-tick pull) →
+  `AnalyzeFrame(ops=[TRAVERSABILITY])` → compute the goal azimuth for
+  guiding (`HrtfBeacon.directionTo(pose, wx, wz).azimuthDeg` against the
+  current waypoint — azimuth only, its elevation/distance are unused now)
+  → `TraversabilityScorer.pickSteeringAngle()` → `smoothAzimuth()` →
+  `hrtfBeacon.updateDirection(smoothed, 0f, OPEN_DIRECTION_DISTANCE_M)` (a
+  fixed nominal radius, same precedent `HrtfBeacon.directionFromBox()`
+  already set for tracking mode's own no-real-distance case) or `.mute()` →
+  fire-and-forget `reportBeaconDirection()`. `toolStartWalking()` no longer
+  calls `startMappingStream()` at all; `toolStartGuiding()` calls BOTH
+  `startMappingStream()` (global route) and `startLocalAvoidanceTicks()`
+  (local dodge). `stopActiveModes()`/`shutdown()` stop the tick job
+  unconditionally alongside the mapping stream and the beacon.
+- **`LocalPathPlanner.kt`** — `findMostOpenDirection()`/`castOpenRay()`
+  removed outright (dead once walking dropped the grid). `findPath()`/A*
+  unchanged — guiding's global layer still needs it.
+- **`HrtfBeacon.kt`** — `worldYawRad()` removed outright (its only caller
+  was `findMostOpenDirection()`). `directionTo()`/`directionFromBox()`
+  unchanged.
+- **`LiveSessionState.kt`** — new `smoothedBeaconAzimuthDeg: Float?`,
+  carried across ticks so smoothing has something to smooth FROM; reset to
+  `null` at the start of a fresh walking/guiding session, but deliberately
+  NOT reset on a single muted tick (a brief mute — e.g. one bad frame —
+  shouldn't discard smoothing continuity for whenever the beacon un-mutes).
+- **`CameraManager.kt`** — the mapping-submode special case (no blur
+  filtering, own send-interval) now covers only `guiding`/`scanning`, not
+  `walking`. Walking's frames flow through the ordinary blur-aware
+  `recentBufferMs` path instead (the same one tracking/reading/idle already
+  use) — which turns out to be exactly the right fit, since
+  `runAvoidanceTick()` wants "the current sharp frame on demand," not a
+  subscribed interval stream. `MainViewModel.kt`'s mirrored
+  `mappingModeActive` condition narrowed the same way.
+- **New "Avoidance FPS" setting** (`SettingsScreen.kt`/`SettingsViewModel`)
+  — same plain-FPS-number-input convention as "Mapping FPS"/"Scan FPS"
+  (fps↔ms conversion only at `doConnect()`), default 350ms/≈2.86fps,
+  threaded through `MainViewModel.connect()` into
+  `ToolDispatcher(avoidanceIntervalMs=...)`.
+
+**GUI**: `server/services/beacon_preview.py` (the old server-side,
+visualization-only world-point reconstruction of "where does the beacon
+point") is deleted outright, along with its usage in `mapping_servicer.py`
+(`_resolved_destinations`/`_last_open_direction` caches, the
+`beacon_world_xz`/`beacon_pixel` computation block) — it modeled the OLD
+grid-based beacon and has no correct equivalent for a client-computed
+azimuth. Replaced by `ReportBeaconDirection` (above) feeding a NEW
+`server_gui.py` panel on the **Perception tab** (not Mapping — walking no
+longer touches `MappingService` at all, so its only server traffic is
+`PerceptionService.AnalyzeFrame(TRAVERSABILITY)` + `StatusService`;
+`_TAB_BY_CLIENT_MODE["walking"]` now points at `tab_perception`
+accordingly): `_render_beacon_polar()` draws the last traversability fan as
+a Plotly polar bar chart (forward = 12 o'clock, azimuth-right reads
+clockwise, matching `HrtfBeacon.kt`'s sign convention) with a marker at the
+client-reported final azimuth, greyed out when muted. The old magenta
+circle overlays on the Mapping tab's frame/occupancy-map views are removed
+(nothing to draw any more — the real beacon direction was never grid-space
+to begin with now).
+
+**Known, accepted limitations** (discussed with the user, not solved by
+this design):
+
+- No IMU-assisted ground-plane fit — purely single-frame RANSAC. A frame
+  with literally no visible floor (very close obstacle filling the view)
+  degrades to "treat everything in range as an obstacle" rather than
+  guessing, per the frontal-obstacle-as-floor fix above.
+- The fan has no memory — an obstacle just outside the current frame gets
+  no warning until it's back in view. This is the direct tradeoff for
+  dropping the (laggy but persistent) occupancy-grid world model.
+- Guiding now makes two independent per-cycle round trips (the slow
+  `MappingService` stream frame for the route, the faster
+  `PerceptionService.AnalyzeFrame` call for the local dodge) — accepted
+  since they serve genuinely different layers and the latter is a
+  lightweight unary call, not a stream.
+
 ### Session-mode pipeline split — SCAN vs. WALKING/GUIDING (`walking_lite`)
 
 Real bug, found via a live device session and fixed: walking mode was
@@ -639,6 +854,15 @@ running the exact same FULL pipeline scanning does — RTAB-Map's own
 every single mini-batch, making walking unusably slow (30-53s stalls
 between occupancy updates) for a mode that only ever needed a live
 occupancy grid, never a persisted point cloud or landmark discovery.
+
+**Note (post "Local reactive HRTF obstacle-dodge"): `SessionMode.WALKING`
+is now effectively dead.** Walking dropped `MappingService` entirely, so
+`feedMappingFrame()` is never called while `state.mode == "walking"` any
+more — nothing ever sends this enum value in practice. The `walking_lite`
+mechanism described below stays fully alive and necessary for `GUIDING`
+(still a non-`SCAN` mode), which is the only mode that reaches it now. The
+enum value itself was left in the proto rather than removed — harmless to
+keep, and removing it would be a wire-compatibility churn for no benefit.
 
 **Chosen fix**: an explicit `SessionMode` (`tracking.proto`: `SCAN`,
 `WALKING`, `GUIDING`) on `MappingChunk`, set once by the client
@@ -725,20 +949,18 @@ otherwise" split this codebase already uses for RTAB-Map loop closure
   still recomputed on every delta export (cheap, vectorized), just not
   propagated to untouched neighbor cells' delta payload.
 - **`mapping_servicer.py`'s full-vs-delta decision** — `MappingServiceServicer.
-  _last_full_bounds` (new, keyed by `location_id`) caches the bounds as of
+  _last_full_bounds` (keyed by `location_id`) caches the bounds as of
   the last FULL grid sent. A `full_resync` is forced when there's no cached
-  entry (first update for this stream — reset via `_last_full_bounds.pop()`/
-  `_last_open_direction.pop()` at stream-open, since these caches are
-  servicer-instance-scoped and would otherwise wrongly survive across
-  separate streams for the same `location_id` and cause a coincidental
-  bounds match to skip a resync the new stream actually needs) or when
-  `bounds()` no longer matches the cached value (the explored area grew).
-  Otherwise `extract_dirty_delta()` is sent instead. The dashboard's
-  beacon-preview circle (`beacon_preview.py`, see the Key Files Map)
-  recomputes only on a `full_resync` for the same reason — a debug
-  visualization refreshing less often than every tick is an acceptable
-  tradeoff against paying for a second `extract_full_grid()` call on delta
-  ticks purely to keep it maximally fresh.
+  entry (first update for this stream — reset via `_last_full_bounds.pop()`
+  at stream-open, since this cache is servicer-instance-scoped and would
+  otherwise wrongly survive across separate streams for the same
+  `location_id` and cause a coincidental bounds match to skip a resync the
+  new stream actually needs) or when `bounds()` no longer matches the
+  cached value (the explored area grew). Otherwise `extract_dirty_delta()`
+  is sent instead. (The `_last_open_direction` cache this bullet used to
+  also mention was part of `beacon_preview.py`'s dashboard-only beacon
+  reconstruction, deleted outright — see "Local reactive HRTF
+  obstacle-dodge".)
 - **`MutableOccupancyGrid.kt`** (new, Android) — the client no longer
   replaces `LiveSessionState.lastMappingGrid` wholesale on every update.
   `state.mutableGrid` is a persistent, patchable backing store:
@@ -750,9 +972,10 @@ otherwise" split this codebase already uses for RTAB-Map loop closure
   a grid whose bounds provably haven't changed, per the server's own
   `full_resync` decision). `toProto()` cheaply repackages the current
   mutable arrays back into an immutable `Tracking.OccupancyGrid` for
-  existing consumers (`LocalPathPlanner`, `HrtfBeacon`/walking's
-  `findMostOpenDirection`) — no reimplementation needed there at all,
-  `ToolDispatcher`'s collect loop just assigns `state.lastMappingGrid =
+  existing consumers (`LocalPathPlanner`'s A*, guiding-only now — see
+  "Local reactive HRTF obstacle-dodge" for why walking no longer reads this
+  grid at all) — no reimplementation needed there at all, `ToolDispatcher`'s
+  collect loop just assigns `state.lastMappingGrid =
   state.mutableGrid?.toProto()` after applying whichever kind of update
   arrived, same as before.
 - **Server CPU cost is unchanged** — `extract_dirty_delta()` still runs the
@@ -2100,10 +2323,13 @@ server/
                                    Tab auto-selection prefers ActivityMonitor.client_mode
                                    (StatusService.ReportMode, authoritative) over inferring from
                                    whichever RPC category most recently updated (fallback for older
-                                   clients). Mapping tab shows the last frame and occupancy_map.py's own
-                                   render_plotly() SIDE BY SIDE in one row, against the LIVE OccupancyMap
-                                   reference ActivityMonitor's mapping bucket holds — occupancy-grid-only,
-                                   deliberately no point-cloud/voxel/confidence view (those stay
+                                   clients) — "walking" now maps to tab_perception, not tab_mapping,
+                                   since walking no longer touches MappingService at all (see "Local
+                                   reactive HRTF obstacle-dodge"). Mapping tab shows the last frame and
+                                   occupancy_map.py's own render_plotly() SIDE BY SIDE in one row,
+                                   against the LIVE OccupancyMap reference ActivityMonitor's mapping
+                                   bucket holds — occupancy-grid-only (routing use only now, see
+                                   below), deliberately no point-cloud/voxel/confidence view (those stay
                                    scan_gui.py's separate, heavier offline debug tool — render_confidence_
                                    plotly() was shown here too originally, dropped as unnecessary for this
                                    at-a-glance live dashboard); wrapped in try/except since that reference
@@ -2114,7 +2340,16 @@ server/
                                    annotated frame (frame_rgb is RGB order, red=(255,0,0)) plus a line in
                                    the Detail textbox, both driven by ActivityMonitor's rtabmap_lost/
                                    rtabmap_total fields (mapping_servicer.py) — see "Blur filtering
-                                   removed for scan/walking" above. No
+                                   removed for scan/walking" above. Perception tab gained a beacon-
+                                   direction panel — _render_beacon_polar()/_beacon_status(), a Plotly
+                                   polar chart of the last AnalyzeFrame(TRAVERSABILITY) fan plus a
+                                   marker at the client-reported final azimuth (ActivityMonitor.
+                                   beacon_azimuth_deg/beacon_muted, fed by StatusService.
+                                   ReportBeaconDirection) — see "Local reactive HRTF obstacle-dodge".
+                                   The old magenta beacon-position circles on the Mapping tab's frame/
+                                   occupancy-map views are REMOVED (beacon_preview.py, below, is
+                                   deleted — the beacon is a pure steering angle now, not a world
+                                   position, so there's nothing left to project onto those views). No
                                    more Chat/Reading tabs or zone-based nav map (those depended on
                                    the deleted server-side LiveSessionState/session.conversation_log/
                                    session._route_planner — this file no longer reads a `servicer`
@@ -2141,7 +2376,9 @@ server/
                                    (frame, prompt/box/score or embedding dim) on every call.
     perception_servicer.py       PerceptionServiceServicer — AnalyzeFrame/Synthesize/Embed. Records
                                    into ActivityMonitor's perception bucket (frame + detections/
-                                   obstacle for AnalyzeFrame, text for Synthesize/Embed).
+                                   obstacle/traversability for AnalyzeFrame, text for Synthesize/
+                                   Embed). Handles the TRAVERSABILITY op via depth_detector.
+                                   estimate_traversability() — see "Local reactive HRTF obstacle-dodge".
     mapping_servicer.py          MappingServiceServicer — UpdateMapping/GetMapSnapshot/
                                    ListMappedLocations/FindLandmark. Records into ActivityMonitor's
                                    mapping bucket on every yielded MappingUpdate (frame, pose,
@@ -2150,11 +2387,12 @@ server/
                                    snapshot, see activity_monitor.py's merge-not-clear note) and every
                                    FindLandmark call. Decides full-vs-delta occupancy grid sync per
                                    update (_last_full_bounds cache vs. OccupancyMap.bounds()) — see
-                                   "Occupancy grid delta sync" above. Also resolves beacon_preview.py's
-                                   visualization-only "where does the HRTF beacon point" reconstruction
-                                   (_resolved_destinations cache for guiding, recomputed-on-full-resync
-                                   for walking) and stores it (world xz + projected frame pixel) into
-                                   ActivityMonitor for server_gui.py's dashboard circles.
+                                   "Occupancy grid delta sync" above. No longer resolves any beacon-
+                                   direction preview (beacon_preview.py and its _resolved_destinations/
+                                   _last_open_direction caches were deleted outright — see "Local
+                                   reactive HRTF obstacle-dodge"; the beacon's actual direction is now
+                                   reported directly by the client via StatusService.
+                                   ReportBeaconDirection instead of reconstructed server-side).
                                    UpdateMapping reads `for chunk in request_iterator:` directly (the full
                                    queue, no dropping) — a drop-to-latest mailbox was tried and reverted,
                                    see "Drop-to-latest mapping-chunk ingestion" below for why.
@@ -2165,15 +2403,12 @@ server/
                                    now also passes rtabmap_lost/rtabmap_total (from session.last_rtabmap_
                                    lost/last_rtabmap_total) so server_gui.py can show RTAB-Map pose-lost
                                    status directly instead of only in console output.
-    beacon_preview.py            find_most_open_direction_world_point()/project_world_point_to_pixel()
-                                   — server-side, VISUALIZATION-ONLY reconstruction of the HRTF beacon's
-                                   current direction, for server_gui.py's dashboard circles. Never feeds
-                                   back into the real audio (computed entirely on Android, see "Walking
-                                   mode redesign" above, for latency reasons). Duplicates (does not
-                                   import) LocalPathPlanner.kt's findMostOpenDirection() ray-cast logic
-                                   — same cross-process duplication precedent as live_path_planner.py.
-    status_servicer.py           StatusServiceServicer — ReportMode only. No data any other service
-                                   needs; records straight into ActivityMonitor.record_client_mode().
+    status_servicer.py           StatusServiceServicer — ReportMode + ReportBeaconDirection (new).
+                                   Neither carries data any other service needs; both record straight
+                                   into ActivityMonitor (record_client_mode()/record_beacon_direction()).
+                                   ReportBeaconDirection is dashboard-only like ReportMode, but called
+                                   once per local-avoidance tick (far more often) — no console print for
+                                   it, unlike ReportMode, since that cadence would spam the log.
   ARCHITECTURE.md                Detailed server internals (component map, data flows, tool→function map;
                                    describes the pre-migration architecture, not fully updated)
   tools/
@@ -2190,7 +2425,21 @@ server/
                                    have). SparseObstacleDetector (ORB-only, relative depth) and
                                    StereoDepthDetector (plane sweep MVS) were removed — this is now
                                    the only depth path for PerceptionService.AnalyzeFrame's DEPTH op,
-                                   so DEPTH_MODEL is no longer read.
+                                   so DEPTH_MODEL is no longer read. Refactored to share one
+                                   _depth_map() DA3 call between check_obstacle() and the new
+                                   estimate_traversability() (delegates to traversability.py, below) —
+                                   see "Local reactive HRTF obstacle-dodge".
+    traversability.py            (new) estimate_traversability(depth_map, num_bins, max_range_m) —
+                                   stateless, single-frame polar obstacle-clearance fan: back-project via
+                                   the same pinhole-K fallback used throughout this codebase, RANSAC-fit
+                                   a ground plane from the frame's bottom ~40%, classify obstacle vs.
+                                   ground by height above it, bucket by azimuth. No IMU, no persisted
+                                   ground_y (deliberately NOT occupancy_map.py's accumulated-belief
+                                   design — a world map is too slow for reactive per-frame dodging). Two
+                                   real bugs found via synthetic ground-truth testing before this
+                                   shipped (sign-flip using the wrong reference point; a frontal
+                                   obstacle filling the frame getting accepted as "the floor") — see
+                                   "Local reactive HRTF obstacle-dodge" for both.
     rag_store.py                 Sentence-transformer text embeddings (embed_text(), backs PerceptionService.Embed);
                                    storage/search methods (add_text/query_global) are now unused server-side —
                                    storage lives on Android (LocalMemoryStore.kt) — kept for reference/DummyRagStore
@@ -2693,27 +2942,31 @@ client/
                                      gate.py's _sharpness_score() uses server-side) — moved here from the
                                      server, see "Client-side frame selection" note for the full rationale.
                                      TWO independent selection policies, chosen per-frame via mappingMode
-                                     (String — "", "walking", "guiding", "scanning" — set every processed
-                                     frame by MainViewModel.kt's frame collector, forwarded verbatim from
-                                     sessionState.mode): (1) mapping modes (walking/guiding/scanning) — NO
+                                     (String — "", "guiding", "scanning" — set every processed frame by
+                                     MainViewModel.kt's frame collector, forwarded verbatim from
+                                     sessionState.mode; walking is deliberately NOT in this set any more —
+                                     it dropped MappingService entirely, see "Local reactive HRTF
+                                     obstacle-dodge"): (1) mapping modes (guiding/scanning) — NO
                                      blur/clarity filtering (removed, confirmed with the user — see "Blur
                                      filtering removed for scan/walking"): whichever frame arrives once
-                                     frameIntervalMs (SettingsScreen slider, 100..5000ms, default 1000, for
-                                     walking/guiding) or scanIntervalMs (SettingsScreen slider, 50..500ms,
-                                     50ms steps, default 100, for scanning) has elapsed since the last send
-                                     is forwarded directly — no window, no candidate comparison;
-                                     activeMappingSubmode tracks which one is in effect and resets the
-                                     send-gate on any submode change (a stale timestamp from a different
-                                     mode/interval shouldn't suppress the new mode's first send); (2)
+                                     frameIntervalMs (ms, guiding) or scanIntervalMs (ms, scanning) has
+                                     elapsed since the last send is forwarded directly — no window, no
+                                     candidate comparison. Both stay ms internally; SettingsScreen exposes
+                                     them as FPS number inputs, not sliders ("Mapping FPS" 0.2..10 default
+                                     1.0, "Scan FPS" 2..20 default 10.0), converting fps->ms only at
+                                     doConnect() time. activeMappingSubmode tracks which one is in effect and
+                                     resets the send-gate on any submode change (a stale timestamp from a
+                                     different mode/interval shouldn't suppress the new mode's first send); (2)
                                      recentBufferMs (SettingsScreen slider, 0..1000ms, 50ms steps, default
-                                     100) — every other mode (tracking/reading/Q&A/idle) — a small rolling
-                                     buffer of the last recentBufferMs of frames, no window/gap logic;
+                                     100) — every other mode (tracking/reading/Q&A/idle/walking) — a small
+                                     rolling buffer of the last recentBufferMs of frames, no window/gap logic;
                                      clearestRecentFrame() pulls the sharpest buffered frame on demand (used
                                      by ToolDispatcher.kt's latestFrame() closure — OCR/run_detection/
-                                     tracking-init calls that want "the current frame" right now), while
-                                     handleRecentEmit() emits that same clearest-so-far frame into frameFlow
-                                     at most once per recentBufferMs for continuous per-frame consumers (hand
-                                     tracking, local ORB tracking, UI overlay).
+                                     tracking-init calls, AND now walking/guiding's own local-avoidance tick,
+                                     see "Local reactive HRTF obstacle-dodge" — all want "the current frame"
+                                     right now), while handleRecentEmit() emits that same clearest-so-far
+                                     frame into frameFlow at most once per recentBufferMs for continuous
+                                     per-frame consumers (hand tracking, local ORB tracking, UI overlay).
     sensors/
       ImuSensor.kt                 SensorManager wrapper; emits ImuReading Flow at SENSOR_DELAY_FASTEST
       ImuRecorder.kt               Writes imu.csv (header: timestamp_ns,ax,ay,az,gx,gy,gz) alongside images/
@@ -2724,35 +2977,48 @@ client/
                                      "Client-Orchestrated Live Session" section for the full picture
       GeminiLiveClient.kt           Raw WebSocket client for Gemini Live's BidiGenerateContent protocol
       ToolDeclarations.kt           SYSTEM_PROMPT + FunctionDeclaration JSON, ported from tool_declarations.py
-      LiveSessionState.kt           Port of server/live_session.py's LiveSessionState
+      LiveSessionState.kt           Port of server/live_session.py's LiveSessionState. smoothedBeaconAzimuthDeg
+                                     (new) — the HRTF beacon's EMA-smoothed azimuth, carried across local-
+                                     avoidance ticks (see ToolDispatcher.kt below).
       ToolDispatcher.kt             Port of _dispatch_tool + live_tools/*.py — remote/3rd-party/local/device.
                                      stopActiveModes() — called first by every mode-entry tool, enforces
                                      state.mode exclusivity (see "Mode exclusivity" note above). reportMode()
                                      — fire-and-forget StatusService.ReportMode call on every mode transition.
+                                     startLocalAvoidanceTicks()/runAvoidanceTick() (new) — the local reactive
+                                     HRTF obstacle-dodge loop for walking AND guiding, see "Local reactive
+                                     HRTF obstacle-dodge" above; replaced updateHrtfBeacon() (removed).
       OcrClient.kt                  Direct 3rd-party HTTP client to paddle_ocr_server
       LocalMemoryStore.kt           On-device JSON memory store + embedding index + cosine search
       LocalPathPlanner.kt           Kotlin port of live_path_planner.py's A* (clearance-aware, closest-approach)
-                                     for guiding. findMostOpenDirection() (new) — walking mode's ambient
-                                     beacon steering: ray-casts per candidate egocentric azimuth against
-                                     the grid to find the most open direction, no destination/A* involved
-                                     — see "Walking mode redesign" note above.
+                                     for guiding's global route only now — findMostOpenDirection()/
+                                     castOpenRay() (walking's old grid-raycast steering) were removed
+                                     outright, see "Local reactive HRTF obstacle-dodge" above.
+      TraversabilityScorer.kt       (new) pickSteeringAngle() — Vector-Field-Histogram-style local
+                                     obstacle-dodge scoring against a per-frame TraversabilityInfo fan:
+                                     corridor-windowed clearance minus goal-bearing penalty (guiding only)
+                                     minus steering-effort penalty, peak-picked; smoothAzimuth() — EMA
+                                     toward the picked angle. See "Local reactive HRTF obstacle-dodge".
       HrtfBeacon.kt                 directionTo() — egocentric waypoint azimuth/elevation from the
-                                     current Pose (guiding/walking); directionFromBox() — pixel-offset
-                                     azimuth/elevation from a 2D ORB tracking box (tracking mode, no
-                                     pose/depth available); worldYawRad() (new) — yaw-only world heading
-                                     from a Pose, used by LocalPathPlanner.findMostOpenDirection()
+                                     current Pose (guiding's goal-bias input only now — its own
+                                     elevation/distance are no longer used to place the beacon directly);
+                                     directionFromBox() — pixel-offset azimuth/elevation from a 2D ORB
+                                     tracking box (tracking mode, no pose/depth available). worldYawRad()
+                                     was removed outright (its only caller, findMostOpenDirection(), is
+                                     gone — see "Local reactive HRTF obstacle-dodge").
       MutableOccupancyGrid.kt       (new) Persistent, patchable occupancy grid — fromFull()/applyDelta()/
                                      toProto(). Backs LiveSessionState.mutableGrid; ToolDispatcher's
-                                     mapping-stream collect loop patches it from MappingUpdate.grid_delta
-                                     instead of replacing lastMappingGrid wholesale every update — see
-                                     "Occupancy grid delta sync" above.
+                                     mapping-stream collect loop (guiding/scanning only now) patches it
+                                     from MappingUpdate.grid_delta instead of replacing lastMappingGrid
+                                     wholesale every update — see "Occupancy grid delta sync" above.
     ui/
-      MainViewModel.kt             connect(host, port, fps, vadThreshold, startThreshold, geminiApiKey,
-                                     ocrServerUrl, locationId) — doLiveSession() opens a GeminiLiveClient
-                                     directly (no more server-relayed VoiceChatStream for this client) and
-                                     drives ToolDispatcher.dispatch() for every Gemini function call;
+      MainViewModel.kt             connect(host, port, fps, avoidanceIntervalMs, vadThreshold,
+                                     startThreshold, geminiApiKey, ocrServerUrl, locationId) —
+                                     doLiveSession() opens a GeminiLiveClient directly (no more
+                                     server-relayed VoiceChatStream for this client) and drives
+                                     ToolDispatcher.dispatch() for every Gemini function call;
                                      feedMappingFrame() called from the camera-frame collector while
-                                     mode is guiding/walking
+                                     mode is guiding/scanning only now (walking dropped MappingService
+                                     entirely — see "Local reactive HRTF obstacle-dodge" above).
 
 paddle_ocr_server/               Standalone OCR microservice (port 8100), called directly by Android now
   server.py                       FastAPI /ocr endpoint — decode -> _preprocess (grayscale/upscale/
@@ -2791,27 +3057,42 @@ User names a target → start_tracking(target) tool
 ```
 
 ### Live navigation (guiding/walking)
+
+Two layers now — global route (guiding only, `MappingService`) and local
+reactive dodge (both modes, `PerceptionService`) — see "Local reactive
+HRTF obstacle-dodge" for the full design.
+
 ```
-User says "guide me to the couch" / "start walking" → start_guiding/
-start_walking tool
-  → ToolDispatcher opens a MappingService.UpdateMapping bidi stream,
-    feeding camera frames (RTAB-Map pose only)
-  → server streams back Pose + OccupancyGrid (only when changed) + landmarks
-  → GUIDING: LocalPathPlanner.findPath() (Kotlin A*) computes/updates a route
-    entirely on-device against the received grid; HrtfBeacon.directionTo()
-    points the beacon at the current waypoint; checkWaypointProgress()
+User says "guide me to the couch" → start_guiding tool
+  → GLOBAL: ToolDispatcher opens a MappingService.UpdateMapping bidi
+    stream, feeding camera frames (RTAB-Map pose only) → server streams
+    back Pose + OccupancyGrid (only when changed) + landmarks →
+    LocalPathPlanner.findPath() (Kotlin A*) computes/updates a route
+    entirely on-device against the received grid; checkWaypointProgress()
     sendSystemNote()s "[SYSTEM] Waypoint reached"/"Arrived at X" for Gemini
     to react to in audio.
-  → WALKING (no destination — see "Mode exclusivity" note above):
-    LocalPathPlanner.findMostOpenDirection() instead — no route, just
-    whichever egocentric direction has the most clear space ahead right now
-    (short rays cast through the grid per candidate azimuth). Purely
-    ambient: HrtfBeacon plays continuously toward that direction, muted
-    only when nothing passable is found — no [SYSTEM] messages, no spoken
-    alerts. Replaced the old fixed-interval PerceptionService.AnalyzeFrame
-    (DEPTH op) polling + spoken "[SYSTEM] Obstacle ~Xm ahead" alert
-    (`quick_label_obstacle` tool, `LiveSessionState.walkingObstacleCache`)
-    entirely — both removed, not deprecated.
+  → LOCAL (same as walking below, goal-biased): the actual HRTF beacon
+    direction — HrtfBeacon.directionTo()'s azimuth (to the current
+    waypoint) feeds in as the goal-bias term, not as the beacon's direction
+    directly any more.
+
+User says "start walking" → start_walking tool (no MappingService at all)
+  → ToolDispatcher.startLocalAvoidanceTicks(): every avoidanceIntervalMs,
+    pull the current frame (clearestRecentFrame()) →
+    PerceptionService.AnalyzeFrame(TRAVERSABILITY) → per-frame, ground-
+    segmented obstacle-clearance fan, no world state → TraversabilityScorer
+    picks the most open direction (pure clearance, no goal bias — walking
+    has no destination) → EMA-smoothed → HrtfBeacon plays continuously
+    toward that azimuth (elevation 0, fixed radius — pure steering command,
+    not a position), muted only when nothing safe is found. Purely
+    ambient — no [SYSTEM] messages, no spoken alerts, matching this
+    project's established beacon behavior. Replaced the old fixed-interval
+    PerceptionService.AnalyzeFrame(DEPTH op) polling + spoken "[SYSTEM]
+    Obstacle ~Xm ahead" alert (`quick_label_obstacle` tool,
+    `LiveSessionState.walkingObstacleCache`) entirely — both long since
+    removed, not deprecated — AND its own successor, the occupancy-grid
+    `findMostOpenDirection()` ray-cast, which is now removed too (too slow
+    to react — see "Local reactive HRTF obstacle-dodge").
 ```
 
 ### Reading a document aloud

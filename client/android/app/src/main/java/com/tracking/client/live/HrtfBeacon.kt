@@ -78,26 +78,6 @@ object HrtfBeacon {
         )
     }
 
-    /**
-     * World-space heading (yaw only, radians) of the camera's forward axis
-     * — the world-space X-Z angle you'd add an egocentric azimuth to in
-     * order to get an absolute world-space bearing. Used by
-     * LocalPathPlanner.findMostOpenDirection() for walking mode's ambient
-     * beacon, which has no waypoint to route toward and instead needs to
-     * test candidate directions relative to current heading against the
-     * occupancy grid.
-     *
-     * Pitch/roll are deliberately ignored — this project's navigation is
-     * floor-constrained pedestrian movement (same assumption CLAUDE.md's
-     * "Continuous obstacle clearance" note makes for path planning), so
-     * only the yaw component of the pose's orientation is meaningful for
-     * "which way is the user walking."
-     */
-    fun worldYawRad(pose: Tracking.Pose): Double {
-        val forward = rotate(pose.qx, pose.qy, pose.qz, pose.qw, 0f, 0f, 1f)
-        return atan2(forward.first.toDouble(), forward.third.toDouble())
-    }
-
     private fun rotateByConjugate(
         qx: Float, qy: Float, qz: Float, qw: Float, vx: Float, vy: Float, vz: Float,
     ): Triple<Float, Float, Float> = rotate(-qx, -qy, -qz, qw, vx, vy, vz)
