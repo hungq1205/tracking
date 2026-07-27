@@ -109,6 +109,17 @@
 //         int32   point_count
 //         float32[point_count*3]  xyz
 //         uint8[point_count*3]    rgb
+//         uint8[point_count]      is_ground        1=RTAB-Map classified this
+//                  point as ground, 0=obstacle — see segment_ground_flags()'s
+//                  own comment for why this needs an axis remap internally
+//                  (RTAB-Map's segmentObstaclesFromGround hardcodes its
+//                  reference "up" as world +Z; this project's own convention
+//                  is Y-down, "up" = -Y). Computed once per node, in the
+//                  node's own CAMERA-LOCAL frame (before the world-pose
+//                  transform above), reusing RTAB-Map's own Grid/* default
+//                  parameters (see Parameters.h) — the exact same
+//                  segmentation RTAB-Map's own OccupancyGrid class would use,
+//                  just not previously called by this server at all.
 
 #include <algorithm>
 #include <cstdint>
@@ -131,6 +142,7 @@
 #include <rtabmap/core/Transform.h>
 #include <rtabmap/core/util3d.h>
 #include <rtabmap/core/util3d_filtering.h>
+#include <rtabmap/core/util3d_mapping.h>
 #include <rtabmap/core/util3d_transforms.h>
 
 namespace {
@@ -236,6 +248,30 @@ rtabmap::ParametersMap make_parameters() {
     // (multi-room scans, faster motion) may still adjust this further — see
     // the README's "Known limitations" section.
     params.insert(rtabmap::ParametersPair(rtabmap::Parameters::kRGBDProximityAngle(), "20"));
+    // Rtabmap/DetectionRate (default 1.0 Hz) throttles how often
+    // Rtabmap::process() actually runs its memory/graph update (new node
+    // creation, loop-closure detection) — a real-time-pacing knob meant for
+    // a live SLAM node processing a continuous sensor stream, where it
+    // exists to bound CPU load. This server has no such stream: it's called
+    // once per TRACK request, often under 100ms apart (a DA3 forward pass
+    // alone runs ~70ms), well faster than the 1 Hz budget. Odometry/pose
+    // still returns every call regardless (a separate subsystem, unaffected
+    // by this parameter) — but with the default rate limit, most calls had
+    // their memory update silently skipped, so a node could go a full
+    // second of wall-clock processing time without any chance to be
+    // created. Symptom this fixes: point-cloud/occupancy growth that was
+    // either fully stalled after node 1 (a short recording finishing before
+    // the 1-second budget ever refreshed again) or "rarely, very rarely"
+    // adding new nodes (roughly one per second of processing time,
+    // regardless of how much the camera actually moved) — both reported
+    // directly from real scans. 0 disables the rate limit entirely (RTAB-Map's
+    // own convention for this parameter), matching how this server is
+    // actually driven — every submitted frame gets a real chance at memory
+    // update, gated only by Mem/RehearsalSimilarity (still at RTAB-Map's
+    // own default) and RGBD/ProximityAngle above, not an unrelated
+    // wall-clock throttle. Not yet verified live against a real rebuild —
+    // see this directory's README "Known limitations".
+    params.insert(rtabmap::ParametersPair(rtabmap::Parameters::kRtabmapDetectionRate(), "0"));
     return params;
 }
 
@@ -247,13 +283,94 @@ rtabmap::ParametersMap make_parameters() {
 // graph-corrected pose (not whatever pose was in effect when this node was
 // first added) so a later loop closure is reflected the next time this is
 // called — the whole point of sourcing reconstruction from RTAB-Map itself.
-pcl::PointCloud<pcl::PointXYZRGB>::Ptr reconstruct_node_cloud(
+// RTAB-Map's own ground/obstacle segmentation (util3d::segmentObstaclesFromGround,
+// the same function RTAB-Map's own OccupancyGrid/LocalGridMaker class uses
+// internally — previously never called by this server at all, which built
+// its own height-only classification entirely in Python). Returns one
+// uint8 per point in `cloud`'s own order (1=ground, 0=obstacle), computed
+// in `cloud`'s OWN local frame — call this BEFORE transformPointCloud(pose)
+// transforms into world space, since the axis remap below assumes the
+// camera-local convention specifically.
+//
+// segmentObstaclesFromGround() hardcodes its reference "ground normal" as
+// world Eigen::Vector4f(0,0,1,0) — confirmed by reading its own
+// implementation (util3d_mapping.hpp): it always calls normalFiltering(...,
+// Eigen::Vector4f(0,0,1,0), ...) regardless of any parameter passed in, so
+// there's no public way to tell it "up" is a different axis. This project's
+// own convention throughout (HrtfBeacon.kt, RotationTracker.kt,
+// occupancy_map.py's ground_y) is camera-optical X-right/Y-down/Z-forward,
+// where "up" (away from the floor, into the room) is -Y, not +Z. Rather
+// than accept wrong results, a temporary axis-remapped COPY of the cloud is
+// built purely for this call: (x, y, z) -> (x, z, -y) — maps our -Y-up onto
+// +Z-up (verified by hand: the vector (0,-1,0), "straight up" in our
+// convention, remaps to (0, 0, 1) = +Z). Ground/obstacle results are
+// returned as plain point INDICES, which are invariant to this remap (point
+// i is still point i, just re-expressed), so they're applied directly back
+// onto the REAL (un-remapped) cloud below — the remapped copy is discarded
+// immediately after, never sent anywhere.
+std::vector<uint8_t> segment_ground_flags(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud) {
+    std::vector<uint8_t> is_ground(cloud->size(), 0);
+    if (cloud->empty()) {
+        return is_ground;
+    }
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr remapped(new pcl::PointCloud<pcl::PointXYZ>);
+    remapped->resize(cloud->size());
+    for (size_t i = 0; i < cloud->size(); ++i) {
+        const auto& p = cloud->points[i];
+        (*remapped)[i] = pcl::PointXYZ(p.x, p.z, -p.y);
+    }
+
+    pcl::IndicesPtr groundIndices, obstacleIndices;
+    // Grid/* defaults — the exact values RTAB-Map's own OccupancyGrid/
+    // LocalGridMaker use (confirmed against Parameters.h): NormalK=20,
+    // MaxGroundAngle=45deg, ClusterRadius=0.1, MinClusterSize=10,
+    // FlatObstacleDetected=true, MaxGroundHeight=0 (disabled — 0 means "no
+    // height cap on what counts as ground," matching this project's own
+    // "classify by geometry, not a hard height cutoff" philosophy).
+    rtabmap::util3d::segmentObstaclesFromGround<pcl::PointXYZ>(
+        remapped,
+        groundIndices, obstacleIndices,
+        /*normalKSearch=*/20,
+        // 45 degrees in radians — avoiding M_PI here since glibc only
+        // declares it under non-strict-ANSI feature-test macros, not
+        // guaranteed available under a plain -std=c++17 build.
+        /*groundNormalAngle=*/0.7853981633974483f,
+        /*clusterRadius=*/0.1f,
+        /*minClusterSize=*/10,
+        /*segmentFlatObstacles=*/true,
+        /*maxGroundHeight=*/0.0f,
+        /*flatObstacles=*/nullptr,
+        // The camera's own local origin, remapped the same way (origin maps
+        // to itself under this linear remap) — matches how RTAB-Map's own
+        // LocalGridMaker passes the SENSOR's own local position as
+        // viewPoint (not this function's default (0,0,100,0), which models
+        // a viewpoint far above pointing down — wrong for a camera at
+        // roughly head/room height looking sideways, not straight down).
+        Eigen::Vector4f(0.0f, 0.0f, 0.0f, 1.0f),
+        /*groundNormalsUp=*/0.0f);
+
+    for (int idx : *groundIndices) {
+        if (idx >= 0 && static_cast<size_t>(idx) < is_ground.size()) {
+            is_ground[idx] = 1;
+        }
+    }
+    return is_ground;
+}
+
+struct ReconstructedCloud {
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud;
+    std::vector<uint8_t> is_ground;  // aligned with cloud->points, 1=ground
+};
+
+ReconstructedCloud reconstruct_node_cloud(
     const rtabmap::Memory* mem, int node_id, const rtabmap::Transform& pose,
     float voxel_size, float max_depth) {
     rtabmap::SensorData data = mem->getNodeData(node_id, true, false, false, false);
     data.uncompressData();
     if (data.imageRaw().empty() || data.depthOrRightRaw().empty()) {
-        return pcl::PointCloud<pcl::PointXYZRGB>::Ptr(new pcl::PointCloud<pcl::PointXYZRGB>());
+        return {pcl::PointCloud<pcl::PointXYZRGB>::Ptr(new pcl::PointCloud<pcl::PointXYZRGB>()), {}};
     }
     // cloudRGBFromSensorData returns an ORGANIZED cloud for a single camera
     // (invalid-depth pixels present as non-finite points, not removed) — its
@@ -267,13 +384,22 @@ pcl::PointCloud<pcl::PointXYZRGB>::Ptr reconstruct_node_cloud(
     auto cloud = rtabmap::util3d::cloudRGBFromSensorData(
         data, /*decimation=*/1, max_depth, MIN_DEPTH_M, &validIndices);
     if (cloud->empty()) {
-        return cloud;
+        return {cloud, {}};
     }
     if (voxel_size > 0.0f) {
         pcl::IndicesPtr indices(new std::vector<int>(validIndices));
         cloud = rtabmap::util3d::voxelize(cloud, indices, voxel_size);
     }
-    return rtabmap::util3d::transformPointCloud(cloud, pose);
+    // Ground segmentation runs on the voxelized cloud, still in the node's
+    // own CAMERA-LOCAL frame — matches RTAB-Map's own default pipeline
+    // order (Grid/PreVoxelFiltering=true: voxel-filter first, then segment
+    // — cheaper, and normal estimation is well-behaved on a
+    // roughly-uniform-density voxelized cloud). Must happen BEFORE the
+    // world-pose transform below, since segment_ground_flags()'s axis remap
+    // assumes the camera-local Y-down convention specifically.
+    std::vector<uint8_t> is_ground = segment_ground_flags(cloud);
+    cloud = rtabmap::util3d::transformPointCloud(cloud, pose);
+    return {cloud, is_ground};
 }
 
 }  // namespace
@@ -361,9 +487,10 @@ int main(int argc, char** argv) {
                 if (node_id <= ghdr.since_node_id || kv.second.isNull()) {
                     continue;
                 }
-                auto cloud = mem != nullptr
+                ReconstructedCloud recon = mem != nullptr
                     ? reconstruct_node_cloud(mem, node_id, kv.second, ghdr.voxel_size, ghdr.max_depth)
-                    : pcl::PointCloud<pcl::PointXYZRGB>::Ptr(new pcl::PointCloud<pcl::PointXYZRGB>());
+                    : ReconstructedCloud{pcl::PointCloud<pcl::PointXYZRGB>::Ptr(new pcl::PointCloud<pcl::PointXYZRGB>()), {}};
+                auto& cloud = recon.cloud;
 
                 double wire_pose[7];
                 pose_to_wire(kv.second, wire_pose);
@@ -377,7 +504,7 @@ int main(int argc, char** argv) {
                 std::memcpy(hp + sizeof(int32_t) + sizeof(wire_pose), &point_count, sizeof(int32_t));
 
                 if (point_count > 0) {
-                    // Both regions must be resized BEFORE taking either
+                    // All three regions must be resized BEFORE taking any
                     // pointer — std::vector::resize() may reallocate the
                     // backing buffer, which would silently invalidate a
                     // pointer taken before a later resize() call (this was a
@@ -389,10 +516,19 @@ int main(int argc, char** argv) {
                     const size_t xyz_bytes = static_cast<size_t>(point_count) * 3 * sizeof(float);
                     const size_t rgb_off = xyz_off + xyz_bytes;
                     const size_t rgb_bytes = static_cast<size_t>(point_count) * 3;
-                    out.resize(rgb_off + rgb_bytes);
+                    const size_t ground_off = rgb_off + rgb_bytes;
+                    const size_t ground_bytes = static_cast<size_t>(point_count);
+                    out.resize(ground_off + ground_bytes);
 
                     float* xyz = reinterpret_cast<float*>(out.data() + xyz_off);
                     uint8_t* rgb = out.data() + rgb_off;
+                    uint8_t* is_ground = out.data() + ground_off;
+                    // recon.is_ground is empty whenever the cloud itself
+                    // couldn't be segmented (e.g. reconstruct_node_cloud's
+                    // early-return paths) — point_count>0 here guarantees it
+                    // isn't one of those, but defend anyway rather than
+                    // assume alignment.
+                    const bool have_ground = recon.is_ground.size() == static_cast<size_t>(point_count);
 
                     for (int32_t i = 0; i < point_count; ++i) {
                         const auto& p = cloud->points[i];
@@ -402,6 +538,7 @@ int main(int argc, char** argv) {
                         rgb[i * 3 + 0] = p.r;
                         rgb[i * 3 + 1] = p.g;
                         rgb[i * 3 + 2] = p.b;
+                        is_ground[i] = have_ground ? recon.is_ground[i] : 0;
                     }
                 }
             }

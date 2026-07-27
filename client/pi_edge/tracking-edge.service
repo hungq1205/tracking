@@ -1,0 +1,19 @@
+[Unit]
+Description=Tracking project Pi edge server (camera + mic + speaker over ZMQ)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/tracking/client/pi_edge
+ExecStart=/home/pi/tracking/client/pi_edge/.venv/bin/python /home/pi/tracking/client/pi_edge/main.py
+Restart=on-failure
+RestartSec=3
+# picamera2 needs access to the camera/video devices, and PortAudio needs
+# access to the audio devices -- running as the normal 'pi' user (already in
+# the 'video'/'audio' groups by default on Raspberry Pi OS) is usually
+# sufficient; avoid running as root unless something else requires it.
+
+[Install]
+WantedBy=multi-user.target

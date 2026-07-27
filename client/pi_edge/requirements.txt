@@ -1,0 +1,11 @@
+# picamera2 is intentionally NOT listed here -- install it via apt, not pip:
+#   sudo apt install -y python3-picamera2 --no-install-recommends
+# It wraps system libcamera bindings and generally doesn't work well as a
+# plain pip package. Create the venv with --system-site-packages so the
+# apt-installed picamera2 is importable inside it (see README.md).
+
+pyzmq>=25
+opencv-python-headless>=4.8
+sounddevice>=0.4.6
+numpy>=1.24
+scipy>=1.10

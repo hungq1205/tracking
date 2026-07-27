@@ -27,8 +27,15 @@ Dataset folder layout (see camera.csv/imu.csv headers for exact columns):
         camera.csv    timestamp_ns,filename
 """
 
+import csv
+import functools
 import math
+import os
+import shutil
+import subprocess
 import tempfile
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
@@ -60,6 +67,14 @@ _IMU_ORIENTATION_LABELS = {
 _DEFAULT_SEGMENTS = pd.DataFrame(
     {"start_s": [0.0], "end_s": [0.0], "area_name": [""]}
 )
+
+
+# -- Recording state flags and directories
+_point_cloud_frames_dir = "point_cloud_frames"
+_pc_signal_file = ".pc_recording.on"
+_voxel_frames_dir = "voxel_frames"
+_voxel_signal_file = ".voxel_recording.on"
+
 
 
 # ── Depth helpers ──────────────────────────────────────────────────────────────
@@ -125,8 +140,8 @@ def _build_detection_view(session):
     lines = [f"**{len(sm.last_detections)} detection(s)**"]
     if sm.last_error:
         lines.append(f"⚠️ {sm.last_error}")
-    lines.append("\n**Qwen VL response:**\n")
-    lines.append(f"```\n{sm.last_vlm_response or '(empty)'}\n```")
+    lines.append("\n**Gemini tags:**\n")
+    lines.append(f"```\n{', '.join(sm.last_tags) or '(empty)'}\n```")
     return image, "\n".join(lines)
 
 
@@ -214,6 +229,18 @@ def _cloud_to_glb_impl(cloud_or_pts, zones=None, ground_y=None) -> Optional[str]
         if len(pts) == 0:
             return None
 
+        # World points are stored in this project's camera-optical convention
+        # (X-right, Y-down, Z-forward), but trimesh's .glb export follows
+        # glTF's convention (X-right, Y-up, Z-backward). Converting requires
+        # flipping BOTH Y and Z — a proper 180-degree rotation about X that
+        # preserves handedness. Flipping Y alone (as an earlier version of
+        # this code did) is a MIRROR (determinant -1), not a rotation — it
+        # silently swapped front/back, which is what made the view look like
+        # it was showing the room from behind regardless of any camera fix.
+        pts = pts * np.array([1.0, -1.0, -1.0], dtype=np.float32)
+        if ground_y is not None:
+            ground_y = -float(ground_y)
+
         # trimesh expects RGBA uint8 colors
         if has_color and len(colors_f) == len(pts):
             rgb8 = (np.clip(colors_f, 0.0, 1.0) * 255).astype(np.uint8)
@@ -225,8 +252,6 @@ def _cloud_to_glb_impl(cloud_or_pts, zones=None, ground_y=None) -> Optional[str]
         pc = trimesh.points.PointCloud(vertices=pts, colors=rgba)
         scene = trimesh.Scene()
         scene.add_geometry(pc)
-
-        _add_zone_overlays(scene, zones, pts, ground_y)
         _set_top_down_camera(scene, pts)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
@@ -271,25 +296,43 @@ def _add_zone_overlays(scene, zones, pts: np.ndarray, ground_y: Optional[float])
             scene.add_geometry(sph)
 
 
+# Which world-Z side counts as "front" — flip this sign if the initial view
+# still opens from the wrong side (there's no reliable way to infer this
+# from the point cloud alone).
+_FRONT_Z_SIGN = 1.0
+
+
 def _set_top_down_camera(scene, pts: np.ndarray) -> None:
-    """Top-down initial camera: camera placed above centroid looking down (-Y).
-    In trimesh camera space: +X=right, +Y=up, -Z=forward (toward scene).
-    For top-down: camera -Z (forward) aligns with world -Y (down),
-      so camera +Z column = world +Y = [0,1,0]
-          camera +X column = world +X = [1,0,0]
-          camera +Y column = world -Z = [0,0,-1]  (right-hand cross product)"""
+    """Initial camera: positioned in front of the cloud and a bit above its
+    center, angled down slightly to look at it — a three-quarter view
+    instead of a straight top-down or dead-on frontal one. `pts` is assumed
+    already Y-up (see the camera-optical -> glTF Y-flip in the callers).
+    Built as a standard look-at camera: local -Z is the viewing direction,
+    +Y is up, +X is right (trimesh/glTF convention)."""
     centroid = pts.mean(axis=0)
     extent = pts.max(axis=0) - pts.min(axis=0)
-    view_dist = float(max(extent)) * 1.5 + 1.5
+    horiz_extent = float(max(extent[0], extent[2])) or 1.0
+    height_extent = float(extent[1]) or 1.0
 
-    cam_R = np.array([
-        [1.0,  0.0,  0.0],
-        [0.0,  0.0, -1.0],
-        [0.0,  1.0,  0.0],
-    ], dtype=np.float64)
+    cam_pos = centroid + np.array([
+        0.0,
+        height_extent * 0.35 + horiz_extent * 0.15,
+        _FRONT_Z_SIGN * (horiz_extent * 1.3 + 1.5),
+    ])
+    # Aim slightly below the true centroid so the elevated camera looks
+    # DOWN at the cloud rather than straight across at it.
+    target = centroid + np.array([0.0, -height_extent * 0.1, 0.0])
+
+    forward = target - cam_pos
+    forward /= np.linalg.norm(forward) or 1.0
+    world_up = np.array([0.0, 1.0, 0.0])
+    right = np.cross(forward, world_up)
+    right /= np.linalg.norm(right) or 1.0
+    true_up = np.cross(right, forward)
+
     cam_T = np.eye(4, dtype=np.float64)
-    cam_T[:3, :3] = cam_R
-    cam_T[:3, 3] = [centroid[0], centroid[1] + view_dist, centroid[2]]
+    cam_T[:3, :3] = np.column_stack([right, true_up, -forward])
+    cam_T[:3, 3] = cam_pos
     scene.camera_transform = cam_T
 
 
@@ -330,6 +373,12 @@ def _voxel_centers_to_glb_impl(
     try:
         import trimesh
 
+        # Same camera-optical -> glTF fix as _cloud_to_glb_impl (flip Y AND Z,
+        # a proper rotation — flipping Y alone mirrors the scene instead).
+        centers = np.asarray(centers, dtype=np.float64) * np.array([1.0, -1.0, -1.0])
+        if ground_y is not None:
+            ground_y = -float(ground_y)
+
         template = trimesh.creation.box(extents=[voxel_size, voxel_size, voxel_size])
         template_verts = np.asarray(template.vertices, dtype=np.float64)  # (V, 3)
         template_faces = np.asarray(template.faces, dtype=np.int64)      # (F, 3)
@@ -360,8 +409,6 @@ def _voxel_centers_to_glb_impl(
 
         scene = trimesh.Scene()
         scene.add_geometry(mesh)
-
-        _add_zone_overlays(scene, zones, centers, ground_y)
         _set_top_down_camera(scene, centers)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
@@ -408,6 +455,118 @@ def _perm_matrix(roll_src: str, pitch_src: str, yaw_src: str) -> np.ndarray:
         col, sign = _AXIS_MAP.get(src, (row, 1))
         P[row, col] = sign
     return P
+
+
+def _frames_to_video(frames_dir: str, output_path: str, fps: int = 10):
+    """Crude but effective frames-to-video using ffmpeg."""
+    if not os.path.isdir(frames_dir):
+        return f"Frames directory '{frames_dir}' not found."
+    frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith(".png")])
+    if not frame_files:
+        return "No frames found to generate video."
+
+    if shutil.which("ffmpeg") is None:
+        return "ffmpeg not found. Please install ffmpeg to generate videos."
+
+    input_pattern = os.path.join(frames_dir, "%05d.png")
+    command = [
+        "ffmpeg",
+        "-y",  # Overwrite output file if it exists
+        "-framerate", str(fps),
+        "-i", input_pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        output_path,
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    shutil.rmtree(frames_dir)
+    return f"Video saved to {output_path} and frames directory cleared."
+
+
+def _save_occupancy_snapshot(scan_manager, location_id: str):
+    location_id = (location_id or "").strip() or "default"
+    session = scan_manager.get(location_id)
+    if session is None or session.occupancy_map is None:
+        return "No active session with an occupancy map to snapshot."
+    fig = session.occupancy_map.render_plotly(zones=session.zones)
+    filename = f"occupancy_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    fig.write_image(filename)
+    return f"Saved snapshot to {filename}"
+
+
+def _take_snapshot(glb_path: str, snapshot_name_prefix: str) -> str:
+    """Saves a single snapshot image from a Model3D's GLB path."""
+    scene = _scene_from_glb(glb_path)
+    if scene is None:
+        return "Nothing to capture. Is the 3D view populated?"
+    filename = f"{snapshot_name_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    try:
+        scene.save_image(filename)
+        return f"Saved snapshot to {filename}"
+    except Exception as e:
+        print(f"[scan_gui] Snapshot failed for {snapshot_name_prefix}: {e}")
+        return f"Error saving snapshot: {e}"
+
+
+def _toggle_recording(is_recording_signal_file: str, frames_dir: str, video_name: str, button_label_prefix: str):
+    if os.path.exists(is_recording_signal_file):
+        # Stop recording
+        os.remove(is_recording_signal_file)
+        status = _frames_to_video(frames_dir, video_name)
+        index_file = os.path.join(frames_dir, ".index")
+        if os.path.exists(index_file):
+            os.remove(index_file)
+        return gr.update(value=f"Start {button_label_prefix} Recording"), status
+    else:
+        # Start recording
+        os.makedirs(frames_dir, exist_ok=True)
+        with open(is_recording_signal_file, "w") as f:
+            f.write("on")
+        with open(os.path.join(frames_dir, ".index"), "w") as f:
+            f.write("0")
+        return gr.update(value=f"Stop {button_label_prefix} Recording"), f"Started {button_label_prefix} recording..."
+
+
+def toggle_pc_recording():
+    return _toggle_recording(_pc_signal_file, _point_cloud_frames_dir, "point_cloud.mp4", "Point Cloud")
+
+
+def toggle_voxel_recording():
+    return _toggle_recording(_voxel_signal_file, _voxel_frames_dir, "voxels.mp4", "Voxel")
+
+
+def _scene_from_glb(glb_path: str) -> "trimesh.Scene | None":
+    """Loads a trimesh.Scene from a GLB file path."""
+    if not glb_path or not os.path.exists(glb_path):
+        return None
+    try:
+        import trimesh
+        return trimesh.load(glb_path, force="scene")
+    except Exception as e:
+        print(f"[scan_gui] Failed to load GLB for recording: {e}")
+        return None
+
+
+def _save_pc_frame(glb_path: str):
+    """Saves a single point cloud frame from a GLB file if recording is on."""
+    if not os.path.exists(_pc_signal_file):
+        return
+    scene = _scene_from_glb(glb_path)
+    if scene is None:
+        return
+    try:
+        index_file = os.path.join(_point_cloud_frames_dir, ".index")
+        idx = 0
+        if os.path.exists(index_file):
+            with open(index_file, 'r') as f:
+                content = f.read().strip()
+            if content.isdigit():
+                idx = int(content)
+        scene.save_image(file_obj=os.path.join(_point_cloud_frames_dir, f"{idx:05d}.png"))
+        with open(index_file, 'w') as f:
+            f.write(str(idx + 1))
+    except Exception as e:
+        print(f"[scan_gui] Point cloud recording frame failed: {e}")
 
 
 def _back_project_frames(all_frames: list, start: int, end: int,
@@ -482,20 +641,91 @@ def _format_poses(all_frames: list, start: int, end: int,
 
 def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
-    _upload_dir = Path(upload_dir) if upload_dir else None
+    # Falls back to a local uploads/ dir next to this file so video ingestion
+    # works even when create_scan_ui() is called without an explicit
+    # upload_dir (e.g. a standalone launch script) — this used to be purely
+    # a *read* location for scan_server.py's old HTTP-uploaded datasets;
+    # it's now also where the GUI's own video-extraction writes land.
+    _upload_dir = Path(upload_dir) if upload_dir else (Path(__file__).parent / "uploads")
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
     def _list_uploads() -> List[str]:
-        if _upload_dir is None or not _upload_dir.exists():
+        if not _upload_dir.exists():
             return []
         return sorted(p.name for p in _upload_dir.iterdir() if p.is_dir())
 
     def _load_upload(scan_id: Optional[str]):
-        if not scan_id or _upload_dir is None:
+        if not scan_id:
             return None
         base = _upload_dir / scan_id / "dataset"
         return str(base) if base.exists() else None
+
+    _FALLBACK_VIDEO_FPS = 30.0  # some containers report 0/NaN for CAP_PROP_FPS
+
+    def _extract_video(video_path: Optional[str]):
+        """
+        Decode an uploaded video (gr.Video gives us a local temp file path)
+        into uploads/<scan_id>/dataset/: images/000000000.jpg, ... +
+        camera.csv (timestamp_ns,filename). Moved here from the old
+        scan_server.py POST /api/upload endpoint — video ingestion is a GUI
+        action now, no separate HTTP API to serve it exists any more.
+
+        No imu.csv is produced — a video container carries no IMU stream;
+        ScanSession.set_imu_file() is simply never called for a
+        video-sourced dataset, and IMU + VO pose mode already falls back to
+        VO-only rotation when no imu.csv is present (the same fallback an
+        Android recording with a missing imu.csv would already hit).
+        RTAB-Map pose mode needs no IMU either way.
+
+        Every decodable frame is extracted (no subsampling at extraction
+        time) — camera.csv's timestamp_ns is derived from the video's own
+        reported fps (frame_idx / fps), so the existing replay-time fps
+        slider (stream_simulator.build_event_timeline) subsamples this
+        exactly like it already does for an Android-recorded dataset.
+        """
+        if not video_path:
+            return gr.update(), "No video provided.", gr.Dropdown(choices=_list_uploads())
+
+        scan_id = uuid.uuid4().hex
+        dataset_dir = _upload_dir / scan_id / "dataset"
+        images_dir = dataset_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            cap.release()
+            return gr.update(), f"Could not decode video: {video_path}", gr.Dropdown(choices=_list_uploads())
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = _FALLBACK_VIDEO_FPS
+
+        camera_rows = []
+        frame_idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            filename = f"{frame_idx:09d}.jpg"
+            cv2.imwrite(str(images_dir / filename), frame)
+            camera_rows.append((round(frame_idx / fps * 1e9), filename))
+            frame_idx += 1
+        cap.release()
+
+        if frame_idx == 0:
+            return gr.update(), "Video contained no decodable frames.", gr.Dropdown(choices=_list_uploads())
+
+        with open(dataset_dir / "camera.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp_ns", "filename"])
+            writer.writerows(camera_rows)
+
+        return (
+            str(dataset_dir),
+            f"Extracted {frame_idx} frames @ {fps:.2f}fps → `{dataset_dir}`.",
+            gr.Dropdown(choices=_list_uploads()),
+        )
 
     def _correct_rotation(frame: np.ndarray, rotation: int) -> np.ndarray:
         rotation = rotation % 360
@@ -671,7 +901,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         sor_std_ratio: float,
         voxel_size: float,
         realtime: bool,
-        occ_obstacle_min_h: float = 0.10,
+        occ_obstacle_min_h: float = 0.20,
         occ_step_over_max_h: float = 0.40,
         occ_obstacle_max_h: float = 2.20,
         occ_logodds_hit: float = 0.85,
@@ -821,10 +1051,14 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             if (show_live_points or show_voxelization) and session._raw_point_count != _last_render_point_count:
                 if show_live_points:
                     cloud = session.ensure_cloud_built()
-                    _yield[live_cloud_plot] = _cloud_to_glb(
+                    glb_path = _cloud_to_glb(
                         cloud, zones=session.zones, ground_y=session.occupancy_map._ground_y
                     )
+                    _save_pc_frame(glb_path)
+                    _yield[live_cloud_plot] = glb_path
                 if show_voxelization:
+                    # Voxel plot does not have recording functionality in this pass.
+                    # It could be added by mirroring the live_cloud_plot pattern.
                     _yield[voxel_plot] = _voxel_centers_to_glb(
                         session.last_voxel_centers, session.last_voxel_colors, session.last_voxel_size,
                         zones=session.zones, ground_y=session.occupancy_map._ground_y,
@@ -846,11 +1080,14 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                 zones=zones, route=nav_state_value.get("route"), route_confirmed=nav_state_value.get("confirmed"))
             _final_yield[confidence_plot] = session.occupancy_map.render_confidence_plotly(
                 zones=zones, route=nav_state_value.get("route"), route_confirmed=nav_state_value.get("confirmed"))
-        if show_live_points:
-            _final_yield[live_cloud_plot] = _cloud_to_glb(
+        if show_live_points:  
+            glb_path = _cloud_to_glb(
                 session._cloud, zones=zones, ground_y=session.occupancy_map._ground_y
             )
+            _save_pc_frame(glb_path)
+            _final_yield[live_cloud_plot] = glb_path
         if show_voxelization:
+            # Voxel plot does not have recording functionality in this pass.
             _final_yield[voxel_plot] = _voxel_centers_to_glb(
                 session.last_voxel_centers, session.last_voxel_colors, session.last_voxel_size,
                 zones=zones, ground_y=session.occupancy_map._ground_y,
@@ -1026,7 +1263,8 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         if (show_live_points or show_voxelization) and session._raw_point_count != replayer.last_render_point_count:
             if show_live_points:
                 cloud = session.ensure_cloud_built()
-                lp_update = _cloud_to_glb(cloud, zones=session.zones, ground_y=session.occupancy_map._ground_y)
+                glb_path = _cloud_to_glb(cloud, zones=session.zones, ground_y=session.occupancy_map._ground_y)
+                lp_update = glb_path
             if show_voxelization:
                 # session.last_voxel_centers is already the single,
                 # incrementally-accumulated voxelization the Occupancy Map
@@ -1049,7 +1287,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         )
         return (
             replayer, preview, gr.update(interactive=has_more),
-            lp_update, vp_update, occ, conf,
+            lp_update, gr.update(value=lp_update), vp_update, occ, conf,
             det_image, det_text, status, f"{src_tag}  {pos_str}", log,
         )
 
@@ -1279,14 +1517,12 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
         return gr.update(choices=_nav_landmark_choices(location_id))
 
     def _apply_vlm_model(model_id: str):
-        if not scan_manager.semantic_mapper_available:
-            return "Semantic mapping is disabled on this server — nothing to apply."
-        model_id = (model_id or "").strip()
-        if not model_id:
-            return "Model ID can't be empty."
-        scan_manager.set_semantic_mapper_model(model_id)
-        print(f"[Scan GUI] Semantic mapper VLM model switched to '{model_id}'")
-        return f"Now using `{model_id}` for the next VLM call (existing SamplingParams/config unchanged)."
+        # Gemini + GroundingDINO-tiny (frame_extractor's tagging pipeline)
+        # has no single swappable "model id" the way the old Gemma-VLM
+        # design did — both checkpoints load once at server startup. This
+        # button is kept as a read-only "current model" display, not an
+        # apply action.
+        return "Gemini + GroundingDINO-tiny aren't hot-swappable from this UI — restart the server with different env vars to change them."
 
     # ── layout ─────────────────────────────────────────────────────────────────
 
@@ -1434,7 +1670,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                     )
                     with gr.Row():
                         occ_obstacle_min_h = gr.Slider(
-                            minimum=0.0, maximum=0.5, step=0.01, value=0.10,
+                            minimum=0.0, maximum=0.5, step=0.01, value=0.20,
                             label="Ground max height", scale=1, interactive=True,
                         )
                         occ_step_over_max_h = gr.Slider(
@@ -1489,7 +1725,10 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                             value=True, label="Bayesian log-odds belief", scale=1,
                         )
 
-                with gr.Accordion("Load from Android Upload", open=True):
+                with gr.Accordion("Load from Video", open=True):
+                    video_upload_input = gr.Video(label="Upload Video", sources=["upload"])
+                    extract_video_btn = gr.Button("Extract Frames", variant="primary", size="sm")
+                    extract_video_status = gr.Markdown("")
                     with gr.Row():
                         upload_dropdown = gr.Dropdown(
                             choices=_list_uploads(),
@@ -1508,17 +1747,17 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
 
                 with gr.Row():
                     vlm_model_input = gr.Textbox(
-                        label="Semantic Mapper VLM Model ID",
+                        label="Semantic Mapper Models (Gemini -> GroundingDINO-tiny, read-only)",
                         value=(
                             scan_manager.semantic_mapper_model_id
                             if scan_manager.semantic_mapper_available
                             else "(semantic mapping disabled on this server)"
                         ),
-                        interactive=scan_manager.semantic_mapper_available,
+                        interactive=False,
                         scale=3,
                     )
                     vlm_model_apply_btn = gr.Button(
-                        "Apply", size="sm", scale=1,
+                        "Info", size="sm", scale=1,
                         interactive=scan_manager.semantic_mapper_available,
                     )
                 vlm_model_status = gr.Markdown("")
@@ -1595,7 +1834,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                                     clear_color=[0.05, 0.05, 0.05, 1.0],
                                     label="Live Points — 3D point cloud, builds up as data arrives",
                                 )
-                            with gr.Column():
+
                                 voxel_plot = gr.Model3D(
                                     height=420,
                                     zoom_speed=0.5,
@@ -1603,6 +1842,13 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                                     clear_color=[0.05, 0.05, 0.05, 1.0],
                                     label="Voxelization — voxelized point cloud",
                                 )
+                        with gr.Row():
+                            pc_record_btn = gr.Button("Start Point Cloud Recording", size="sm", scale=1)
+                            voxel_record_btn = gr.Button("Start Voxel Recording", size="sm", scale=1)
+                            occupancy_snapshot_btn = gr.Button("Take Occupancy Snapshot", size="sm", scale=1)
+                            pc_snapshot_btn = gr.Button("Take Point Cloud Snapshot", size="sm", scale=1)
+                            voxel_snapshot_btn = gr.Button("Take Voxel Snapshot", size="sm", scale=1)
+                        recording_status = gr.Markdown("")
                         with gr.Row():
                             with gr.Column():
                                 occupancy_plot = gr.Plot(
@@ -1829,8 +2075,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                     occ_enable_ray_casting, occ_enable_bayesian,
                     show_live_points_cb, show_voxelization_cb, show_occupancy_cb,
                     nav_state],
-            outputs=[
-                live_cloud_plot, voxel_plot, occupancy_plot, confidence_plot,
+            outputs=[live_cloud_plot, voxel_plot, occupancy_plot, confidence_plot,
                 detection_image, detection_text,
                 scan_status, scan_position, log_output,
                 nav_state, nav_status,
@@ -1856,8 +2101,7 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             inputs=[manual_replay_state,
                     show_live_points_cb, show_voxelization_cb, show_occupancy_cb],
             outputs=[
-                manual_replay_state, manual_preview_image, manual_feed_btn,
-                live_cloud_plot, voxel_plot, occupancy_plot, confidence_plot,
+                manual_replay_state, manual_preview_image, manual_feed_btn, live_cloud_plot, voxel_plot, occupancy_plot, confidence_plot,
                 detection_image, detection_text,
                 scan_status, scan_position, log_output,
             ],
@@ -1993,6 +2237,12 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
                 outputs=[frame_pose_text],
             )
 
+        extract_video_btn.click(
+            fn=_extract_video,
+            inputs=[video_upload_input],
+            outputs=[dataset_path_input, extract_video_status, upload_dropdown],
+        )
+
         refresh_uploads_btn.click(
             fn=lambda: gr.Dropdown(choices=_list_uploads()),
             inputs=[],
@@ -2003,6 +2253,34 @@ def create_scan_ui(scan_manager, upload_dir: Optional[str] = None) -> gr.Blocks:
             fn=_load_upload,
             inputs=[upload_dropdown],
             outputs=[dataset_path_input],
+        )
+
+        pc_record_btn.click(
+            fn=toggle_pc_recording,
+            inputs=[],
+            outputs=[pc_record_btn, recording_status],
+        )
+        pc_snapshot_btn.click(
+            fn=lambda path: _take_snapshot(path, "point_cloud"),
+            inputs=[live_cloud_plot],
+            outputs=[recording_status],
+        )
+
+        voxel_record_btn.click(
+            fn=toggle_voxel_recording,
+            inputs=[],
+            outputs=[voxel_record_btn, recording_status],
+        )
+
+        occupancy_snapshot_btn.click(
+            fn=functools.partial(_save_occupancy_snapshot, scan_manager),
+            inputs=[location_id_input],
+            outputs=[recording_status],
+        )
+        voxel_snapshot_btn.click(
+            fn=lambda path: _take_snapshot(path, "voxels"),
+            inputs=[voxel_plot],
+            outputs=[recording_status],
         )
 
     return app

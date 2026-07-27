@@ -66,6 +66,11 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+    // LifecycleService base class for LiveAssistantService — the foreground
+    // bound service now hosting the whole Gemini Live session graph so it
+    // survives Activity/task teardown. See CLAUDE.md's "Client-Orchestrated
+    // Live Session" section.
+    implementation("androidx.lifecycle:lifecycle-service:2.8.6")
     implementation("androidx.navigation:navigation-compose:2.8.3")
 
     implementation("androidx.camera:camera-core:$cameraxVersion")
@@ -86,11 +91,36 @@ dependencies {
 
     implementation("androidx.media3:media3-exoplayer:$media3Version")
     implementation("androidx.media3:media3-ui:$media3Version")
+    // HLS (.m3u8) extension — many internet radio stations (play_radio,
+    // RadioClient.kt) serve HLS rather than a plain MP3/AAC Icecast stream;
+    // media3-exoplayer alone has no HLS media source factory registered
+    // and throws IllegalStateException("No suitable media source factory
+    // found for content type: 2") at prepare() time without this.
+    implementation("androidx.media3:media3-exoplayer-hls:$media3Version")
+
+    // Pure-Java ZeroMQ client (no NDK/native libzmq needed) — used by the
+    // mock edge-device test screen (EdgeZmqTestClient.kt) to exercise the
+    // PUSH/PULL audio/frame link a real Pi-Zero-2 edge device would use.
+    implementation("org.zeromq:jeromq:0.6.0")
+
+    // Official ToS-compliant YouTube IFrame player — play_youtube_video
+    // tool (see ToolDeclarations.kt/YouTubeSearchClient.kt). Deliberately
+    // NOT a raw stream-URL resolver: this needs a visible on-screen player
+    // (MainScreen.kt), a real, accepted limitation vs. play_video's
+    // headless PlaybackService/ExoPlayer path — see CLAUDE.md's YouTube
+    // playback note.
+    implementation("com.pierfrancescosoffritti.androidyoutubeplayer:core:12.1.0")
 
     // Raw WebSocket client for GeminiLiveClient — grpc-okhttp shades its own
     // okhttp internally (doesn't expose okhttp3.* on the compile classpath),
     // so this is a separate, explicit dependency, not a reuse of grpc's.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // On-device language ID for reading-mode OCR correction
+    // (GeminiCorrectionClient) — picks the fix-only vs. fix+translate
+    // prompt. Lazily downloads its own small model on first use; no other
+    // ML Kit APIs are used (OCR itself stays OCR.space via OcrClient.kt).
+    implementation("com.google.mlkit:language-id:17.0.6")
 }
 
 protobuf {

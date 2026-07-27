@@ -50,6 +50,22 @@ class HrtfBeaconPlayer(private val context: Context) {
         private const val MAX_RANGE_M = 15f    // beacon gain floors out beyond this distance
         private const val MIN_GAIN = 0.15f     // never fully silent once a target exists
         private const val MAX_GAIN = 1.0f
+
+        // Externalization aids. Generic (non-individualized) HRTF, convolved
+        // anechoically and played over headphones, is notorious for sounding
+        // like it's coming from inside the listener's head rather than from
+        // an external source — real-world listening always has some air
+        // absorption (distance darkens high frequencies) and room
+        // reflections, and the brain leans on both to place a sound outside
+        // the head. Neither of these is a full fix (that needs measured room
+        // BRIRs and dynamic head-tracked re-rendering), but both are cheap,
+        // well-established mitigations worth applying unconditionally.
+        private const val LOWPASS_FC_NEAR_HZ = 16000f  // effectively unfiltered
+        private const val LOWPASS_FC_FAR_HZ = 2500f     // audibly darker at MAX_RANGE_M
+        private const val REVERB_WET = 0.18f
+        private const val REVERB_FEEDBACK = 0.35f
+        private const val REVERB_DELAY_L_MS = 29f
+        private const val REVERB_DELAY_R_MS = 37f  // != L — decorrelates the two ears' reflections
     }
 
     /** Fires with every already-rendered stereo PCM16 (little-endian) chunk,
@@ -64,8 +80,21 @@ class HrtfBeaconPlayer(private val context: Context) {
 
     @Volatile private var filterIndex = 0
     @Volatile private var overallGain = 0f
+
+    /** User-configurable master volume multiplier for the cue (0f..1f, default 1f) —
+     * distinct from [overallGain]'s distance-based falloff, applied on top of it. */
+    @Volatile var cueVolume = 1f
+    @Volatile private var distanceGain = 0f
+
+    /** True while this beacon is actually producing audible sound (not
+     * muted) — the beacon plays CONTINUOUSLY through all of walking/guiding,
+     * so this is checked by ContinuousVadRecorder's output-aware VAD gating
+     * (see its own doc comment) rather than something that only matters
+     * around discrete conversational turns. */
+    val isEmitting: Boolean get() = overallGain > 0.02f
     @Volatile private var leftGain = 0f    // pan-fallback path only
     @Volatile private var rightGain = 0f   // pan-fallback path only
+    @Volatile private var currentDistanceM = 0f  // drives the distance-lowpass below
 
     fun start() {
         if (job != null) return
@@ -104,6 +133,17 @@ class HrtfBeaconPlayer(private val context: Context) {
             val prevOutL = FloatArray(CHUNK_FRAMES)
             val prevOutR = FloatArray(CHUNK_FRAMES)
 
+            // Externalization state (see the companion object's own comment)
+            // — persists across chunks, applied uniformly regardless of
+            // which rendering path (real HRTF vs. pan fallback) produced
+            // outL/outR this chunk.
+            val reverbBufL = FloatArray((REVERB_DELAY_L_MS / 1000f * SAMPLE_RATE).toInt().coerceAtLeast(1))
+            val reverbBufR = FloatArray((REVERB_DELAY_R_MS / 1000f * SAMPLE_RATE).toInt().coerceAtLeast(1))
+            var reverbIdxL = 0
+            var reverbIdxR = 0
+            var lpStateL = 0f
+            var lpStateR = 0f
+
             while (isActive) {
                 val gain = overallGain
                 byteBuf.clear()
@@ -130,18 +170,49 @@ class HrtfBeaconPlayer(private val context: Context) {
                         }
                     }
                     lastFilterIndex = idx
-                    for (i in 0 until CHUNK_FRAMES) {
-                        byteBuf.putShort(clipToShort(outL[i] * gain))
-                        byteBuf.putShort(clipToShort(outR[i] * gain))
-                    }
                 } else {
                     val lg = leftGain
                     val rg = rightGain
                     for (i in 0 until CHUNK_FRAMES) {
                         val s = monoPcm[(readPos + i) % monoPcm.size]
-                        byteBuf.putShort(clipToShort(s * lg))
-                        byteBuf.putShort(clipToShort(s * rg))
+                        // Raw pan coefficients already fold overallGain in
+                        // (see updateDirection) — divide it back out so the
+                        // shared post-processing below applies gain exactly
+                        // once, the same as the convolved path.
+                        outL[i] = s * lg
+                        outR[i] = s * rg
                     }
+                }
+
+                val distFrac = (currentDistanceM / MAX_RANGE_M).coerceIn(0f, 1f)
+                val fc = LOWPASS_FC_NEAR_HZ + (LOWPASS_FC_FAR_HZ - LOWPASS_FC_NEAR_HZ) * distFrac
+                val lpAlpha = lowpassAlpha(fc, SAMPLE_RATE)
+                val gainForChunk = if (convolver.isLoaded) gain else 1f  // fallback path's gain is already in outL/outR
+                for (i in 0 until CHUNK_FRAMES) {
+                    // Distance-based lowpass ("air absorption") — darkens
+                    // the direct sound as the notional distance grows, a
+                    // real-world cue pure HRTF convolution has no other
+                    // way to convey.
+                    lpStateL += lpAlpha * (outL[i] - lpStateL)
+                    lpStateR += lpAlpha * (outR[i] - lpStateR)
+                    val dryL = lpStateL
+                    val dryR = lpStateR
+
+                    // Light decorrelated comb reverb — a cheap
+                    // externalization cue; anechoic HRTF over headphones
+                    // with zero reflected energy is a well-known cause of
+                    // in-head localization.
+                    val wetL = reverbBufL[reverbIdxL]
+                    val wetR = reverbBufR[reverbIdxR]
+                    reverbBufL[reverbIdxL] = dryL + wetL * REVERB_FEEDBACK
+                    reverbBufR[reverbIdxR] = dryR + wetR * REVERB_FEEDBACK
+                    reverbIdxL = (reverbIdxL + 1) % reverbBufL.size
+                    reverbIdxR = (reverbIdxR + 1) % reverbBufR.size
+
+                    val mixedL = (dryL * (1f - REVERB_WET) + wetL * REVERB_WET) * gainForChunk
+                    val mixedR = (dryR * (1f - REVERB_WET) + wetR * REVERB_WET) * gainForChunk
+                    byteBuf.putShort(clipToShort(mixedL))
+                    byteBuf.putShort(clipToShort(mixedR))
                 }
 
                 readPos = (readPos + CHUNK_FRAMES) % monoPcm.size
@@ -155,7 +226,9 @@ class HrtfBeaconPlayer(private val context: Context) {
     /** azimuthDeg/elevationDeg: HrtfBeacon.directionTo()'s convention
      * (0=ahead/+right, 0=level/+above). distanceM: flat-plane distance. */
     fun updateDirection(azimuthDeg: Float, elevationDeg: Float, distanceM: Float) {
-        overallGain = (1f - (distanceM / MAX_RANGE_M)).coerceIn(MIN_GAIN, MAX_GAIN)
+        currentDistanceM = distanceM
+        distanceGain = (1f - (distanceM / MAX_RANGE_M)).coerceIn(MIN_GAIN, MAX_GAIN)
+        overallGain = distanceGain * cueVolume.coerceIn(0f, 1f)
         if (convolver.isLoaded) {
             filterIndex = convolver.nearestIndex(azimuthDeg, elevationDeg)
         } else {
@@ -181,13 +254,24 @@ class HrtfBeaconPlayer(private val context: Context) {
     }
 }
 
-private fun clipToShort(v: Float): Short =
+/** One-pole lowpass smoothing coefficient for [cutoffHz] at [sampleRate] —
+ * `y[n] = y[n-1] + alpha*(x[n]-y[n-1])`. */
+private fun lowpassAlpha(cutoffHz: Float, sampleRate: Int): Float {
+    val rc = 1f / (2f * PI.toFloat() * cutoffHz)
+    val dt = 1f / sampleRate
+    return dt / (rc + dt)
+}
+
+// Not private: PixieController.kt (same package) reuses these three
+// helpers directly rather than duplicating the MediaCodec decode
+// boilerplate — both classes decode the same kind of looped mono asset.
+internal fun clipToShort(v: Float): Short =
     v.toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
 
 /** Decodes a compressed audio asset (mp3, etc.) to mono PCM16 at [targetSampleRate],
  * downmixing multi-channel sources. Returns an empty array on any failure — the
  * caller treats that as "beacon unavailable," never crashes. */
-private fun decodeAssetToMonoPcm(context: Context, assetPath: String, targetSampleRate: Int): ShortArray {
+internal fun decodeAssetToMonoPcm(context: Context, assetPath: String, targetSampleRate: Int): ShortArray {
     return try {
         val afd = context.assets.openFd(assetPath)
         val extractor = MediaExtractor()
@@ -263,7 +347,7 @@ private fun decodeAssetToMonoPcm(context: Context, assetPath: String, targetSamp
     }
 }
 
-private fun resampleLinear(input: ShortArray, srcRate: Int, dstRate: Int): ShortArray {
+internal fun resampleLinear(input: ShortArray, srcRate: Int, dstRate: Int): ShortArray {
     val ratio = dstRate.toDouble() / srcRate.toDouble()
     val outLen = (input.size * ratio).toInt().coerceAtLeast(1)
     val out = ShortArray(outLen)

@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.EdgeMock" parent="Theme.MaterialComponents.DayNight.NoActionBar" />
+</resources>

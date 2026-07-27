@@ -46,12 +46,30 @@ sealed class LiveServerEvent {
 class GeminiLiveClient(
     private val apiKey: String,
     private val model: String = "gemini-3.1-flash-live-preview",
+    // Prebuilt Live API voice — see https://ai.google.dev/gemini-api/docs/live
+    // for the current voice roster ("Puck"/"Zephyr" are alternates). Paired
+    // with ToolDeclarations.PERSONA_PROMPT (the "Lumina" character) — the
+    // voice alone doesn't make the model roleplay a persona, just changes
+    // the TTS timbre, so both are needed together for the requested effect.
+    private val voiceName: String = "Leda",
 ) {
     private var webSocket: WebSocket? = null
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS) // persistent stream, no read timeout
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
+
+    /** Invoked at the top of every [sendSystemNote] call, BEFORE the note
+     * is actually sent — requested directly by the user: "every single
+     * gemini live api call with [SYSTEM] tag should be an interrupting
+     * call, override current call if overlap." Wired by
+     * LiveAssistantService to flush whatever's still queued in
+     * StreamingAudioPlayer (Gemini's own voice) so a stale, still-playing
+     * response never overlaps/talks over the new one — see
+     * StreamingAudioPlayer.interrupt()'s own doc comment. Left null-safe
+     * (a no-op if unset) rather than a hard dependency, since this class
+     * has no direct reference to the audio player itself. */
+    var onInterrupt: (() -> Unit)? = null
 
     /**
      * Opens the WebSocket, sends the setup message, and emits every server
@@ -67,6 +85,11 @@ class GeminiLiveClient(
                     put("model", "models/$model")
                     put("generationConfig", JSONObject().apply {
                         put("responseModalities", JSONArray().put("AUDIO"))
+                        put("speechConfig", JSONObject().put(
+                            "voiceConfig", JSONObject().put(
+                                "prebuiltVoiceConfig", JSONObject().put("voiceName", voiceName)
+                            )
+                        ))
                     })
                     put(
                         "systemInstruction",
@@ -103,8 +126,26 @@ class GeminiLiveClient(
             Log.w(TAG, "Unparseable server message: $text")
             return
         }
+        // A rejected/malformed session (e.g. an invalid tool schema in the
+        // setup message) comes back as a top-level "error" — previously
+        // completely unhandled here, so it was silently dropped with zero
+        // log output, indistinguishable from "the model just didn't call
+        // any tool." Log it in full and surface it as a real event.
+        obj.optJSONObject("error")?.let { err ->
+            Log.e(TAG, "Server error: $err")
+            scope.trySend(LiveServerEvent.Error(err.toString()))
+        }
         if (obj.has("setupComplete")) {
+            Log.d(TAG, "setupComplete received")
             scope.trySend(LiveServerEvent.SetupComplete)
+        }
+        if (obj.has("goAway")) {
+            Log.w(TAG, "Server sent goAway: ${obj.optJSONObject("goAway")}")
+        }
+        if (!obj.has("error") && !obj.has("setupComplete") && !obj.has("goAway") &&
+            !obj.has("serverContent") && !obj.has("toolCall")
+        ) {
+            Log.d(TAG, "Unrecognized server message top-level keys: ${obj.keys().asSequence().toList()}")
         }
         obj.optJSONObject("serverContent")?.let { sc ->
             sc.optJSONObject("modelTurn")?.optJSONArray("parts")?.let { parts ->
@@ -139,9 +180,13 @@ class GeminiLiveClient(
         )))
     }
 
-    fun sendAudioStreamEnd() {
+    /** Marks the end of one recorded utterance ("voice message") sent to
+     * Gemini Live. Returns whether the send was actually enqueued on an
+     * open socket — the signal LiveAssistantService uses to play a
+     * confirmation cue only for a message that genuinely went out, not a
+     * dropped one (e.g. socket closed mid-utterance). */
+    fun sendAudioStreamEnd(): Boolean =
         send(JSONObject().put("realtimeInput", JSONObject().put("audioStreamEnd", true)))
-    }
 
     fun sendVideoFrame(jpeg: ByteArray) {
         send(JSONObject().put("realtimeInput", JSONObject().put(
@@ -151,6 +196,7 @@ class GeminiLiveClient(
     }
 
     fun sendSystemNote(text: String) {
+        onInterrupt?.invoke()
         send(JSONObject().put("clientContent", JSONObject()
             .put("turns", JSONArray().put(
                 JSONObject().put("role", "user").put("parts", JSONArray().put(
@@ -174,8 +220,13 @@ class GeminiLiveClient(
         webSocket = null
     }
 
-    private fun send(obj: JSONObject) {
-        webSocket?.send(obj.toString()) ?: Log.w(TAG, "send() called with no open WebSocket")
+    private fun send(obj: JSONObject): Boolean {
+        val ws = webSocket
+        if (ws == null) {
+            Log.w(TAG, "send() called with no open WebSocket")
+            return false
+        }
+        return ws.send(obj.toString())
     }
 
     companion object {

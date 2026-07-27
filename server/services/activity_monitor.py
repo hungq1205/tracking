@@ -84,6 +84,26 @@ class ActivityMonitor:
             self.beacon_muted = muted
             self.beacon_at = time.time()
 
+    def reset(self) -> None:
+        """Wipes every recorded bucket back to its __init__ state — called
+        by StatusService.ResetSession when a fresh client connection starts,
+        so server_gui.py's dashboard doesn't keep showing a previous
+        connection's last frame/mode/beacon reading against a session that
+        no longer exists server-side."""
+        with self._lock:
+            self.log.clear()
+            self.tracking = {}
+            self.perception = {}
+            self.mapping = {}
+            self.last_category = ""
+            self.last_at = 0.0
+            self.client_mode = ""
+            self.client_mode_target = ""
+            self.client_mode_at = 0.0
+            self.beacon_azimuth_deg = 0.0
+            self.beacon_muted = True
+            self.beacon_at = 0.0
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {

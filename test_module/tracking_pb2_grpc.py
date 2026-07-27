@@ -609,6 +609,11 @@ class StatusServiceStub(object):
                 request_serializer=tracking__pb2.ReportBeaconDirectionRequest.SerializeToString,
                 response_deserializer=tracking__pb2.ReportBeaconDirectionResponse.FromString,
                 _registered_method=True)
+        self.ResetSession = channel.unary_unary(
+                '/tracking.StatusService/ResetSession',
+                request_serializer=tracking__pb2.ResetSessionRequest.SerializeToString,
+                response_deserializer=tracking__pb2.ResetSessionResponse.FromString,
+                _registered_method=True)
 
 
 class StatusServiceServicer(object):
@@ -640,6 +645,19 @@ class StatusServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ResetSession(self, request, context):
+        """Called once, right after a fresh connection is established (see
+        MainViewModel.connect()) — the server otherwise has no way to
+        distinguish "a genuinely new client session is starting" from "this
+        same client is still going, just calling another RPC." Clears every
+        accumulated server-side scan/mapping session (all location_ids) and
+        resets the shared RTAB-Map docker session, so a new connection never
+        silently resumes a stale map/pose left over from a previous one.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_StatusServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -652,6 +670,11 @@ def add_StatusServiceServicer_to_server(servicer, server):
                     servicer.ReportBeaconDirection,
                     request_deserializer=tracking__pb2.ReportBeaconDirectionRequest.FromString,
                     response_serializer=tracking__pb2.ReportBeaconDirectionResponse.SerializeToString,
+            ),
+            'ResetSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResetSession,
+                    request_deserializer=tracking__pb2.ResetSessionRequest.FromString,
+                    response_serializer=tracking__pb2.ResetSessionResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -715,6 +738,33 @@ class StatusService(object):
             '/tracking.StatusService/ReportBeaconDirection',
             tracking__pb2.ReportBeaconDirectionRequest.SerializeToString,
             tracking__pb2.ReportBeaconDirectionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ResetSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tracking.StatusService/ResetSession',
+            tracking__pb2.ResetSessionRequest.SerializeToString,
+            tracking__pb2.ResetSessionResponse.FromString,
             options,
             channel_credentials,
             insecure,

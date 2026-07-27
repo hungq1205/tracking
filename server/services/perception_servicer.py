@@ -18,11 +18,10 @@ import tracking_pb2_grpc
 
 
 class PerceptionServiceServicer(tracking_pb2_grpc.PerceptionServiceServicer):
-    def __init__(self, detector, embedder, depth_detector, tts=None, rag_store=None, activity_monitor=None):
+    def __init__(self, detector, embedder, depth_detector, rag_store=None, activity_monitor=None):
         self.detector = detector
         self.embedder = embedder
         self.depth_detector = depth_detector
-        self.tts = tts
         self.rag_store = rag_store
         self.activity_monitor = activity_monitor
 
@@ -35,8 +34,6 @@ class PerceptionServiceServicer(tracking_pb2_grpc.PerceptionServiceServicer):
     def AnalyzeFrame(self, request, context):
         frame = self._decode_image(request.image_data)
         ops_names = [tracking_pb2.AnalysisOp.Name(op) for op in request.ops]
-        print(f"[PerceptionService] AnalyzeFrame <- {context.peer()} ops={ops_names} "
-              f"prompt='{request.prompt}' image_bytes={len(request.image_data)}")
         response = tracking_pb2.AnalyzeFrameResponse()
         if frame is None:
             print("[PerceptionService] AnalyzeFrame: failed to decode image_data")
@@ -81,6 +78,7 @@ class PerceptionServiceServicer(tracking_pb2_grpc.PerceptionServiceServicer):
                         max_angle_deg=trav.max_angle_deg,
                         angle_step_deg=trav.angle_step_deg,
                         max_range_m=trav.max_range_m,
+                        dropoff_m=trav.dropoff_m,
                     )
                 )
         except Exception as e:
@@ -108,6 +106,7 @@ class PerceptionServiceServicer(tracking_pb2_grpc.PerceptionServiceServicer):
                         "max_angle_deg": response.traversability.max_angle_deg,
                         "angle_step_deg": response.traversability.angle_step_deg,
                         "max_range_m": response.traversability.max_range_m,
+                        "dropoff_m": list(response.traversability.dropoff_m),
                     }
                     if response.HasField("traversability") else None
                 ),
@@ -115,21 +114,17 @@ class PerceptionServiceServicer(tracking_pb2_grpc.PerceptionServiceServicer):
         return response
 
     def Synthesize(self, request, context):
-        print(f"[PerceptionService] Synthesize <- {context.peer()} chars={len(request.text)}")
+        # KokoroTTS was removed outright — reading-mode TTS runs on-device
+        # now (ReadingTtsPlayer.kt), no live client path calls this RPC any
+        # more. Left as a no-op stream (not deleted from the proto) rather
+        # than an error, so an old/unmigrated caller degrades quietly.
         if self.activity_monitor is not None:
             self.activity_monitor.record_perception(
                 f"Synthesize chars={len(request.text)}",
                 op="Synthesize", text=request.text,
             )
-        if self.tts is None or not request.text:
-            return
-        try:
-            for pcm in self.tts.synthesize_pcm_chunks(request.text):
-                yield tracking_pb2.PcmChunk(pcm_data=pcm)
-        except Exception as e:
-            traceback.print_exc()
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
+        return
+        yield  # pragma: no cover — makes this a generator, matching the RPC's streaming signature
 
     def Embed(self, request, context):
         print(f"[PerceptionService] Embed <- {context.peer()} text='{request.text}'")

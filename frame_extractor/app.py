@@ -2,9 +2,9 @@
 Gradio GUI for frame_extractor — upload a video, get back only the frames
 whose ORB features weren't already covered by a previously-accepted frame
 (see extractor.py's docstring). RTAB-Map is optional (pose/node_id metadata
-only, no longer gates acceptance). RAM++ tagging -> GroundingDINO-tiny
+only, no longer gates acceptance). Gemini tagging -> GroundingDINO-tiny
 detection (tagging.py) is also optional — when enabled, every returned frame
-additionally shows its RAM++ tags and GroundingDINO boxes.
+additionally shows its Gemini-proposed tags and GroundingDINO boxes.
 
 Run:
     conda activate hrtf   # same env scan_server/ is developed against
@@ -17,18 +17,19 @@ import gradio as gr
 from extractor import extract_new_frames
 from tagging import FrameTagger
 
-# FrameTagger loads a 3GB RAM++ checkpoint + GroundingDINO tiny (~1-2 min,
-# see tagging.py) — built once on first use and cached here instead of
-# reloading it on every "Extract new frames" click.
+# FrameTagger loads GroundingDINO tiny locally (~seconds) and a Gemini API
+# client (no local checkpoint) — built once on first use and cached here
+# instead of reloading it on every "Extract new frames" click.
 _TAGGER_CACHE = {}
 
 
-def _get_tagger(ram_checkpoint, gdino_model_id, device):
-    key = (ram_checkpoint, gdino_model_id, device)
+def _get_tagger(gemini_api_key, gemini_model_id, gdino_model_id, device):
+    key = (gemini_api_key, gemini_model_id, gdino_model_id, device)
     if key not in _TAGGER_CACHE:
         _TAGGER_CACHE.clear()  # only one tagger resident on the GPU at a time
         _TAGGER_CACHE[key] = FrameTagger(
-            ram_checkpoint=ram_checkpoint, gdino_model_id=gdino_model_id, device=device,
+            gemini_api_key=gemini_api_key, gemini_model_id=gemini_model_id,
+            gdino_model_id=gdino_model_id, device=device,
         )
     return _TAGGER_CACHE[key]
 
@@ -36,7 +37,7 @@ def _get_tagger(ram_checkpoint, gdino_model_id, device):
 def run(video_file, use_rtabmap, rtabmap_addr, sample_fps, min_new_fraction, min_new_count,
         orb_features, min_raw_matches, ransac_threshold_px, min_rotation_deg, min_sharpness,
         da3_batch_size, da3_model, da3_onnx_path,
-        use_tagging, ram_checkpoint, gdino_model_id, tag_batch_size,
+        use_tagging, gemini_api_key, gemini_model_id, gdino_model_id, tag_batch_size,
         device, progress=gr.Progress()):
     if video_file is None:
         return [], "Upload a video first.", []
@@ -47,8 +48,10 @@ def run(video_file, use_rtabmap, rtabmap_addr, sample_fps, min_new_fraction, min
     frame_tagger = None
     if use_tagging:
         try:
-            progress(0, desc="Loading RAM++ / GroundingDINO tiny (first run only)...")
-            frame_tagger = _get_tagger(ram_checkpoint.strip(), gdino_model_id.strip(), device)
+            progress(0, desc="Loading GroundingDINO tiny (first run only)...")
+            frame_tagger = _get_tagger(
+                gemini_api_key.strip(), gemini_model_id.strip(), gdino_model_id.strip(), device,
+            )
         except Exception as e:
             return [], f"Failed to load tagging models: {e}", []
 
@@ -104,7 +107,7 @@ def run(video_file, use_rtabmap, rtabmap_addr, sample_fps, min_new_fraction, min
         if nf.node_id != -1:
             lines.append(f"- **RTAB-Map node:** {nf.node_id}")
         if nf.tags:
-            lines.append(f"- **RAM++ tags:** {', '.join(nf.tags)}")
+            lines.append(f"- **Gemini tags:** {', '.join(nf.tags)}")
         if nf.tag_prompt:
             lines.append(f"- **GroundingDINO prompt:** `{nf.tag_prompt}`")
         if nf.tag_detections:
@@ -126,9 +129,9 @@ with gr.Blocks(title="Frame Extractor — ORB new-feature detection") as demo:
         "A person walking through a static shot won't count as new; panning to an unseen part "
         "of the room will. Checked against every accepted frame so far, so panning back to an "
         "earlier view won't be re-accepted.\n\n"
-        "Optionally, every accepted frame is also tagged with RAM++ (open-set image tagging) "
+        "Optionally, every accepted frame is also tagged via Gemini (open-set image tagging) "
         "and those tags are fed straight into GroundingDINO tiny as its detection prompt — so "
-        "each frame gets boxed for whatever RAM++ actually found in it, no fixed vocabulary "
+        "each frame gets boxed for whatever Gemini actually found in it, no fixed vocabulary "
         "needed up front."
     )
     with gr.Row():
@@ -192,28 +195,30 @@ with gr.Blocks(title="Frame Extractor — ORB new-feature detection") as demo:
             da3_model = gr.Radio(["torch", "onnx"], value="onnx", label="DA3 depth backend (RTAB-Map only)")
             da3_onnx_path = gr.Textbox(label="DA3 ONNX path (only if backend=onnx)", value="DA3METRIC-LARGE.onnx")
             use_tagging = gr.Checkbox(
-                label="Tag + detect each accepted frame (RAM++ -> GroundingDINO tiny)",
+                label="Tag + detect each accepted frame (Gemini -> GroundingDINO tiny)",
                 value=False,
-                info="First use loads a ~3GB RAM++ checkpoint + GroundingDINO tiny (~1-2 min); "
-                     "cached in memory after that, not reloaded per run.",
+                info="First use loads GroundingDINO tiny locally (~seconds); tagging itself is a "
+                     "Gemini API call, no local checkpoint needed.",
             )
-            ram_checkpoint = gr.Textbox(
-                label="RAM++ checkpoint path",
-                value=os.getenv(
-                    "RAM_PLUS_CHECKPOINT",
-                    os.path.join(os.path.dirname(__file__), "weights", "ram_plus_swin_large_14m.pth"),
-                ),
+            gemini_api_key = gr.Textbox(
+                label="Gemini API Key",
+                value=os.getenv("GEMINI_API_KEY", ""),
+                type="password",
+            )
+            gemini_model_id = gr.Textbox(
+                label="Gemini tagging model id",
+                value=os.getenv("GEMINI_TAGGING_MODEL_ID", FrameTagger.DEFAULT_GEMINI_MODEL),
             )
             gdino_model_id = gr.Textbox(
                 label="GroundingDINO tagging model id",
-                value="IDEA-Research/grounding-dino-tiny",
+                value="IDEA-Research/grounding-dino-base",
             )
             tag_batch_size = gr.Slider(
                 minimum=1, maximum=8, value=1, step=1,
                 label="Tagging batch size",
-                info="RAM++/GroundingDINO frames processed per batched forward pass — independent "
-                     "of the DA3 batch size above (different VRAM/speed profile, no chronological "
-                     "dependency).",
+                info="Frames processed per batched Gemini call / GroundingDINO forward pass — "
+                     "independent of the DA3 batch size above (different VRAM/speed profile, no "
+                     "chronological dependency).",
             )
             device = gr.Radio(["cuda", "cpu"], value="cuda", label="Device")
             run_btn = gr.Button("Extract new frames", variant="primary")
@@ -229,7 +234,7 @@ with gr.Blocks(title="Frame Extractor — ORB new-feature detection") as demo:
         inputs=[video_input, use_rtabmap, rtabmap_addr, sample_fps, min_new_fraction, min_new_count,
                 orb_features, min_raw_matches, ransac_threshold_px, min_rotation_deg, min_sharpness,
                 da3_batch_size, da3_model, da3_onnx_path,
-                use_tagging, ram_checkpoint, gdino_model_id, tag_batch_size,
+                use_tagging, gemini_api_key, gemini_model_id, gdino_model_id, tag_batch_size,
                 device],
         outputs=[gallery, status, details_state],
     )

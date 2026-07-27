@@ -31,7 +31,7 @@ def _post_process_grounded(processor, outputs, input_ids, box_threshold, text_th
 
 
 class GroundingDINODetector(IObjectDetector):
-    def __init__(self, model_id: str = "IDEA-Research/grounding-dino-tiny"):
+    def __init__(self, model_id: str = "IDEA-Research/grounding-dino-base"):
         from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
         print(f"[SERVER] Initializing Grounding DINO ({model_id})...")
@@ -113,7 +113,12 @@ class GroundingDINODetector(IObjectDetector):
 
         boxes = results["boxes"].cpu().numpy()
         scores = results["scores"].cpu().numpy()
-        labels = results["text_labels"]
+        # Same transformers<=4.46.x vs >=5.x rename _post_process_grounded()
+        # above already works around for the call's kwarg name — the RETURN
+        # dict's label key was renamed too ("labels" -> "text_labels"), and
+        # this codebase has actually observed both in practice depending on
+        # which environment's transformers ends up loaded at runtime.
+        labels = results.get("text_labels", results.get("labels"))
 
         return [
             LabeledDetection(

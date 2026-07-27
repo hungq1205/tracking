@@ -16,6 +16,8 @@ is the tab-selection fallback for older clients that predate ReportMode.
 """
 from __future__ import annotations
 
+import os
+import shutil
 import time
 from typing import Optional
 
@@ -23,6 +25,7 @@ import cv2
 import gradio as gr
 import numpy as np
 import plotly.graph_objects as go
+from scipy.spatial.transform import Rotation
 
 
 _TAB_BY_CATEGORY = {
@@ -34,13 +37,20 @@ _TAB_BY_CATEGORY = {
 _TAB_BY_CLIENT_MODE = {
     "tracking": "tab_tracking",
     "guiding": "tab_mapping",
-    # Walking no longer touches MappingService at all (see CLAUDE.md's
-    # "Local reactive HRTF obstacle-dodge" note) — its only server traffic
-    # is PerceptionService.AnalyzeFrame(TRAVERSABILITY) + StatusService, so
-    # its activity shows up on the Perception tab now, not Mapping.
-    "walking": "tab_perception",
+    # Walking rejoined MappingService (RTAB-Map pose + a live occupancy grid,
+    # same as guiding — see CLAUDE.md's "Grid-planned walking route" note),
+    # so its activity lands in the mapping bucket again, same as guiding/
+    # scanning. This used to point at tab_perception, back when walking's
+    # only server traffic was AnalyzeFrame(TRAVERSABILITY) — a real,
+    # previously-documented gap (the dashboard tab never matched what the
+    # client was actually doing), now closed.
+    "walking": "tab_mapping",
     "scanning": "tab_mapping",
 }
+
+
+_frame_idx = 0
+_frames_dir = "frames"
 
 
 def _bgr_to_rgb(frame_bgr: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -123,6 +133,70 @@ def _perception_status(snap: dict) -> str:
     return "\n".join(lines)
 
 
+def _project_world_to_pixel(pose_proto, ground_y: float, wx: float, wz: float, frame_w: int, frame_h: int):
+    """Projects a world (x, ground_y, z) point into this pose's camera
+    pixel space — the inverse of scan_session.py's own back-projection.
+    Camera-local convention (X-right, Y-down, Z-forward) matches every pose
+    this project produces, same as HrtfBeacon.kt's own docstring. Assumed
+    intrinsics (fx=fy=0.8*max(w,h), cx=w/2, cy=h/2) are the same "no real
+    calibration, guess a pinhole K" convention duplicated as `_estimate_K`
+    across scan_session.py/feature_tracker.py/orb_novelty_gate.py/
+    rtabmap_client.py — reproduced directly here rather than importing
+    across the server/scan_server boundary, matching that established
+    precedent. Returns None if intrinsics can't be computed (frame_w/h <= 0)
+    or the point is behind the camera.
+
+    The "behind camera" check is deliberately HORIZONTAL-ONLY (dot product
+    against the camera's own floor-plane forward direction — same
+    computation _pose_heading_rad() does server-side), not the full 3D
+    camera-local Z. Using the full 3D Z would let an inaccurate `ground_y`
+    (a single scalar estimate, not a per-point measurement) leak into
+    whether a point is considered "visible" at all — a modest camera pitch
+    combined with an off `ground_y` could flip the sign and silently blank
+    the WHOLE overlay even though every point is genuinely in front of the
+    user horizontally. `ground_y` is still used for vertical (v) pixel
+    placement, where an inaccuracy just draws the overlay a bit high/low
+    rather than making it vanish entirely."""
+    if frame_w <= 0 or frame_h <= 0:
+        return None
+    quat = np.array([pose_proto.qx, pose_proto.qy, pose_proto.qz, pose_proto.qw])
+    quat_norm = float(np.linalg.norm(quat))
+    # A protobuf Pose that was never actually populated (e.g. a stale/
+    # default-constructed message slipping through) reads qx=qy=qz=qw=0 —
+    # a zero-norm "quaternion" that isn't a rotation at all. scipy's
+    # from_quat() normalizes internally, so a near-zero input silently
+    # divides by ~0 and returns NaN rather than raising — every point would
+    # then look "behind the camera" from a `nan <= 1e-3` comparison (always
+    # False in Python) actually falling through to `int(round(nan))`,
+    # which DOES raise, mid-list-comprehension, potentially breaking the
+    # whole dashboard tuple update for that tick. Guard explicitly instead
+    # of relying on that to surface loudly.
+    if quat_norm < 1e-6:
+        print(f"[server_gui] _project_world_to_pixel: degenerate pose quaternion {quat.tolist()} "
+              f"(norm={quat_norm:.4f}) — pose_proto likely unset/stale, skipping projection")
+        return None
+    cam_r = Rotation.from_quat(quat).as_matrix()
+    forward_world = cam_r @ np.array([0.0, 0.0, 1.0])
+    dx = wx - pose_proto.x
+    dz = wz - pose_proto.z
+    horizontal_forward_dot = dx * forward_world[0] + dz * forward_world[2]
+    if horizontal_forward_dot <= 1e-3:
+        return None
+    d_world = np.array([dx, ground_y - pose_proto.y, dz])
+    d_cam = cam_r.T @ d_world  # world -> camera-local
+    # Visibility was already decided above (horizontal-only) — clamp rather
+    # than reject here, so a `ground_y` inaccurate enough to push the full
+    # 3D Z near/below zero degrades to "drawn near the edge" instead of
+    # "silently dropped" for a point that IS genuinely in front of the user.
+    z_for_projection = max(d_cam[2], 0.05)
+    f = 0.8 * max(frame_w, frame_h)
+    u = f * d_cam[0] / z_for_projection + frame_w / 2.0
+    v = f * d_cam[1] / z_for_projection + frame_h / 2.0
+    if not (np.isfinite(u) and np.isfinite(v)):
+        return None
+    return int(round(u)), int(round(v))
+
+
 def _annotate_mapping(snap: dict) -> Optional[np.ndarray]:
     frame_rgb = snap.get("frame_rgb")
     if frame_rgb is None:
@@ -130,7 +204,9 @@ def _annotate_mapping(snap: dict) -> Optional[np.ndarray]:
     if snap.get("op") != "UpdateMapping":
         return frame_rgb
     vis = frame_rgb.copy()
-    text = f"pose=({snap.get('pose_x', 0):.2f},{snap.get('pose_z', 0):.2f}) conf={snap.get('confidence', 0):.2f}"
+    heading_rad = snap.get("heading_rad")
+    heading_txt = f" heading={np.degrees(heading_rad):.0f}deg" if heading_rad is not None else ""
+    text = f"pose=({snap.get('pose_x', 0):.2f},{snap.get('pose_z', 0):.2f}) conf={snap.get('confidence', 0):.2f}{heading_txt}"
     cv2.putText(vis, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 100), 2, cv2.LINE_AA)
     rtabmap_lost = snap.get("rtabmap_lost", 0)
     if rtabmap_lost:
@@ -140,27 +216,134 @@ def _annotate_mapping(snap: dict) -> Optional[np.ndarray]:
             vis, f"RTAB-Map TRACKING LOST ({rtabmap_lost}/{snap.get('rtabmap_total', 0)})",
             (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2, cv2.LINE_AA,
         )
+    pose_proto = snap.get("pose_proto")
+    planned_path = snap.get("planned_path") or []
+    if pose_proto is not None and planned_path:
+        h, w = vis.shape[:2]
+        # dict.get(key, default) only falls back when the KEY is missing,
+        # not when it's present but None — record_mapping() always passes
+        # the `ground_y` key, so if occupancy_map._ground_y hadn't been
+        # estimated yet at record time (no ground evidence seen so far
+        # this session), this used to silently pass ground_y=None through
+        # into arithmetic below instead of falling back to pose_proto.y.
+        ground_y = snap.get("ground_y")
+        if ground_y is None:
+            ground_y = pose_proto.y
+        # Only the user's own pose (bottom center, by construction of
+        # _project_world_to_pixel) -> the first waypoint is drawn here —
+        # the rest of the route is already visible on the occupancy map,
+        # and projecting the full path onto a forward-facing camera frame
+        # degenerates badly past the first joint (points behind/beside the
+        # camera, or far down a corridor, don't read as a useful line).
+        pixels = [
+            _project_world_to_pixel(pose_proto, ground_y, wx, wz, w, h)
+            for wx, wz in planned_path[:1]
+        ]
+        if planned_path and all(p is None for p in pixels):
+            print(f"[server_gui] _annotate_mapping: ALL {len(pixels)} planned_path points "
+                  f"projected as not-visible — pose=({pose_proto.x:.2f},{pose_proto.y:.2f},"
+                  f"{pose_proto.z:.2f}) quat=({pose_proto.qx:.3f},{pose_proto.qy:.3f},"
+                  f"{pose_proto.qz:.3f},{pose_proto.qw:.3f}) ground_y={ground_y:.2f} "
+                  f"first_path_point={planned_path[0]}")
+        # cyan — distinct from the green pose text / red tracking-lost
+        # warning already drawn on this same overlay.
+        color = (0, 255, 255)
+        origin = (w // 2, h - 1)
+        first = pixels[0] if pixels else None
+        if first is not None:
+            cv2.line(vis, origin, first, color, 2, cv2.LINE_AA)
+            cv2.circle(vis, first, 4, color, -1, cv2.LINE_AA)
+
+        # HRTF beacon target — same beacon_target_point() calculation
+        # ToolDispatcher.kt's steerBeaconAlongPath() does on-device (project
+        # onto the path, then move forward by a look-ahead distance),
+        # replicated server-side purely for this display — see
+        # CLAUDE.md's "Server-planned walking path" note. Magenta, a larger
+        # ring, so it reads as "the sound source" distinct from the plain
+        # cyan route dots.
+        beacon_point = snap.get("beacon_point")
+        if beacon_point is not None:
+            bp = _project_world_to_pixel(pose_proto, ground_y, beacon_point[0], beacon_point[1], w, h)
+            if bp is not None:
+                cv2.circle(vis, bp, 10, (255, 0, 255), 2, cv2.LINE_AA)
     return vis
 
 
-def _render_occupancy(snap: dict):
+def _render_occupancy(snap: dict, record_is_checked: bool):
     """Height-heatmap occupancy grid, reusing occupancy_map.py's own
     render_plotly() directly — no reimplementation of its classification/
     colorscale logic. Deliberately no point-cloud/voxel view here (that
     stays scan_gui.py's separate, heavier offline debug tool — see
     CLAUDE.md's server_gui.py note); this is occupancy-grid-only, matching
-    what the client actually navigates against (routing only now — the
-    HRTF beacon itself is no longer grid-derived, see the Perception tab's
-    beacon-direction panel instead).
+    what the client actually navigates against.
+    Overlays the current server-planned route via render_plotly()'s own
+    route/route_confirmed params (same _overlay_route() scan_gui.py's Live
+    Navigation Preview already uses) — route must include the start point
+    (current pose) as its first element, per that function's own contract.
     Wrapped in try/except: occupancy_map is a live object reference,
     mutated concurrently by the gRPC streaming thread while this renders on
     the Gradio polling thread — a render racing a mutation should degrade
     (skip this tick, try again next poll) rather than crash the dashboard."""
+    global _frame_idx
     occ_map = snap.get("occupancy_map")
     if occ_map is None:
         return None
+    planned_path = snap.get("planned_path") or []
+    route = [(snap.get("pose_x", 0.0), snap.get("pose_z", 0.0))] + list(planned_path) if planned_path else None
     try:
-        return occ_map.render_plotly()
+        fig = occ_map.render_plotly(route=route, route_confirmed=snap.get("path_confirmed"))
+        # HRTF beacon target, in world space — same beacon_target_point()
+        # calculation ToolDispatcher.kt's steerBeaconAlongPath() does
+        # on-device, replicated server-side purely for this display (see
+        # CLAUDE.md's "Server-planned walking path" note). Magenta,
+        # matching the frame overlay's own beacon marker color.
+        beacon_point = snap.get("beacon_point")
+        if beacon_point is not None:
+            fig.add_trace(go.Scatter(
+                x=[beacon_point[0]], y=[beacon_point[1]],
+                mode="markers", marker=dict(size=14, color="magenta", symbol="circle-open", line=dict(width=3)),
+                name="HRTF beacon", hoverinfo="skip",
+            ))
+        # Which way the user is actually facing (world-frame yaw from
+        # _pose_heading_rad(), same 0=+Z/positive-toward-+X convention
+        # HrtfBeacon.kt's azimuth uses) — drawn as a short arrow from the
+        # current position, so a mismatch between "where the route goes"
+        # and "which way the user is actually pointed" is visible directly
+        # on this plot instead of only inferable from console logs.
+        heading_rad = snap.get("heading_rad")
+        if heading_rad is not None:
+            hx, hz = snap.get("pose_x", 0.0), snap.get("pose_z", 0.0)
+            arrow_len = 0.6
+            ax = hx + arrow_len * np.sin(heading_rad)
+            az = hz + arrow_len * np.cos(heading_rad)
+            fig.add_annotation(
+                x=ax, y=az, ax=hx, ay=hz, xref="x", yref="y", axref="x", ayref="y",
+                showarrow=True, arrowhead=3, arrowsize=1.5, arrowwidth=3,
+                arrowcolor="yellow", text="",
+            )
+            # add_annotation() draws the arrow but doesn't add a legend
+            # entry — an invisible marker at the arrow tip stands in for one
+            # (same trick used wherever this codebase wants a legend label
+            # for something that isn't itself a Scatter trace).
+            fig.add_trace(go.Scatter(
+                x=[ax], y=[az], mode="markers",
+                marker=dict(size=0.1, color="yellow"),
+                name="Facing direction", hoverinfo="skip",
+            ))
+        # Discovered landmarks (session._raw_landmarks, live during a SCAN —
+        # see "Semantic mapper adapted to..." in CLAUDE.md) — white diamonds
+        # with their name as hover text, distinct from the beacon/facing
+        # markers above.
+        landmarks = snap.get("landmarks") or []
+        if landmarks:
+            fig.add_trace(go.Scatter(
+                x=[lm[0] for lm in landmarks], y=[lm[1] for lm in landmarks],
+                mode="markers+text", marker=dict(size=10, color="white", symbol="diamond", line=dict(width=1, color="black")),
+                text=[lm[2] for lm in landmarks], textposition="top center",
+                name="Landmarks", hoverinfo="text",
+            ))
+
+        return fig
     except Exception:
         return None
 
@@ -171,11 +354,23 @@ def _render_beacon_polar(snap: dict):
     reconstruction (which modeled the beacon as a position; it's a pure
     steering angle now, see CLAUDE.md's "Local reactive HRTF obstacle-
     dodge" note). Forward = 12 o'clock, azimuth-right reads clockwise
-    (matches HrtfBeacon.kt's convention). Bars are the last
-    AnalyzeFrame(TRAVERSABILITY) fan (perception bucket); the marker is the
-    ACTUAL final azimuth the client is playing (post goal-bias, post EMA
-    smoothing — client-computed, reported via StatusService.
-    ReportBeaconDirection since the server has no other way to know it)."""
+    (matches HrtfBeacon.kt's convention). Lives on the Mapping tab now
+    (moved off the old standalone Perception tab — see CLAUDE.md's
+    "Grid-planned walking route" note): shown alongside the occupancy map
+    since that's the grid GUIDING's and now WALKING's beacon both actually
+    steer through.
+
+    The marker is the ACTUAL final azimuth the client is playing —
+    client-computed, reported via StatusService.ReportBeaconDirection since
+    the server has no other way to know it (GUIDING: goal-biased,
+    EMA-smoothed TraversabilityScorer output; WALKING: bearing to the
+    client's current LocalPathPlanner waypoint along its grid-planned
+    route). The bars are the last AnalyzeFrame(TRAVERSABILITY) fan
+    (perception bucket) — for GUIDING this is literally what the marker was
+    scored from; for WALKING the steering itself comes from the occupancy
+    grid instead, so these bars are only the separate step-down/drop-off
+    hazard-check fan (see CLAUDE.md's "Hazard warnings" note) — background
+    context, not what picked the marker's angle."""
     trav = snap.get("perception", {}).get("traversability")
     if trav is None:
         return None
@@ -199,7 +394,7 @@ def _render_beacon_polar(snap: dict):
         ))
     fig.update_layout(
         polar=dict(
-            angularaxis=dict(rotation=90, direction="clockwise", range=[trav["min_angle_deg"], trav["max_angle_deg"]]),
+            angularaxis=dict(rotation=90, direction="clockwise"),
             radialaxis=dict(range=[0, trav["max_range_m"]]),
         ),
         showlegend=False, margin=dict(l=20, r=20, t=20, b=20), height=360,
@@ -267,6 +462,37 @@ def _log_html(entries: list) -> str:
     )
 
 
+def _frames_to_video(frames_dir: str, output_path: str, fps: int = 10):
+    """Crude but effective frames-to-video using cv2."""
+    if not os.path.isdir(frames_dir):
+        print(f"Frames directory '{frames_dir}' not found, nothing to do.")
+        return "Frames directory not found."
+    frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith(".png")])
+    if not frame_files:
+        print("No frames to generate video.")
+        return "No frames found to generate video."
+
+    first_frame_path = os.path.join(frames_dir, frame_files[0])
+    frame = cv2.imread(first_frame_path)
+    height, width, _ = frame.shape
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    for frame_file in frame_files:
+        frame_path = os.path.join(frames_dir, frame_file)
+        video.write(cv2.imread(frame_path))
+
+    video.release()
+    print(f"Video saved to {output_path}")
+
+    global _frame_idx
+    _frame_idx = 0
+    shutil.rmtree(frames_dir)
+    print(f"Cleaned up {frames_dir}.")
+    return f"Video saved to {output_path}. Frames directory cleared."
+
+
 def _client_mode_text(snap: dict) -> str:
     mode = snap.get("client_mode", "")
     if not mode:
@@ -301,13 +527,15 @@ def create_ui(activity_monitor) -> gr.Blocks:
             _beacon_status(snap),
             _annotate_mapping(snap["mapping"]),
             _mapping_status(snap["mapping"]),
-            _render_occupancy(snap["mapping"]),
+            _render_occupancy(snap["mapping"], False),  # Recording is handled by a separate event
             _log_html(snap["log"]),
+            snap,  # Pass the full snapshot to the state component
         )
 
     with gr.Blocks(title="Vision Assistant — Server Monitor") as app:
         gr.Markdown("## Vision Assistant — Server Monitor")
         ui_client_mode = gr.Textbox(label="", show_label=False, interactive=False)
+        ui_snapshot_state = gr.State()
 
         ui_tabs = gr.Tabs(selected="tab_log")
         with ui_tabs:
@@ -318,33 +546,51 @@ def create_ui(activity_monitor) -> gr.Blocks:
                     with gr.Column(scale=1):
                         ui_track_status = gr.Textbox(label="Detail", lines=8, interactive=False)
 
-            with gr.Tab("Perception (walking / OCR-adjacent)", id="tab_perception"):
+            with gr.Tab("Perception (on-demand queries)", id="tab_perception"):
+                gr.Markdown(
+                    "Ad-hoc AnalyzeFrame calls only — `run_detection`/`check_obstacle` tool "
+                    "invocations. Walking/guiding's own HRTF beacon display moved to the "
+                    "Mapping tab (below), since that's the grid both modes actually steer "
+                    "through now — see CLAUDE.md's \"Grid-planned walking route\" note."
+                )
                 with gr.Row():
                     with gr.Column(scale=2):
                         ui_perc_image = gr.Image(label="Last frame (annotated)", type="numpy")
                     with gr.Column(scale=1):
                         ui_perc_status = gr.Textbox(label="Detail", lines=10, interactive=False)
-                gr.Markdown(
-                    "**HRTF beacon direction** — the local per-frame obstacle-clearance fan "
-                    "(AnalyzeFrame TRAVERSABILITY) and the beacon's actual final steering angle "
-                    "(client-computed: goal-biased + smoothed, reported via ReportBeaconDirection "
-                    "purely for this display)."
-                )
+
+            with gr.Tab("Mapping + Beacon (guiding / walking / scanning)", id="tab_mapping"):
+                with gr.Row():
+                    ui_map_image = gr.Image(label="Last mapping frame", type="numpy", height=420)
+                    ui_occupancy_plot = gr.Plot(label="Occupancy Map (height)")
+                with gr.Row():
+                    record_checkbox = gr.Checkbox(label="Record occupancy map to frames/")
+
+                    def handle_record_change(is_checked, snap):
+                        if is_checked and snap.get("mapping"):
+                            fig = _render_occupancy(snap["mapping"], is_checked)
+                            if fig:
+                                if not os.path.exists(_frames_dir):
+                                    os.makedirs(_frames_dir)
+                                fig.write_image(f"{_frames_dir}/{_frame_idx:05d}.png")
+                                globals()["_frame_idx"] += 1
+
+                    generate_button = gr.Button("Generate occupancy.mp4 and clear frames")
+                video_status = gr.Textbox(label="Video Status", interactive=False, show_label=False)
+
+                def generate_video_action():
+                    return _frames_to_video(_frames_dir, "occupancy.mp4")
+
+                generate_button.click(fn=generate_video_action, inputs=[], outputs=[video_status])
+                # Beacon graph side by side with BOTH detail boxes (mapping +
+                # beacon), not a separate full-width status row floating
+                # between the two plots — requested directly by the user.
                 with gr.Row():
                     with gr.Column(scale=2):
                         ui_beacon_plot = gr.Plot(label="Beacon direction (forward = up)")
                     with gr.Column(scale=1):
-                        ui_beacon_status = gr.Textbox(label="Detail", lines=4, interactive=False)
-
-            with gr.Tab("Mapping (guiding / walking / scanning)", id="tab_mapping"):
-                gr.Markdown(
-                    "Occupancy grid only (no point cloud / voxel / confidence view — "
-                    "that stays scan_gui.py's separate, heavier offline debug tool)."
-                )
-                with gr.Row():
-                    ui_map_image = gr.Image(label="Last mapping frame", type="numpy")
-                    ui_occupancy_plot = gr.Plot(label="Occupancy Map (height)")
-                ui_map_status = gr.Textbox(label="Detail", lines=6, interactive=False)
+                        ui_map_status = gr.Textbox(label="Mapping detail", lines=6, interactive=False)
+                        ui_beacon_status = gr.Textbox(label="Beacon detail", lines=4, interactive=False)
 
             with gr.Tab("Activity Log", id="tab_log"):
                 ui_log = gr.HTML()
@@ -366,7 +612,14 @@ def create_ui(activity_monitor) -> gr.Blocks:
                 ui_map_status,
                 ui_occupancy_plot,
                 ui_log,
+                ui_snapshot_state,
             ],
+        )
+        
+        ui_occupancy_plot.change(
+            fn=handle_record_change,
+            inputs=[record_checkbox, ui_snapshot_state],
+            outputs=[]
         )
 
     return app

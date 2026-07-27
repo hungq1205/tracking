@@ -1,16 +1,20 @@
 # Installed on top of scan_server/requirements.txt in the same `hrtf` conda env.
 #
 # transformers is pinned (not left on whatever scan_server/hrtf otherwise
-# has) because the `ram` package below vendors its own BERT copy against an
-# older transformers internal API — see CLAUDE.md's "Frame Extractor"
-# section for what specifically breaks above this version.
+# has) because AutoModelForZeroShotObjectDetection's
+# post_process_grounded_object_detection has a different signature above
+# this version (box_threshold/"labels" vs. threshold/"text_labels") — see
+# CLAUDE.md's "Frame Extractor" section.
 #
-# After installing, run `python frame_extractor/patch_ram_package.py` once —
-# `ram`'s vendored BERT still has a few import-path breakages even at this
-# pinned transformers version; that script patches the installed package
-# in place (idempotent, safe to re-run).
+# google-genai (Gemini API client, used by tagging.py's FrameTagger for the
+# open-set tagging step) is already pinned in scan_server/requirements.txt —
+# no separate entry needed here.
+#
+# RAM++ (`recognize-anything` package + patch_ram_package.py) is no longer
+# used by the live tagging pipeline — tagging.py switched to Gemini for
+# open-set tagging (see that module's docstring); both are kept in the repo
+# for reference/future use, not deleted.
 transformers==4.46.3
 accelerate>=0.26.0
 timm
 fairscale
-git+https://github.com/xinyu1205/recognize-anything.git

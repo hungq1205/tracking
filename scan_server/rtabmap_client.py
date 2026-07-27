@@ -93,6 +93,10 @@ class ReconstructedNode:
     pose: np.ndarray            # 4x4 c2w, world frame — RTAB-Map's CURRENT corrected pose
     points: np.ndarray          # Nx3 float32, world frame
     colors: np.ndarray          # Nx3 uint8, RGB
+    is_ground: np.ndarray       # N bool — RTAB-Map's own ground/obstacle segmentation
+                                 # (util3d::segmentObstaclesFromGround, see
+                                 # rtabmap_server.cc's segment_ground_flags() for the
+                                 # axis-remap this needed), aligned with points/colors.
 
 
 def _pose_bytes_to_c2w(tx: float, ty: float, tz: float,
@@ -227,19 +231,34 @@ class RtabmapPoseClient:
             offset += node_hdr_size
             xyz_bytes = point_count * 3 * 4
             rgb_bytes = point_count * 3
+            ground_bytes = point_count
             if point_count > 0:
                 points = np.frombuffer(reply[offset:offset + xyz_bytes], dtype=np.float32).reshape(-1, 3)
                 offset += xyz_bytes
                 colors = np.frombuffer(reply[offset:offset + rgb_bytes], dtype=np.uint8).reshape(-1, 3)
                 offset += rgb_bytes
+                # is_ground is a NEW wire field — an older, un-rebuilt server
+                # simply won't have sent these trailing bytes at all, so this
+                # degrades to "nothing classified as ground" (same
+                # backward-compat convention TrackedFrame.node_id/
+                # inlier_fraction already established) rather than raising.
+                if offset + ground_bytes <= len(reply):
+                    is_ground = np.frombuffer(
+                        reply[offset:offset + ground_bytes], dtype=np.uint8
+                    ).astype(bool)
+                    offset += ground_bytes
+                else:
+                    is_ground = np.zeros(point_count, dtype=bool)
             else:
                 points = np.zeros((0, 3), dtype=np.float32)
                 colors = np.zeros((0, 3), dtype=np.uint8)
+                is_ground = np.zeros(0, dtype=bool)
             nodes.append(ReconstructedNode(
                 node_id=node_id,
                 pose=_pose_bytes_to_c2w(tx, ty, tz, qx, qy, qz, qw),
                 points=points,
                 colors=colors,
+                is_ground=is_ground,
             ))
         return nodes
 

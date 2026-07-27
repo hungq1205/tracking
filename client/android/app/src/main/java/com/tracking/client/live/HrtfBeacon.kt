@@ -52,30 +52,121 @@ object HrtfBeacon {
     }
 
     /**
-     * Egocentric direction of a 2D-tracked object's box center, for tracking
-     * mode — where [HrtfBeacon.directionTo] needs a 3D pose + world target
-     * (guiding/walking, backed by MappingService's RTAB-Map pose), local ORB
-     * object tracking (TrackingBackend.kt) has no pose or depth at all, only
-     * a pixel box in the current frame. Approximates azimuth/elevation from
-     * the box center's pixel offset from frame center via the same pinhole
-     * FOV assumption server/tools/depth.py's `_estimate_K` uses
+     * Combines an authoritative server pose with the client's own local
+     * motion estimate — [rotationDeltaQuat] (x, y, z, w), RotationTracker's
+     * accumulatedRotation() — and [distanceM] (PdrStepEstimator's
+     * distanceSinceReset()) — into a best-current-estimate Pose, bridging
+     * the ~1Hz MappingService gap between server updates. See
+     * ToolDispatcher's mapping-stream collector and CLAUDE.md's
+     * "Server-planned walking path" note.
+     *
+     * Distance is walked along the NEW (rotation-updated) heading, not the
+     * stale authoritative one — over the short (~1s) bridge window this
+     * update spans, the difference is negligible, and using the current
+     * heading is the more correct choice of the two in principle.
+     */
+    fun extrapolate(authoritative: Tracking.Pose, rotationDeltaQuat: FloatArray, distanceM: Float): Tracking.Pose {
+        val newQuat = quatMultiply(
+            floatArrayOf(authoritative.qx, authoritative.qy, authoritative.qz, authoritative.qw),
+            rotationDeltaQuat,
+        )
+        val forward = rotate(newQuat[0], newQuat[1], newQuat[2], newQuat[3], 0f, 0f, 1f)
+        return Tracking.Pose.newBuilder()
+            .setX(authoritative.x + forward.first * distanceM)
+            .setY(authoritative.y)
+            .setZ(authoritative.z + forward.third * distanceM)
+            .setQx(newQuat[0]).setQy(newQuat[1]).setQz(newQuat[2]).setQw(newQuat[3])
+            .build()
+    }
+
+    /** Hamilton product a*b, both (x, y, z, w) unit quaternions — same
+     * formula as RotationTracker.kt's own internal copy (kept separate
+     * there since it's used for a different, self-contained composition;
+     * this one is exposed for ToolDispatcher's latency-compensation math,
+     * which needs the same op). */
+    fun quatMultiply(a: FloatArray, b: FloatArray): FloatArray {
+        val ax = a[0]; val ay = a[1]; val az = a[2]; val aw = a[3]
+        val bx = b[0]; val by = b[1]; val bz = b[2]; val bw = b[3]
+        return floatArrayOf(
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        )
+    }
+
+    /**
+     * Egocentric direction of one screen-space point relative to ANOTHER
+     * screen-space reference point (not necessarily frame center) — the
+     * general form [directionFromBox] is a special case of. Real fix,
+     * found from a direct user report: tracking mode's whole point is
+     * guiding the user's HAND to the target object, but the original
+     * [directionFromBox]-only design computed the object's position
+     * relative to the FRAME CENTER — i.e. "which way to turn/look to
+     * center the object," not "which way to move your hand toward it."
+     * Those are only the same thing if the hand happens to already be at
+     * the frame center, which isn't guaranteed at all. Callers guiding a
+     * hand toward an object should pass the HAND's own screen position as
+     * [refX]/[refY] instead of the frame center — see
+     * ToolDispatcher.updateTrackingPixie().
+     *
+     * Approximates azimuth/elevation from the pixel offset via the same
+     * pinhole FOV assumption server/tools/depth.py's `_estimate_K` uses
      * (fx=fy=0.8*max(w,h)) — not a real calibrated camera model, but
-     * consistent with the only other place this project guesses intrinsics.
+     * consistent with the only other place this project guesses
+     * intrinsics.
      *
      * [distanceM] is a fixed nominal value, not a real measurement — 2D-only
      * tracking has no depth, so there's nothing to compute it from. Chosen
      * so HrtfBeaconPlayer's distance-based gain sits mid-range (audible, not
      * maxed) rather than implying a false precision.
      */
-    fun directionFromBox(centerX: Float, centerY: Float, frameWidth: Int, frameHeight: Int): BeaconDirection {
+    fun directionBetweenPoints(targetX: Float, targetY: Float, refX: Float, refY: Float, frameWidth: Int, frameHeight: Int): BeaconDirection {
         val f = 0.8f * maxOf(frameWidth, frameHeight)
-        val dx = centerX - frameWidth / 2f
-        val dy = centerY - frameHeight / 2f
+        val dx = targetX - refX
+        val dy = targetY - refY
         return BeaconDirection(
             azimuthDeg = Math.toDegrees(atan2(dx.toDouble(), f.toDouble())).toFloat(),
             elevationDeg = Math.toDegrees(atan2(-dy.toDouble(), f.toDouble())).toFloat(),
             distanceM = 5f,
         )
+    }
+
+    /** Egocentric direction of a 2D-tracked object's box center relative to
+     * the FRAME CENTER — a special case of [directionBetweenPoints] (ref =
+     * frame center). NOT used by tracking mode's hand-guidance cue any
+     * more (see that function's own doc comment for why) — kept for any
+     * other caller that genuinely wants "where is this relative to where
+     * the camera is pointed," e.g. a future look-at-target cue. */
+    fun directionFromBox(centerX: Float, centerY: Float, frameWidth: Int, frameHeight: Int): BeaconDirection =
+        directionBetweenPoints(centerX, centerY, frameWidth / 2f, frameHeight / 2f, frameWidth, frameHeight)
+
+    /** World-space heading (degrees, 0 = camera-local +Z / no rotation,
+     * positive = turned right) of [pose] — rotates the camera-local forward
+     * vector (0, 0, 1) by its quaternion and reads atan2(x, z). Same
+     * convention as AngleTracker.kt's own headingDegOf() and
+     * mapping_servicer.py's _pose_heading_rad() (X-right/Y-down/Z-forward).
+     * Used by ToolDispatcher's mapping-stream collector to feed each
+     * accepted server fix into AngleTracker.setAuthoritativeHeadingDeg(). */
+    fun worldHeadingDeg(pose: Tracking.Pose): Float {
+        val forward = rotate(pose.qx, pose.qy, pose.qz, pose.qw, 0f, 0f, 1f)
+        return Math.toDegrees(atan2(forward.first.toDouble(), forward.third.toDouble())).toFloat()
+    }
+
+    /** World (x, z) of a point [distanceM] ahead of [pose] at egocentric
+     * [azimuthDeg] (0 = straight ahead, positive = right — same convention
+     * as [directionTo]'s own return value) — the exact inverse of
+     * [directionTo]: rotates a floor-plane direction vector by the pose's
+     * quaternion DIRECTLY (not the conjugate [directionTo] uses) and offsets
+     * by the pose's own position. Used by ToolDispatcher's sub-path dodge
+     * computation to turn one egocentric "go this way for this far" reading
+     * from the traversability fan into a real world waypoint. */
+    fun worldPointFrom(pose: Tracking.Pose, azimuthDeg: Float, distanceM: Float): Pair<Float, Float> {
+        val azRad = Math.toRadians(azimuthDeg.toDouble())
+        val localX = (kotlin.math.sin(azRad) * distanceM).toFloat()
+        val localZ = (kotlin.math.cos(azRad) * distanceM).toFloat()
+        val world = rotate(pose.qx, pose.qy, pose.qz, pose.qw, localX, 0f, localZ)
+        return (pose.x + world.first) to (pose.z + world.third)
     }
 
     private fun rotateByConjugate(

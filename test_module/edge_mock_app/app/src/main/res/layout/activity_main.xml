@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+<LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <!-- ── Mode 1: act AS the mock edge device (unchanged) — for testing
+         client/android's own EdgeZmqTestClient without real Pi hardware. ── -->
+
+    <TextView
+        android:id="@+id/title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Mode 1 — Act as mock edge device (stands in for the Pi Zero 2)"
+        android:textStyle="bold"
+        android:textSize="18sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Binds ports 5601 (mock mic audio), 5602 (mock camera frames), 5603 (receives audio to play). Point the tracking app's Edge ZMQ Test screen at this device's Wi-Fi IP."
+        android:textSize="13sp" />
+
+    <TextView
+        android:id="@+id/ipText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:textStyle="bold" />
+
+    <Button
+        android:id="@+id/startStopButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="Start mock edge server" />
+
+    <TextView
+        android:id="@+id/statsText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:fontFamily="monospace" />
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="24dp"
+        android:layout_marginBottom="8dp"
+        android:background="#888888" />
+
+    <!-- ── Mode 2: act AS client/android would — connect OUT to a REAL
+         edge device (already has mic/camera/speaker hardware) and run a
+         short concurrent load test on all 3 channels before that hardware
+         gets wired into the real, heavy tracking app. ── -->
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Mode 2 — Test a REAL edge device (acts as client/android would)"
+        android:textStyle="bold"
+        android:textSize="18sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Connects to a real edge device's bound ports 5601/5602/5603 as a client, same as client/android's EdgeZmqTestClient would. Runs mic_out + frame_out + audio_in concurrently for the given duration, validates data-type correctness (not a fixed fps/rate target — the real device's own camera/mic specs aren't assumed), and reports the results."
+        android:textSize="13sp" />
+
+    <EditText
+        android:id="@+id/edgeHostInput"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:hint="Edge device IP (e.g. 192.168.1.50)"
+        android:inputType="text" />
+
+    <EditText
+        android:id="@+id/durationInput"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:hint="Load test duration (seconds)"
+        android:inputType="numberDecimal"
+        android:text="4" />
+
+    <Button
+        android:id="@+id/loadTestButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="Start load test" />
+
+    <TextView
+        android:id="@+id/loadTestStatusText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:fontFamily="monospace" />
+
+</LinearLayout>
+</ScrollView>

@@ -39,7 +39,7 @@ frame's depth is fed to RTAB-Map sequentially (RTAB-Map's own tracking is
 inherently per-frame/chronological — only the depth estimation batches).
 
 Optionally (`frame_tagger`, see tagging.py), every accepted frame also gets
-RAM++ open-set tagging -> GroundingDINO-tiny detection, batched independently
+Gemini open-set tagging -> GroundingDINO-tiny detection, batched independently
 of the RTAB-Map/DA3 batching above (`tag_batch_size`) since tagging has no
 chronological dependency. GroundingDINO's boxes get drawn on the frame too
 (yellow, on top of the ORB keypoints), and both the raw tag list and
@@ -118,7 +118,7 @@ class NewFrame:
     pose_translation_px: float  # median inlier pixel displacement vs. best-matching accepted frame (0.0 if no match)
     image_rgb: np.ndarray    # HxW x3 uint8, ORB keypoints (green=new/red=old) + tag_detections boxes drawn on it
     sharpness: float = 0.0   # variance of Laplacian (blur metric); 0.0 if min_sharpness gating was disabled
-    tags: List[str] = field(default_factory=list)                    # RAM++ tags (empty if frame_tagger unset)
+    tags: List[str] = field(default_factory=list)                    # Gemini-proposed tags (empty if frame_tagger unset)
     tag_prompt: str = ""                                              # exact GroundingDINO text prompt built from `tags`
     tag_detections: List[TagDetection] = field(default_factory=list)  # GroundingDINO boxes prompted by `tags`
 
@@ -322,7 +322,7 @@ def _flush_rtabmap_batch(pending: list, estimator, client, timers: _Timers) -> L
 
 
 def _flush_tag_batch(pending: list, frame_tagger: FrameTagger, timers: _Timers) -> None:
-    """Runs RAM++ tagging + GroundingDINO detection as ONE batched call
+    """Runs Gemini tagging + GroundingDINO detection as ONE batched call
     across every already-built NewFrame in `pending` (a list of {"rgb",
     "frame_ref"} dicts), then mutates each NewFrame in place (tags,
     tag_detections, and image_rgb — the GroundingDINO boxes get drawn on
@@ -419,17 +419,17 @@ def extract_new_frames(
     periodic reports; a final report always prints at the end) to see which
     stage dominates for your video.
 
-    `frame_tagger`: an already-constructed `tagging.FrameTagger` (RAM++ open-set
-    tagging -> GroundingDINO-tiny detection, see tagging.py's module
+    `frame_tagger`: an already-constructed `tagging.FrameTagger` (Gemini
+    open-set tagging -> GroundingDINO-tiny detection, see tagging.py's module
     docstring), or None to skip tagging entirely. Passed in already-built
     rather than constructed from flat args here (unlike `estimator`/`client`
-    above) because loading it is expensive (~1-2min: a 3GB RAM++ checkpoint
-    + GroundingDINO tiny) — callers (e.g. app.py) should build one FrameTagger
-    once and reuse it across every extract_new_frames() call instead of
-    paying that cost per video. `tag_batch_size` batches accepted frames for
-    the (separate, more VRAM-hungry) RAM++/GroundingDINO forward passes —
-    independent of `da3_batch_size`/RTAB-Map's own batching, since tagging has
-    no chronological dependency and a different VRAM profile.
+    above) because loading GroundingDINO tiny still costs a few seconds —
+    callers (e.g. app.py) should build one FrameTagger once and reuse it
+    across every extract_new_frames() call instead of paying that cost per
+    video. `tag_batch_size` batches accepted frames for the Gemini call /
+    GroundingDINO forward pass — independent of `da3_batch_size`/RTAB-Map's
+    own batching, since tagging has no chronological dependency and a
+    different VRAM profile.
 
     `progress_cb(done, total)`, if given, is called after each sampled frame.
     """
