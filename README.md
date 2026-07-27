@@ -14,11 +14,12 @@ internals).
 
 ## Quick start
 
-One workflow: OCR server + Main server + RTAB-Map pose service + Android app
-(the only client this project ships — Android talks to Gemini Live
-directly). Mapping runs live, automatically, during guiding/walking mode —
-there's no separate offline scanning step any more. Everything needs
-`GEMINI_API_KEY` set. See [Workflows](#workflows) below for the step-by-step.
+One workflow: Main server + RTAB-Map pose service + Android app (the only
+client this project ships — Android talks to Gemini Live directly, and OCR
+is a direct call from the app to OCR.space, no local OCR server to run).
+Mapping runs live, automatically, during guiding/walking mode — there's no
+separate offline scanning step any more. Everything needs `GEMINI_API_KEY`
+set. See [Workflows](#workflows) below for the step-by-step.
 
 ---
 
@@ -29,7 +30,8 @@ there's no separate offline scanning step any more. Everything needs
 | Python 3.12 | Main server (`server/.venv`) |
 | Python 3.11 (via conda) | Scan server (`conda env hrtf`) — see [Development Environments](CLAUDE.md#development-environments) |
 | `GEMINI_API_KEY` | Gemini Live API — required by the Main server; Scan server's semantic mapper also uses it |
-| Docker + NVIDIA Container Toolkit | OCR server (GPU PaddleOCR image), and the optional RTAB-Map pose service |
+| An OCR.space API key | Free tier ("helloworld" test key works for light use) — entered in the Android app's Settings screen, no server to run |
+| Docker + NVIDIA Container Toolkit | The optional RTAB-Map pose service |
 | NVIDIA GPU | DA3 depth models (Main server, Scan server) — CPU fallback exists but is slow |
 | JDK 17 + Android SDK | Building the Android client |
 
@@ -57,10 +59,6 @@ pip install -r scan_server/requirements.txt
 pip install -e scan_server/Depth-Anything-3   # DA3 model package, editable install
 ```
 
-### `paddle_ocr_server` — usually run via Docker (see below) instead of a
-local env, since PaddlePaddle's GPU wheels are picky about CUDA/cuDNN
-versions; the Dockerfile pins a known-good base image.
-
 ---
 
 ## Environment variables
@@ -73,9 +71,9 @@ Required:
   **not** passed through automatically).
 
 Everything below is read by the Main server (`server/grpc_server.py`) — there
-is no separate Scan server process any more, and OCR is called directly from
-Android now (its URL is entered in the app's Settings screen, not an env var
-here). Full narrative in
+is no separate Scan server process any more, and OCR is a direct Android ->
+OCR.space call (the API key is entered in the app's Settings screen, not an
+env var here). Full narrative in
 [CLAUDE.md's Deployment section](CLAUDE.md#deployment).
 
 | Variable | Default | Used for |
@@ -91,25 +89,14 @@ here). Full narrative in
 
 ## Running the components
 
-### OCR server
+### OCR
 
-Called directly by Android for reading mode (not proxied through the Main server).
-
-```bash
-cd paddle_ocr_server
-uvicorn server:app --host 0.0.0.0 --port 8100
-```
-
-Pipeline-stage debug UI (received → preprocessed → raw text blocks →
-merged paragraphs → final text) at `http://<host>:8100/gui` — same process,
-no extra command.
-
-Or via Docker (recommended — pins the CUDA/cuDNN-matched PaddlePaddle base image):
-
-```bash
-docker build -t tracking-ocr paddle_ocr_server
-docker run --rm --gpus all -p 8100:8100 tracking-ocr
-```
+No server to run — Android calls [OCR.space](https://ocr.space/) (free
+hosted OCR) directly for reading mode. Enter your OCR.space API key in the
+app's Settings screen (the public `helloworld` test key works for light,
+rate-limited use). See `client/android/.../live/OcrClient.kt` and
+`TextBlockFilters.kt` for the rotation/noise/blur filtering applied to its
+response.
 
 ### Main server
 
@@ -156,7 +143,7 @@ cd client/android
 
 Installs to `app/build/outputs/apk/debug/`. It's the only client this
 project ships — on first launch, open Settings and enter your Gemini API
-key, the Main server's IP, and the OCR server's IP (all on your LAN).
+key, the Main server's IP, and your OCR.space API key.
 
 ---
 
@@ -166,11 +153,11 @@ Mapping is no longer a separate offline step — it runs live, automatically,
 whenever guiding/walking mode is on (see `CLAUDE.md`'s
 "Client-Orchestrated Live Session" section). There's just one workflow now:
 
-1. Start the [OCR server](#ocr-server), the [Main server](#main-server), and
-   the [RTAB-Map pose service](#rtab-map-pose-service-optional--a-more-robust-pose-source-for-scanning)
+1. Start the [Main server](#main-server) and the
+   [RTAB-Map pose service](#rtab-map-pose-service-required--the-only-pose-source-mappingservice-supports)
    (required — MappingService is RTAB-Map-only).
-2. Launch the Android app, enter your Gemini API key + the Main server's
-   address in Settings, connect.
+2. Launch the Android app, enter your Gemini API key + OCR.space API key +
+   the Main server's address in Settings, connect.
 3. Speak naturally — Gemini Live (running directly on the phone) handles
    intent routing: tracking, reading, navigating to a landmark, memory
    recall, device actions like calls/alarms/calendar. Say "guide me to

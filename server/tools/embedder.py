@@ -2,7 +2,7 @@ import cv2
 import torch
 from transformers import AutoImageProcessor, AutoModel
 
-_MODEL_ID = "facebook/dinov2-small"
+_MODEL_ID = "facebook/dinov2-large"
 
 
 class DINOv2Embedder:

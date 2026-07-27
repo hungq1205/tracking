@@ -221,39 +221,14 @@ def _overlay_zones(fig: go.Figure, zones) -> None:
             borderpad=3,
         )
 
-        # Landmark footprints — the actual 4 backprojected box corners
-        # (lm.footprint_corners), each independently rotated by that frame's
-        # camera pose, so this is a true parallelogram when the object was
-        # viewed at an angle, not an axis-aligned rectangle (footprint_min/max
-        # is just that quad's bounding envelope, used for clustering only —
-        # see semantic_mapper.py). Drawn as one Scatter trace with
-        # None-separated segments so every landmark's quad in this zone
-        # renders without needing a separate trace per landmark.
+        # Landmark centroid markers with text — footprint quad outlines
+        # (lm.footprint_corners) used to also be drawn here as a dotted box
+        # per landmark; removed per direct user feedback (cluttered the
+        # map). footprint_min/max/corners are still computed and kept on
+        # the Landmark dataclass — still used for clustering (see
+        # semantic_mapper.py) — just no longer rendered.
         landmarks = getattr(zone, "landmarks", [])
         if landmarks:
-            box_x: list = []
-            box_z: list = []
-            for lm in landmarks:
-                corners = getattr(lm, "footprint_corners", None)
-                if not corners:
-                    x0, z0 = lm.footprint_min
-                    x1, z1 = lm.footprint_max
-                    corners = [(x0, z0), (x1, z0), (x1, z1), (x0, z1)]
-                xs = [c[0] for c in corners] + [corners[0][0]]
-                zs = [c[1] for c in corners] + [corners[0][1]]
-                box_x.extend(xs + [None])
-                box_z.extend(zs + [None])
-            fig.add_trace(go.Scatter(
-                x=box_x, y=box_z,
-                mode="lines",
-                line=dict(color=color, width=1.5, dash="dot"),
-                name=label,
-                showlegend=False,
-                legendgroup=label,
-                hoverinfo="skip",
-            ))
-
-            # Landmark centroid markers with text
             fig.add_trace(go.Scatter(
                 x=[float(lm.x) for lm in landmarks],
                 y=[float(lm.z) for lm in landmarks],
@@ -287,7 +262,7 @@ class _CellState:
 
 
 class OccupancyMap:
-    OBSTACLE_MIN_H = 0.10       # metres above ground; below this → walkable
+    OBSTACLE_MIN_H = 0.20       # metres above ground; below this → walkable
     STEP_OVER_MAX_H = 0.40      # metres above ground; below this (and >= OBSTACLE_MIN_H)
                                 # → low, step-over-able obstacle (class 2); at/above this
                                 # (and < OBSTACLE_MAX_H) → normal obstacle (class 3). The
@@ -518,6 +493,7 @@ class OccupancyMap:
     def update(
         self, trajectory: np.ndarray, cloud_points: np.ndarray,
         confidence: float = 1.0,
+        point_is_ground: Optional[np.ndarray] = None,
     ) -> None:
         """
         Accumulate Bayesian occupancy evidence from a new batch of already-
@@ -550,6 +526,23 @@ class OccupancyMap:
                       applies in Bayesian mode (enable_bayesian) — non-
                       Bayesian mode's "single hit = permanent" design has no
                       incremental belief to scale.
+        point_is_ground: optional length-M bool, aligned with cloud_points —
+                      when given, RTAB-Map's OWN ground/obstacle segmentation
+                      (util3d::segmentObstaclesFromGround, see
+                      rtabmap_server.cc's segment_ground_flags()) decides
+                      ground-vs-obstacle for each point INSTEAD of this
+                      module's own height-vs-OBSTACLE_MIN_H heuristic. Height
+                      is still computed and still used for the OBSTACLE_MAX_H
+                      ceiling filter (RTAB-Map's segmentation has no "too
+                      high to matter" concept) and for the LOW_STEP_OVER vs.
+                      normal-OBSTACLE tiering downstream in _classify_state()
+                      — this only replaces the ground/not-ground BOUNDARY
+                      decision, not height tracking itself. None (default)
+                      keeps the original pure-height behavior — IMU+VO/VO
+                      pose sources have no such per-point flag to offer.
+                      Misaligned length falls back to height-only rather
+                      than raising or silently misapplying flags to the
+                      wrong points.
         """
         if len(trajectory):
             self._trajectory.extend((float(p[0]), float(p[1]), float(p[2])) for p in trajectory)
@@ -561,10 +554,18 @@ class OccupancyMap:
 
         pts = np.asarray(cloud_points, dtype=np.float64)
 
+        ground_flags = None
+        if point_is_ground is not None:
+            ground_flags = np.asarray(point_is_ground, dtype=bool)
+            if len(ground_flags) != len(pts):
+                ground_flags = None
+
         # Sub-sample for speed
         if len(pts) > self.MAX_CLOUD_SAMPLE:
             idx = np.random.choice(len(pts), self.MAX_CLOUD_SAMPLE, replace=False)
             pts = pts[idx]
+            if ground_flags is not None:
+                ground_flags = ground_flags[idx]
 
         # First-ever call: no ground estimate exists yet to classify points
         # against. Bootstrap one from this batch's own points alone so
@@ -583,7 +584,7 @@ class OccupancyMap:
         n_obstacle_pts = 0
         n_ground_pts = 0
         n_ceiling_pts = 0
-        for pt in pts:
+        for i, pt in enumerate(pts):
             ix = int(np.floor(float(pt[0]) / res))
             iz = int(np.floor(float(pt[2]) / res))
             y = float(pt[1])
@@ -592,7 +593,8 @@ class OccupancyMap:
                 n_ceiling_pts += 1
                 continue
             key = (ix, iz)
-            if height < self.OBSTACLE_MIN_H:
+            is_ground_pt = bool(ground_flags[i]) if ground_flags is not None else (height < self.OBSTACLE_MIN_H)
+            if is_ground_pt:
                 cell_ground_ys.setdefault(key, []).append(y)
                 n_ground_pts += 1
             else:
@@ -872,7 +874,21 @@ class OccupancyMap:
             if cls == self.CLASS_UNKNOWN:
                 continue  # not enough evidence, or ceiling — left as NaN
             if cls == self.CLASS_GROUND:
-                height_grid[row, col] = 0.0
+                # Real height (0..OBSTACLE_MIN_H), not flattened to a flat
+                # 0.0 for every ground cell regardless of its actual height
+                # — _classify_state() itself still reports a fixed 0.0 for
+                # GROUND (its own [0,1] normalized-obstacle-span contract is
+                # relied on elsewhere — path planning, the gRPC height_norm
+                # field — so left untouched), this display-only computation
+                # recovers the real per-cell height directly from the same
+                # height_ewma/ground_y the classification itself used. A
+                # cell classified GROUND via the free-logodds path (never
+                # actually height-measured) has no height_ewma — 0.0 for
+                # that case is the honest answer, not a missing one.
+                ground_height = (
+                    (gy - cell.height_ewma) if cell.height_ewma is not None else 0.0
+                )
+                height_grid[row, col] = max(0.0, min(ground_height, self.OBSTACLE_MIN_H))
             else:
                 # De-normalize _classify_state's (height-OBSTACLE_MIN_H)/
                 # (OBSTACLE_MAX_H-OBSTACLE_MIN_H) fraction back to real

@@ -1,42 +1,40 @@
 package com.tracking.client.ui
 
 import androidx.camera.view.PreviewView
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import android.util.Log
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.viewinterop.AndroidView
-import com.tracking.client.model.ConnectionState
-import com.tracking.client.model.ObjectTrack
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.PlayerConstants
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.YouTubePlayer
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.listeners.AbstractYouTubePlayerListener
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.options.IFramePlayerOptions
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.views.YouTubePlayerView
+
+private const val YT_TAG = "YouTubePlayerOverlay"
 
 @Composable
 fun MainScreen(
@@ -44,178 +42,156 @@ fun MainScreen(
     onOpenSettings: () -> Unit,
 ) {
     val uiState by viewModel.uiState.collectAsState()
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val snackbarHostState = remember { SnackbarHostState() }
+    val pendingYoutubeVideoId by viewModel.pendingYoutubeVideoId.collectAsState()
 
-    LaunchedEffect(uiState.error) {
-        uiState.error?.let {
-            snackbarHostState.showSnackbar(it)
-            viewModel.clearError()
-        }
+    // Frame capture runs continuously against LiveAssistantService's own
+    // lifecycle regardless (see CameraManager.bind()) — this only plugs/
+    // unplugs the on-screen preview surface while this screen is actually
+    // visible, per CLAUDE.md's "Client-Orchestrated Live Session" note on
+    // the Preview/ImageAnalysis binding split.
+    DisposableEffect(Unit) {
+        onDispose { viewModel.detachCameraPreview() }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-            // Camera preview
-            AndroidView(
-                factory = { ctx ->
-                    PreviewView(ctx).also { previewView ->
-                        viewModel.cameraManager.bind(lifecycleOwner, previewView)
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-
-            // Bounding box overlay — match PreviewView FIT_CENTER transform
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                val frameW = uiState.guidanceData.frameWidth.toFloat()
-                val frameH = uiState.guidanceData.frameHeight.toFloat()
-                if (frameW <= 0f || frameH <= 0f) return@Canvas
-                // FIT_CENTER: uniform scale so full frame fits, letterbox offsets
-                val scale = minOf(size.width / frameW, size.height / frameH)
-                val ox = (size.width - frameW * scale) / 2f
-                val oy = (size.height - frameH * scale) / 2f
-
-                val obj = uiState.guidanceData.objectBoxXyxy
-                if (obj.size == 4) {
-                    drawRect(
-                        color = Color.Green,
-                        topLeft = Offset(obj[0] * scale + ox, obj[1] * scale + oy),
-                        size = Size((obj[2] - obj[0]) * scale, (obj[3] - obj[1]) * scale),
-                        style = Stroke(width = 4f)
-                    )
+        // Camera preview
+        AndroidView(
+            factory = { ctx ->
+                PreviewView(ctx).also { previewView ->
+                    viewModel.attachCameraPreview(previewView)
                 }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
 
-                val hand = uiState.guidanceData.handBoxXyxy
-                if (hand.size == 4) {
-                    drawRect(
-                        color = Color.Blue,
-                        topLeft = Offset(hand[0] * scale + ox, hand[1] * scale + oy),
-                        size = Size((hand[2] - hand[0]) * scale, (hand[3] - hand[1]) * scale),
-                        style = Stroke(width = 3f)
-                    )
-                }
-
-                val kx = uiState.guidanceData.matchedKeypointsX
-                val ky = uiState.guidanceData.matchedKeypointsY
-                if (kx.size == ky.size && kx.isNotEmpty()) {
-                    for (i in kx.indices) {
-                        drawCircle(
-                            color = Color.Yellow,
-                            radius = 5f,
-                            center = Offset(kx[i] * scale + ox, ky[i] * scale + oy)
-                        )
-                    }
-                }
-
-                uiState.guidanceData.handLandmarksX.zip(uiState.guidanceData.handLandmarksY)
-                    .forEach { (lx, ly) ->
-                        lx.zip(ly).forEach { (x, y) ->
-                            drawCircle(
-                                color = Color.Cyan,
-                                radius = 4f,
-                                center = Offset(x * scale + ox, y * scale + oy)
-                            )
-                        }
-                    }
+        // Settings button — top-right
+        Row(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(end = 4.dp, top = 4.dp)
+        ) {
+            IconButton(onClick = onOpenSettings) {
+                Icon(Icons.Default.Settings, contentDescription = "Settings", tint = Color.White)
             }
-
-            // HUD — top-left
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(8.dp)
-            ) {
-                ConnectionChip(uiState.connectionState)
-                GuidanceHud(uiState.guidanceData, uiState.agentState, uiState.agentName)
-            }
-
-            // Guiding / walking banner — top-center
-            if (uiState.guidingDestination.isNotEmpty() || uiState.isWalkingMode) {
-                val bannerText = if (uiState.guidingDestination.isNotEmpty())
-                    "Navigating → ${uiState.guidingDestination}"
-                else
-                    "Walking — obstacle detection active"
-                Text(
-                    text = bannerText,
-                    color = Color(0xFFFFCC00),
-                    fontSize = 13.sp,
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 8.dp)
-                        .background(Color.Black.copy(alpha = 0.6f))
-                        .padding(horizontal = 12.dp, vertical = 4.dp)
-                        .fillMaxWidth(0.5f)
-                )
-            }
-
-            // Chat panel — right side
-            ChatPanel(
-                chatHistory = uiState.chatHistory,
-                micVolume = uiState.micVolume,
-                isRecording = uiState.isRecording,
-                agentState = uiState.agentState,
-                isTtsPlaying = uiState.isTtsPlaying,
-                onStartRecording = { viewModel.startPtt() },
-                onStopRecording = { viewModel.stopPtt() },
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .width(300.dp)
-                    .fillMaxHeight()
-            )
-
-            // Settings button — top-right (the old Scan button is gone;
-            // mapping now runs live during guiding mode, see CLAUDE.md's
-            // "Client-Orchestrated Live Session" section)
-            Row(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(end = 308.dp, top = 4.dp)
-            ) {
-                IconButton(onClick = onOpenSettings) {
-                    Icon(Icons.Default.Settings, contentDescription = "Settings", tint = Color.White)
-                }
-            }
-
-            SnackbarHost(
-                hostState = snackbarHostState,
-                modifier = Modifier.align(Alignment.BottomStart)
-            )
         }
+
+        // Embedded YouTube (IFrame) player — play_youtube_video tool.
+        // Always mounted (not conditionally composed on a pending video id)
+        // so it's ready instantly rather than being re-created per
+        // playback — deliberately the ONLY player surface for YouTube
+        // specifically (play_video's resolved-stream path stays headless
+        // via PlaybackService) — the official player requires being
+        // attached/rendering to play at all, a real ToS-driven limitation,
+        // not an oversight. See CLAUDE.md's YouTube playback note.
+        //
+        // Per direct user request: visually hidden (near-zero size + fully
+        // transparent) while audio keeps playing — the WebView stays
+        // attached and rendering (alpha/size don't pause a WebView's own
+        // media playback), it's just drawn with zero opacity into a 1.dp
+        // box, so nothing shows on screen. No on-screen close button any
+        // more, since there's nothing visible left to tap — dismiss via the
+        // voice `stop_music`/`stop_radio` tools instead, consistent with
+        // this app's voice-first design (dismissYoutubeVideo() is still
+        // reachable programmatically if a future affordance needs it).
+        YouTubePlayerOverlay(
+            videoId = pendingYoutubeVideoId,
+            isAwaitingResponse = uiState.isAwaitingResponse,
+            onPlaybackStateChanged = { isPlaying -> viewModel.reportYoutubePlaybackState(isPlaying) },
+            modifier = Modifier
+                .size(1.dp)
+                .alpha(0f)
+        )
+    }
 }
 
 @Composable
-private fun ConnectionChip(state: ConnectionState) {
-    val (label, color) = when (state) {
-        ConnectionState.CONNECTED -> "Connected" to Color(0xFF69F0AE)
-        ConnectionState.CONNECTING -> "Connecting..." to Color(0xFFFFCC00)
-        ConnectionState.ERROR -> "Error" to Color(0xFFFF5252)
-        ConnectionState.DISCONNECTED -> "Disconnected" to Color.Gray
-    }
-    AssistChip(
-        onClick = {},
-        label = { Text(label, fontSize = 11.sp) },
-        colors = AssistChipDefaults.assistChipColors(containerColor = color.copy(alpha = 0.2f)),
-        border = AssistChipDefaults.assistChipBorder(enabled = true, borderColor = color)
-    )
-}
+private fun YouTubePlayerOverlay(
+    videoId: String?,
+    isAwaitingResponse: Boolean,
+    onPlaybackStateChanged: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var player by remember { mutableStateOf<YouTubePlayer?>(null) }
+    // Backs the listener's log lines below with the LATEST videoId, not
+    // whichever value happened to be current when the AndroidView factory
+    // ran (factory only runs once per view instance, so a plain closure
+    // over the `videoId` parameter would otherwise always log the FIRST
+    // composition's value, not the one actually being played later).
+    val currentVideoId = rememberUpdatedState(videoId)
+    val currentOnPlaybackStateChanged = rememberUpdatedState(onPlaybackStateChanged)
 
-@Composable
-private fun GuidanceHud(data: ObjectTrack, agentState: String, agentName: String) {
-    if (agentState.isNotBlank()) {
-        Text("[$agentName] $agentState", color = Color(0xFFFFCC00), fontSize = 11.sp,
-            modifier = Modifier.background(Color.Black.copy(alpha = 0.5f)).padding(2.dp))
+    LaunchedEffect(videoId, player) {
+        if (videoId != null) player?.loadVideo(videoId, 0f) else player?.pause()
     }
-    if (data.status.isNotBlank()) {
-        Text(data.status, color = Color.White, fontSize = 11.sp,
-            modifier = Modifier.background(Color.Black.copy(alpha = 0.5f)).padding(2.dp))
+
+    // Ducking only once the user's utterance is fully registered and
+    // Gemini's response is about to arrive — NOT during capture itself
+    // (music/reading keep playing while the user is being recorded, per
+    // the user's explicit spec). This player's instance lives in Compose,
+    // not the Service, so it reacts to isAwaitingResponse directly here
+    // rather than through LiveAssistantService's PlaybackService-pause
+    // path. See CLAUDE.md's "Continuous VAD-gated listening" note.
+    LaunchedEffect(isAwaitingResponse, player) {
+        if (videoId == null) return@LaunchedEffect
+        if (isAwaitingResponse) player?.pause() else player?.play()
     }
-    if (data.instruction.isNotBlank()) {
-        Text(data.instruction, color = Color(0xFF00E5FF), fontSize = 12.sp,
-            modifier = Modifier.background(Color.Black.copy(alpha = 0.5f)).padding(2.dp))
-    }
-    if (data.confidence > 0f) {
-        Text("Conf: ${"%.2f".format(data.confidence)}", color = Color.White, fontSize = 10.sp,
-            modifier = Modifier.background(Color.Black.copy(alpha = 0.5f)).padding(2.dp))
+
+    Box(modifier = modifier) {
+        AndroidView(
+            factory = { ctx ->
+                YouTubePlayerView(ctx).also { view ->
+                    lifecycleOwner.lifecycle.addObserver(view)
+                    // Error 152-4 firing IMMEDIATELY on load (before any
+                    // playback attempt) is YouTube's anti-bot/referrer
+                    // verification rejecting a WebView with no valid
+                    // Referer/origin at all — automatic initialization (no
+                    // origin set) is the WORST case for this, not a safe
+                    // default. A prior attempt set origin to
+                    // "https://www.youtube.com" itself, which is wrong (origin
+                    // must identify the EMBEDDING app/page, not claim to BE
+                    // youtube.com) and plausibly made it worse. Correct value
+                    // per YouTube's own documented workaround for WebView/app
+                    // embeds: "https://www.youtube-nocookie.com".
+                    view.enableAutomaticInitialization = false
+                    view.initialize(
+                        object : AbstractYouTubePlayerListener() {
+                            override fun onReady(youTubePlayer: YouTubePlayer) {
+                                Log.d(YT_TAG, "onReady, pending videoId=${currentVideoId.value}")
+                                player = youTubePlayer
+                                currentVideoId.value?.let { youTubePlayer.loadVideo(it, 0f) }
+                            }
+                            override fun onStateChange(
+                                youTubePlayer: YouTubePlayer,
+                                state: PlayerConstants.PlayerState,
+                            ) {
+                                Log.d(YT_TAG, "onStateChange: $state (videoId=${currentVideoId.value})")
+                                // Real playing/not-playing signal for VAD
+                                // output-aware gating (LiveAssistantService's
+                                // isOutputActive) — must reflect ACTUAL
+                                // audio output, not just "a video is loaded,"
+                                // since a paused-but-loaded video was found to
+                                // keep the VAD's 3x threshold multiplier stuck
+                                // on indefinitely (see that field's doc).
+                                currentOnPlaybackStateChanged.value(state == PlayerConstants.PlayerState.PLAYING)
+                            }
+                            override fun onError(
+                                youTubePlayer: YouTubePlayer,
+                                error: PlayerConstants.PlayerError,
+                            ) {
+                                // This is the signal that was previously completely
+                                // silent — toolPlayYoutubeVideo() reports "playing"
+                                // to Gemini before the WebView even attempts to load,
+                                // so an invalid video id / embedding-disabled /
+                                // region-blocked video would fail with zero trace.
+                                Log.e(YT_TAG, "onError: $error (videoId=${currentVideoId.value})")
+                            }
+                        },
+                        IFramePlayerOptions.Builder().origin("https://www.youtube-nocookie.com").build(),
+                    )
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
-

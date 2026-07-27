@@ -28,7 +28,9 @@ import tracking.Tracking
 class TrackingBackend(
     private val grpcManager: GrpcClientManager,
     private val nfeatures: Int = 800,
-    private val renewalIntervalMs: Long = 1000L,
+    // Periodic re-identify (renewal()) cadence — requested directly by the
+    // user as 4s (was 1s).
+    private val renewalIntervalMs: Long = 4000L,
 ) {
 
     private val orb: ORB by lazy {
@@ -58,6 +60,15 @@ class TrackingBackend(
 
     private var refEmbedding: FloatArray? = null
 
+    // Latest hand box seen by update() — renewal() runs async (a full
+    // gRPC round trip) and has no per-call hand box of its own, so it
+    // reads this (continuously refreshed by update(), which runs every
+    // frame) right before committing a reference swap. See renewal()'s
+    // own doc comment for why this matters: the hand can start overlapping
+    // the target WHILE a renewal that was scheduled just before that is
+    // still in flight.
+    @Volatile private var lastHandBoxXyxy: List<Float> = emptyList()
+
     /**
      * One-shot init: detect object on server then extract ORB reference.
      * Must be called from a dedicated coroutine (not the frame loop) — it blocks on gRPC.
@@ -82,8 +93,16 @@ class TrackingBackend(
             return@withContext null
         }
         Log.d(TAG, "detectObject: score=${detection.score} box=${detection.boxXyxyList}")
-        if (detection.score <= 0f || detection.boxXyxyCount != 4) {
-            Log.w(TAG, "initialize: no detection (score=${detection.score})")
+        // Requested directly by the user after a real low-confidence false
+        // positive (score=0.383 on a real device) got accepted as the
+        // tracking target outright — this used to only reject a literal
+        // zero score. INIT_CONFIDENCE_MIN is deliberately stricter than
+        // update()'s/renewal's own thresholds (10 matches / 0.2 score),
+        // which stay lenient on purpose to avoid losing an ALREADY-
+        // confirmed target over one weak frame — this is the one-time
+        // "is this even the right object" gate.
+        if (detection.score < INIT_CONFIDENCE_MIN || detection.boxXyxyCount != 4) {
+            Log.w(TAG, "initialize: no confident detection (score=${detection.score}, need >= $INIT_CONFIDENCE_MIN)")
             return@withContext null
         }
 
@@ -135,9 +154,21 @@ class TrackingBackend(
     /**
      * Per-frame update — pure local ORB + homography, no network calls, runs every frame.
      * Renewal is triggered asynchronously in the background when the interval elapses.
+     *
+     * [handBoxXyxy] (optional, from MediaPipe hand detection — see
+     * LiveAssistantService's frame collector), when it overlaps the
+     * current tracking box, SKIPS this cycle's renewal — requested
+     * directly by the user: a hand reaching for/holding the object
+     * typically occludes it, so a re-identify DetectObject call right then
+     * is likely to see a poor/wrong view of the target (or the hand
+     * itself), wasting a server round trip on a request unlikely to help.
+     * `lastRenewalMs` is deliberately NOT advanced when skipped this way,
+     * so renewal fires as soon as the hand moves off the target and the
+     * interval has elapsed, rather than waiting a full extra interval.
      */
-    suspend fun update(frameJpeg: ByteArray): ObjectTrack? = withContext(Dispatchers.IO) {
+    suspend fun update(frameJpeg: ByteArray, handBoxXyxy: List<Float> = emptyList()): ObjectTrack? = withContext(Dispatchers.IO) {
         if (!active) return@withContext null
+        lastHandBoxXyxy = handBoxXyxy
 
         // Take a snapshot of reference state under lock so renewal can update concurrently
         val (localDesc, localKp, localCenter, localW, localH) = synchronized(this@TrackingBackend) {
@@ -206,7 +237,7 @@ class TrackingBackend(
         )
         lastBox = box
 
-        if (System.currentTimeMillis() - lastRenewalMs > renewalIntervalMs) {
+        if (System.currentTimeMillis() - lastRenewalMs > renewalIntervalMs && !boxesOverlap(box, handBoxXyxy)) {
             lastRenewalMs = System.currentTimeMillis()
             GlobalScope.launch(Dispatchers.IO) { renewal(frameJpeg) }
         }
@@ -231,6 +262,23 @@ class TrackingBackend(
         val desc: Mat, val kp: MatOfKeyPoint, val center: Mat, val initW: Float, val initH: Float
     )
 
+    /**
+     * Re-identify, running async on its own gRPC round trip — REFRESHES the
+     * reference for the object we're ALREADY tracking, never re-searches
+     * the whole frame and latches onto a different instance. Two guards
+     * against a real reported bug (the reference silently swapping to a
+     * completely different, visually-similar object the moment a hand
+     * reached for/covered the real target): (1) [spatiallyConsistent]
+     * rejects a detection that doesn't overlap where we already think the
+     * object is — a genuine re-identify of the SAME physical object should
+     * never jump to an unrelated part of the frame, regardless of how the
+     * open-vocab prompt/embedding-similarity checks scored it; (2) a
+     * SECOND hand-overlap check, against [lastHandBoxXyxy] (the MOST
+     * RECENT hand box, refreshed every update() call — not the one at the
+     * moment this renewal was scheduled), right before committing — closes
+     * the race where the hand starts covering the target WHILE a renewal
+     * scheduled just before that is still in flight.
+     */
     private suspend fun renewal(frameJpeg: ByteArray) {
         if (!active || prompt.isBlank()) return
         val stub = grpcManager.trackingStub ?: return
@@ -246,7 +294,13 @@ class TrackingBackend(
         }
         if (detection.score < 0.2f || detection.boxXyxyCount != 4) return
 
-        val currentEmbedding = getEmbedding(detection.boxXyxyList.toFloatArray(), frameJpeg) ?: return
+        val rawBox = detection.boxXyxyList.toFloatArray()
+        if (!boxesOverlap(lastBox, rawBox.toList())) {
+            Log.w(TAG, "renewal: rejected, detection box ${rawBox.toList()} doesn't overlap current position ${lastBox.toList()}")
+            return
+        }
+
+        val currentEmbedding = getEmbedding(rawBox, frameJpeg) ?: return
         val previous = refEmbedding ?: return
         if (!isSimilar(previous, currentEmbedding)) return
 
@@ -255,9 +309,13 @@ class TrackingBackend(
         orb.detectAndCompute(gray, Mat(), kp, desc)
         if (desc.empty()) return
 
-        val box = clampBox(detection.boxXyxyList.toFloatArray(), gray.width(), gray.height())
+        val box = clampBox(rawBox, gray.width(), gray.height())
         val cx = (box[0] + box[2]) / 2f
         val cy = (box[1] + box[3]) / 2f
+        if (boxesOverlap(box, lastHandBoxXyxy)) {
+            Log.w(TAG, "renewal: rejected, hand now overlaps the target (race with an in-flight renewal)")
+            return
+        }
         synchronized(this) {
             refKeypoints = MatOfKeyPoint(*kp.toArray())
             refDescriptors = desc.clone()
@@ -323,7 +381,19 @@ class TrackingBackend(
         box[2].coerceAtMost(width.toFloat()), box[3].coerceAtMost(height.toFloat()),
     )
 
+    /** Plain AABB overlap test — any portion of [b] intersecting [a] counts
+     * (not a minimum-overlap-fraction threshold). See update()'s own doc
+     * comment for why this gates renewal. */
+    private fun boxesOverlap(a: FloatArray, b: List<Float>): Boolean {
+        if (b.size != 4) return false
+        return a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1]
+    }
+
     companion object {
         private const val TAG = "TrackingBackend"
+        // initialize()'s one-time DetectObject acceptance threshold — see
+        // that function's own comment for why this is stricter than
+        // update()'s/renewal's ongoing thresholds.
+        private const val INIT_CONFIDENCE_MIN = 0.45f
     }
 }

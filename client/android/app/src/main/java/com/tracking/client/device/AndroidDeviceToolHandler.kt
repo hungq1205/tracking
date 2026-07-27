@@ -9,6 +9,9 @@ import android.os.Build
 import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.ContactsContract
+import android.provider.Telephony
+import android.telecom.TelecomManager
+import android.telephony.SmsManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
@@ -16,7 +19,10 @@ import java.util.Calendar
 
 class AndroidDeviceToolHandler(private val context: Context) : DeviceToolHandler {
 
-    override val capabilities = listOf("make_phone_call", "set_alarm", "create_calendar_event", "search_contacts", "play_video", "stop_music")
+    override val capabilities = listOf(
+        "make_phone_call", "set_alarm", "create_calendar_event", "search_contacts", "play_video", "stop_music",
+        "answer_phone_call", "send_sms", "check_unread_sms",
+    )
 
     override suspend fun execute(toolCall: DeviceToolCall): String {
         val args = try { JSONObject(toolCall.argsJson) } catch (e: Exception) { JSONObject() }
@@ -29,12 +35,84 @@ class AndroidDeviceToolHandler(private val context: Context) : DeviceToolHandler
                 "search_contacts"       -> searchContacts(args)
                 "play_video"            -> playVideo(args)
                 "stop_music"            -> stopMusic()
+                "answer_phone_call"     -> answerPhoneCall()
+                "send_sms"              -> sendSms(args)
+                "check_unread_sms"      -> checkUnreadSms()
                 else -> """{"error":"Unknown device tool: ${toolCall.name}"}"""
             }
         } catch (e: Exception) {
             Log.e(TAG, "Device tool ${toolCall.name} failed", e)
             """{"error":"${e.message?.replace("\"", "'")}"}"""
         }
+    }
+
+    private fun answerPhoneCall(): String {
+        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.ANSWER_PHONE_CALLS)
+                != PackageManager.PERMISSION_GRANTED) {
+            return """{"error":"Answer-call permission not granted. Ask the user to allow it in app settings."}"""
+        }
+        val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+            ?: return """{"error":"TelecomManager unavailable on this device"}"""
+        return try {
+            @Suppress("DEPRECATION")
+            telecomManager.acceptRingingCall()
+            """{"status":"answered"}"""
+        } catch (e: SecurityException) {
+            """{"error":"Not permitted to answer calls (may require default dialer role on this device): ${e.message?.replace("\"", "'")}"}"""
+        }
+    }
+
+    private fun sendSms(args: JSONObject): String {
+        val recipient = args.optString("recipient", "")
+        val message = args.optString("message", "")
+        if (recipient.isBlank()) return """{"error":"No recipient provided"}"""
+        if (message.isBlank()) return """{"error":"No message text provided"}"""
+        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.SEND_SMS)
+                != PackageManager.PERMISSION_GRANTED) {
+            return """{"error":"SMS permission not granted. Ask the user to allow it in app settings."}"""
+        }
+        // Same name→number resolution convention as makePhoneCall.
+        val number = if (recipient.matches(Regex("[+\\d\\s\\-().]+"))) {
+            recipient
+        } else {
+            lookupContactNumber(recipient)
+                ?: return """{"error":"Contact '${recipient.replace("\"", "'")}' not found in contacts"}"""
+        }
+        return try {
+            @Suppress("DEPRECATION")
+            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                context.getSystemService(SmsManager::class.java)
+            else
+                SmsManager.getDefault()
+            smsManager.sendTextMessage(number, null, message, null, null)
+            """{"status":"sent","recipient":"$number"}"""
+        } catch (e: Exception) {
+            """{"error":"Failed to send SMS: ${e.message?.replace("\"", "'")}"}"""
+        }
+    }
+
+    private fun checkUnreadSms(): String {
+        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_SMS)
+                != PackageManager.PERMISSION_GRANTED) {
+            return """{"error":"SMS read permission not granted. Ask the user to allow it in app settings."}"""
+        }
+        val cursor = context.contentResolver.query(
+            Telephony.Sms.Inbox.CONTENT_URI,
+            arrayOf(Telephony.Sms.Inbox.ADDRESS, Telephony.Sms.Inbox.BODY, Telephony.Sms.Inbox.DATE),
+            "${Telephony.Sms.Inbox.READ} = 0",
+            null,
+            "${Telephony.Sms.Inbox.DATE} DESC",
+        )
+        val messages = mutableListOf<String>()
+        cursor?.use {
+            while (it.moveToNext() && messages.size < 20) {
+                val sender = (it.getString(0) ?: "unknown").replace("\"", "'")
+                val body = (it.getString(1) ?: "").replace("\"", "'").replace("\n", " ")
+                val timestamp = it.getLong(2)
+                messages.add("""{"sender":"$sender","body":"$body","timestamp":$timestamp}""")
+            }
+        }
+        return """{"messages":[${messages.joinToString(",")}],"count":${messages.size}}"""
     }
 
     private fun makePhoneCall(args: JSONObject): String {

@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.PixieHrtfTest" parent="Theme.MaterialComponents.DayNight.NoActionBar" />
+</resources>

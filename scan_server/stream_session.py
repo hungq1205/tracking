@@ -71,6 +71,7 @@ class StreamingScanSession:
         imu_stationary_s: float = 1.0,
         occupancy_voxel_size: float = DEFAULT_VOXEL_SIZE,
         walking_lite: bool = False,
+        pure_walking: bool = False,
     ) -> None:
         self.session: ScanSession = scan_manager.get_or_create(location_id, zone_type=zone_type)
         # ScanSessionManager.get_or_create() returns the SAME ScanSession
@@ -82,7 +83,19 @@ class StreamingScanSession:
         # frames it was never fed. A live camera source has no such leftover
         # state, so every new StreamingScanSession starts from a genuinely
         # empty reconstruction, same as the real thing would.
-        self.session.reset_cloud()
+        #
+        # WALKING/GUIDING are the deliberate exception: toolStopScan() (or a
+        # user going straight to guiding) immediately opens a fresh WALKING/
+        # GUIDING stream for the same location_id right after a SCAN
+        # finishes, and the user explicitly wants that transition to keep
+        # RTAB-Map's pose graph/occupancy grid/landmarks intact instead of
+        # throwing away the scan's own reconstruction the instant walking or
+        # guiding starts — a WALKING/GUIDING stream reopen (mode switch,
+        # brief disconnect, etc.) continues on top of whatever this
+        # location_id already has. SCAN itself still always resets (a fresh
+        # scan should never silently resume on top of stale reconstruction).
+        if not walking_lite:
+            self.session.reset_cloud()
         self._use_imu, self._use_rtabmap = resolve_pose_flags(
             pose_src,
             rtabmap_available=getattr(scan_manager, "rtabmap_pose_available", False),
@@ -105,6 +118,11 @@ class StreamingScanSession:
         # back-projection feeds the occupancy map instead. Intended for
         # walking/guiding, not scanning — see mapping_servicer.py.
         self._walking_lite = walking_lite
+        # See ScanSession.process_frames_batch's pure_walking docstring —
+        # SessionMode.WALKING specifically (not GUIDING): skips the
+        # Bayesian occupancy grid entirely and enables the consecutive-
+        # tracking-loss reset check.
+        self._pure_walking = pure_walking
 
         self._imu: Optional[IncrementalImuIntegrator] = None
         self._frame_buffer: List[tuple] = []  # (rgb, ts_ns)
@@ -167,6 +185,7 @@ class StreamingScanSession:
             sor_std_ratio=self._sor_std_ratio,
             occupancy_voxel_size=self._occupancy_voxel_size,
             walking_lite=self._walking_lite,
+            pure_walking=self._pure_walking,
         )
         if self._zone_active and len(self.session.last_trajectory) > 0:
             self._zone_positions.extend(self.session.last_trajectory.tolist())

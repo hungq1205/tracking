@@ -72,10 +72,14 @@ enum AnalysisOp {
   DETECT = 0;         // GroundingDINO open-vocab detection (requires prompt)
   EMBED = 1;           // DINOv2 re-ID embedding (requires box_xyxy)
   DEPTH = 2;           // obstacle/depth estimate (SparseObstacleDetector/StereoDepthDetector/DA3)
-  TRAVERSABILITY = 3;  // per-angle obstacle clearance fan — see TraversabilityInfo. The local,
-                       // per-frame, no-world-map obstacle-dodge signal walking/guiding's HRTF
-                       // beacon is now driven from (replaced the old occupancy-grid ray-cast
-                       // steering — see CLAUDE.md's "Local reactive HRTF obstacle-dodge" note).
+  TRAVERSABILITY = 3;  // per-angle obstacle clearance fan — see TraversabilityInfo. Still used
+                       // by GUIDING's local dodge layer (unchanged) — see CLAUDE.md's "Local
+                       // reactive HRTF obstacle-dodge" note.
+  CORRIDOR = 4;        // UNUSED — was WALKING's world-anchored-corridor-lock beacon signal,
+                       // superseded by a client-side LocalPathPlanner route through a live
+                       // occupancy grid (see CLAUDE.md's walking-mode local-map note). Left
+                       // in place (server no longer handles it) rather than removed/renumbered
+                       // — no wire-compat benefit to reclaiming the value.
 }
 
 message AnalyzeFrameRequest {
@@ -90,6 +94,7 @@ message AnalyzeFrameResponse {
   repeated float embedding = 2;           // present if EMBED was requested
   ObstacleInfo obstacle = 3;              // present if DEPTH was requested
   TraversabilityInfo traversability = 4;  // present if TRAVERSABILITY was requested
+  CorridorInfo corridor = 5;              // present if CORRIDOR was requested
 }
 
 message Detection {
@@ -119,6 +124,24 @@ message TraversabilityInfo {
   float max_angle_deg = 3;
   float angle_step_deg = 4;
   float max_range_m = 5;
+  // Nearest BELOW-ground-plane (drop-off/step-down/stairs) distance per
+  // bin, same shape/semantics as clearance_m — a bin with no drop-off
+  // within max_range_m reads max_range_m itself. Distinct from
+  // clearance_m, which only tracks points ABOVE the ground plane
+  // (obstacles) — a downward step registers as neither an obstacle nor
+  // ground under the old obstacle-only classification, which let a
+  // staircase going down misread as a wide-open corridor. See
+  // server/tools/traversability.py's _clearance_fan_from_depth() and
+  // CLAUDE.md's hazard-warning note.
+  repeated float dropoff_m = 6;
+}
+
+// UNUSED — see AnalysisOp.CORRIDOR's own comment. Left in place, not removed.
+message CorridorInfo {
+  bool found = 1;
+  float azimuth_deg = 2;
+  float distance_m = 3;
+  float width_m = 4;
 }
 
 message SynthesizeRequest {
@@ -187,6 +210,17 @@ message MappingChunk {
   SessionMode session_mode = 7;              // only meaningful on the first chunk of a stream —
                                               // see StreamingScanSession(walking_lite=...) /
                                               // ScanSession.process_frames_batch's walking_lite note
+  // GUIDING only — set once ToolDispatcher.recomputeRoute() has resolved
+  // guidingDestinationLabel via FindLandmark; left false for WALKING, which
+  // has no destination (the server infers "keep walking forward" from its
+  // own RTAB-Map pose's heading + session_mode instead — see
+  // find_farthest_open_path() in live_path_planner.py). Server-side path
+  // planning needs a goal it has no other way to learn (see CLAUDE.md's
+  // "Server-planned walking path" note) — FindLandmark itself is unchanged,
+  // this just carries its result back to the server for planning purposes.
+  bool has_goal = 8;
+  float goal_x = 9;
+  float goal_z = 10;
 }
 
 // SCAN: full pipeline (RTAB-Map get_cloud/SOR reconstruction + VLM/semantic
@@ -235,6 +269,24 @@ message Landmark {
   float confidence = 4;
 }
 
+message PathPoint {
+  float x = 1;
+  float z = 2;
+}
+
+// A server-planned walking route, computed against the live occupancy grid
+// (server-side only now — see CLAUDE.md's "Server-planned walking path"
+// note) via scan_server/live_path_planner.py's LiveGridPathPlanner. Android
+// no longer runs its own A* — it steers the HRTF beacon toward a
+// look-ahead point that walks along `points`, bridging the gap between
+// updates with its own rotation/PDR estimate (see ToolDispatcher.kt).
+message PlannedPath {
+  repeated PathPoint points = 1;  // world (x, z); empty == no walkable path found (dead end)
+  bool confirmed = 2;             // false if the route crossed any CLASS_UNKNOWN cell
+  bool reached_exactly = 3;       // false == GUIDING's closest-approach fallback, or
+                                   // WALKING's farthest-open-direction pick (never an exact goal)
+}
+
 // One changed occupancy cell, addressed by GLOBAL grid index (ix, iz) — NOT
 // relative to any particular window/row/col — so indices stay valid across
 // deltas even as the map's overall bounding box grows between full resyncs.
@@ -269,6 +321,26 @@ message MappingUpdate {
   bool full_resync = 7;            // true the first time a location streams this session, or
                                     // whenever the map's bounding box itself grew — client must
                                     // replace its whole local grid from `grid`, not patch it
+  // True on the one update where a pure-walking (SessionMode.WALKING)
+  // session's consecutive-RTAB-Map-tracking-loss streak crossed the
+  // "completely lost, no sign of recovery" threshold and the session was
+  // reset (RTAB-Map + pose state cleared, same as a fresh stream). Only
+  // ever set for WALKING — GUIDING/SCAN leave this false. The client must
+  // drop any corridor lock computed against the now-discarded pose history
+  // — see CLAUDE.md's walking-mode corridor-lock note.
+  bool reset_occurred = 8;
+  // Echoes MappingChunk.frame_timestamp_ns for whichever chunk this update
+  // was computed from — the client's latency-compensation buffer (see
+  // ToolDispatcher.kt / CLAUDE.md's "Server-planned walking path" note)
+  // looks up its own locally-estimated pose AT that send time, so it can
+  // fast-forward this (already slightly stale, by network + RTAB-Map/DA3
+  // processing latency) `pose` by however much local motion it estimates
+  // happened since then.
+  int64 frame_timestamp_ns = 9;
+  // Server-planned route for this update's pose — see PlannedPath's own
+  // docstring. Replaces the old design where Android streamed the
+  // occupancy grid (`grid`/`grid_delta` above) and ran its own A* locally.
+  PlannedPath planned_path = 10;
 }
 
 message GetMapSnapshotRequest {
@@ -311,6 +383,14 @@ service StatusService {
   // TraversabilityInfo fan alone. Called once per avoidance tick while
   // walking/guiding is active.
   rpc ReportBeaconDirection (ReportBeaconDirectionRequest) returns (ReportBeaconDirectionResponse);
+  // Called once, right after a fresh connection is established (see
+  // MainViewModel.connect()) — the server otherwise has no way to
+  // distinguish "a genuinely new client session is starting" from "this
+  // same client is still going, just calling another RPC." Clears every
+  // accumulated server-side scan/mapping session (all location_ids) and
+  // resets the shared RTAB-Map docker session, so a new connection never
+  // silently resumes a stale map/pose left over from a previous one.
+  rpc ResetSession (ResetSessionRequest) returns (ResetSessionResponse);
 }
 
 message ReportModeRequest {
@@ -326,3 +406,6 @@ message ReportBeaconDirectionRequest {
 }
 
 message ReportBeaconDirectionResponse {}
+
+message ResetSessionRequest {}
+message ResetSessionResponse {}

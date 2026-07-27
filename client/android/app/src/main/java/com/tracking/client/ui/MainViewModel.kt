@@ -1,402 +1,143 @@
 package com.tracking.client.ui
 
 import android.app.Application
+import android.content.ComponentName
 import android.content.Context
-import android.graphics.BitmapFactory
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.IBinder
+import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.tracking.client.audio.HrtfBeaconPlayer
-import com.tracking.client.audio.PushToTalkRecorder
-import com.tracking.client.audio.StreamingAudioPlayer
 import com.tracking.client.camera.CameraManager
-import com.tracking.client.device.AndroidDeviceToolHandler
-import com.tracking.client.device.DeviceToolHandler
-import com.tracking.client.edge.LocalEdgeDevice
-import com.tracking.client.grpc.GrpcClientManager
-import com.tracking.client.live.GeminiLiveClient
-import com.tracking.client.live.LiveServerEvent
-import com.tracking.client.live.LiveSessionState
-import com.tracking.client.live.LocalMemoryStore
-import com.tracking.client.live.OcrClient
-import com.tracking.client.live.ToolDeclarations
-import com.tracking.client.live.ToolDispatcher
+import com.tracking.client.live.LiveAssistantService
 import com.tracking.client.model.AppUiState
-import com.tracking.client.model.ChatMessage
-import com.tracking.client.model.ConnectionState
-import com.tracking.client.model.ObjectTrack
-import com.tracking.client.tracking.HandTracker
-import com.tracking.client.tracking.TrackingBackend
-import android.util.Log
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.conflate
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.stateIn
 
+/**
+ * Thin bound-client facade over [LiveAssistantService], which now owns the
+ * entire Gemini Live session graph (gRPC, camera, mic, tool dispatch) — see
+ * CLAUDE.md's "Client-Orchestrated Live Session" section. This class used to
+ * own that graph directly inside viewModelScope, which meant the whole
+ * session died whenever the Activity/ViewModelStore was torn down (screen
+ * off, app swiped from Recents). It now just binds to the Service (started
+ * as a foreground service so it survives independently of this binding) and
+ * delegates every call, re-exposing the Service's own StateFlow as its own.
+ */
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val prefs = app.getSharedPreferences("tracking_prefs", Context.MODE_PRIVATE)
+    private val _boundService = MutableStateFlow<LiveAssistantService?>(null)
 
-    val grpcManager = GrpcClientManager()
-    val cameraManager = CameraManager(app)
-    private val ptt = PushToTalkRecorder()
-    private val streamingPlayer = StreamingAudioPlayer()
-    private val hrtfBeacon = HrtfBeaconPlayer(app)
-    private val trackingBackend by lazy { TrackingBackend(grpcManager) }
-    private val handTracker by lazy { HandTracker(getApplication()) }
-    private val deviceToolHandler: DeviceToolHandler = AndroidDeviceToolHandler(app)
-    private val memoryStore by lazy { LocalMemoryStore(app) }
-    private val sessionState = LiveSessionState()
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val service = (binder as? LiveAssistantService.LocalBinder)?.getService()
+            _boundService.value = service
+            pendingPreviewView?.let { service?.cameraManager?.attachPreviewSurface(it) }
+        }
 
-    val edgeDevice: LocalEdgeDevice = LocalEdgeDevice(cameraManager)
+        override fun onServiceDisconnected(name: ComponentName?) {
+            _boundService.value = null
+        }
+    }
 
-    private val _uiState = MutableStateFlow(AppUiState())
-    val uiState: StateFlow<AppUiState> = _uiState
+    // Remembered in case a PreviewView attaches before the Service binding
+    // completes — see the same race/fallback in CameraManager's own
+    // pendingPreviewView.
+    private var pendingPreviewView: PreviewView? = null
 
-    private var isLocalTrackingActive = false
-    private var localTrackingPrompt = ""
-    private var lastTrackingUpdateMs = 0L
-    private val trackingIntervalMs = 143L // cap local ORB tracking at ~7 fps
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val uiState: StateFlow<AppUiState> = _boundService
+        .flatMapLatest { service -> service?.uiState ?: flowOf(AppUiState()) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, AppUiState())
 
-    // Hand-guidance [SYSTEM] tick while tracking (mirrors the old server's
-    // tracking_guidance_active/tracking_last_guidance_at — now client-side
-    // since Gemini Live runs here) — fires once both target+hand are visible,
-    // then every 5s while both remain visible.
-    private var trackingGuidanceLastAtMs = 0L
-    private val trackingGuidanceIntervalMs = 5000L
+    /** Non-null video id means the UI should show/update the embedded
+     * YouTube IFrame player — see LiveAssistantService's own field doc and
+     * CLAUDE.md's YouTube playback note. */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val pendingYoutubeVideoId: StateFlow<String?> = _boundService
+        .flatMapLatest { service -> service?.pendingYoutubeVideoId ?: flowOf(null) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    private var localProcessingJob: Job? = null
-    private var initJob: Job? = null
-    private var liveSessionJob: Job? = null
-    private var liveClient: GeminiLiveClient? = null
-    private var toolDispatcher: ToolDispatcher? = null
+    /** Manual on-screen dismissal of the embedded YouTube player (distinct
+     * from the voice-driven `stop_music` tool, which also stops PlaybackService). */
+    fun dismissYoutubeVideo() { _boundService.value?.dismissYoutubeVideo() }
+
+    /** Reports the IFrame player's actual PLAYING/paused state up to the
+     * Service — see LiveAssistantService's own field doc (isOutputActive's
+     * VAD-gating signal) for why this must be the REAL playing state, not
+     * merely whether a video is loaded. */
+    fun reportYoutubePlaybackState(isPlaying: Boolean) {
+        _boundService.value?.reportYoutubePlaybackState(isPlaying)
+    }
+
+    /** Exposed only for [attachCameraPreview]'s reuse of CameraManager's own
+     * pending-attach fallback — not read directly by the UI layer any more. */
+    private val cameraManager: CameraManager?
+        get() = _boundService.value?.cameraManager
 
     init {
-        viewModelScope.launch {
-            grpcManager.connectionState.collect { state ->
-                _uiState.update { it.copy(connectionState = state) }
-            }
-        }
-        viewModelScope.launch {
-            streamingPlayer.isPlaying.collect { playing ->
-                _uiState.update { it.copy(isTtsPlaying = playing) }
-            }
-        }
-        ptt.onVolumeChange = { rms -> _uiState.update { it.copy(micVolume = rms) } }
+        val intent = Intent(app, LiveAssistantService::class.java)
+        // Start it as a genuine foreground service independent of this
+        // binding — the Activity going away must not stop it.
+        app.startForegroundService(intent)
+        app.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+    }
+
+    /** Replaces the old direct `cameraManager.bind(lifecycleOwner, previewView)`
+     * call site — camera binding itself now happens once, inside the
+     * Service's own onCreate(), against the Service's lifecycle. This just
+     * plugs the Activity's on-screen PreviewView into the already-bound
+     * Preview use case (see CameraManager.attachPreviewSurface). */
+    fun attachCameraPreview(previewView: PreviewView) {
+        pendingPreviewView = previewView
+        cameraManager?.attachPreviewSurface(previewView)
+    }
+
+    fun detachCameraPreview() {
+        pendingPreviewView = null
+        cameraManager?.detachPreviewSurface()
     }
 
     fun connect(
         host: String, port: Int, frameIntervalMs: Int, scanIntervalMs: Int, recentBufferMs: Int,
         avoidanceIntervalMs: Int = 350,
-        vadThreshold: Float = 0.03f, startThreshold: Float = 0.05f,
-        geminiApiKey: String, ocrServerUrl: String, locationId: String,
+        beaconElevationDeg: Float = -20f, beaconRadiusM: Float = 6f,
+        vadThreshold: Float = 0.012f, startThreshold: Float = 0.018f,
+        geminiApiKey: String, ocrApiKey: String, locationId: String,
+        blurSharpnessThreshold: Float = 40f, saveDebugOcrFrames: Boolean = false,
+        youtubeApiKey: String = "",
+        cueVolume: Float = 1f,
+        geminiVoiceVolume: Float = 1f,
+        otherSoundVolume: Float = 1f,
+        useRemoteEdgeDevice: Boolean = false,
+        edgeDeviceHost: String = "",
     ) {
-        grpcManager.connect(host, port)
-        cameraManager.frameIntervalMs = frameIntervalMs
-        cameraManager.scanIntervalMs = scanIntervalMs
-        cameraManager.recentBufferMs = recentBufferMs
-
-        val ocrClient = OcrClient(ocrServerUrl)
-        toolDispatcher = ToolDispatcher(
-            grpc = grpcManager,
-            ocrClient = ocrClient,
-            memoryStore = memoryStore,
-            deviceToolHandler = deviceToolHandler,
-            state = sessionState,
-            locationId = locationId,
-            avoidanceIntervalMs = avoidanceIntervalMs,
-            scope = viewModelScope,
-            latestFrame = { cameraManager.clearestRecentFrame() },
-            sendVideoFrame = { jpeg -> liveClient?.sendVideoFrame(jpeg) },
-            sendSystemNote = { text -> liveClient?.sendSystemNote(text) },
-            playPcm = { pcm -> streamingPlayer.writeChunk(pcm); edgeDevice.emitAudio(pcm) },
-            onTrackingStateChanged = { active, target ->
-                if (active) startLocalTracking(target) else stopLocalTracking()
-            },
-            onGuidanceUpdate = { mode, waypoints ->
-                _uiState.update {
-                    it.copy(
-                        isWalkingMode = mode == "walking",
-                        guidingDestination = if (mode == "guiding") sessionState.guidingDestinationLabel else "",
-                        guidingRoute = waypoints.map { (x, z) -> "($x, $z)" },
-                    )
-                }
-            },
-            hrtfBeacon = hrtfBeacon,
+        _boundService.value?.connect(
+            host, port, frameIntervalMs, scanIntervalMs, recentBufferMs,
+            avoidanceIntervalMs, beaconElevationDeg, beaconRadiusM,
+            vadThreshold, startThreshold, geminiApiKey, ocrApiKey, locationId,
+            blurSharpnessThreshold, saveDebugOcrFrames, youtubeApiKey, cueVolume,
+            geminiVoiceVolume, otherSoundVolume, useRemoteEdgeDevice, edgeDeviceHost,
         )
-
-        startLocalProcessing()
-        startLiveSession(geminiApiKey)
-        _uiState.update { it.copy(isVadActive = true) }
-        appendSystemMessage("Connecting to $host:$port …")
     }
 
     fun disconnect() {
-        localProcessingJob?.cancel(); localProcessingJob = null
-        liveSessionJob?.cancel(); liveSessionJob = null
-        liveClient?.close(); liveClient = null
-        toolDispatcher?.shutdown(); toolDispatcher = null
-        initJob?.cancel()
-        if (_uiState.value.isRecording) ptt.stopRecording()
-        grpcManager.disconnect()
-        sessionState.reset()
-        _uiState.update { it.copy(isVadActive = false, isRecording = false, connectionState = ConnectionState.DISCONNECTED) }
-        appendSystemMessage("Disconnected")
+        _boundService.value?.disconnect()
     }
 
-    fun startPtt() {
-        _uiState.update { it.copy(isRecording = true) }
-        ptt.onChunkReady = { pcm -> liveClient?.sendAudioChunk(pcm) }
-        ptt.startRecording()
-    }
-
-    fun stopPtt() {
-        ptt.stopRecording()
-        ptt.onChunkReady = null
-        liveClient?.sendAudioStreamEnd()
-        _uiState.update { it.copy(isRecording = false, micVolume = 0f) }
-    }
-
-    fun startLocalTracking(prompt: String) {
-        isLocalTrackingActive = true
-        localTrackingPrompt = prompt
-        _uiState.update { it.copy(agentName = "tracking", agentState = "INITIALIZING") }
-        appendSystemMessage("Searching for '$prompt'…")
-
-        initJob?.cancel()
-        initJob = viewModelScope.launch(Dispatchers.IO) {
-            while (isActive) {
-                val frame = cameraManager.clearestRecentFrame()
-                if (frame == null) { delay(100); continue }
-                Log.d(TAG, "initialize attempt for '$prompt'")
-                val track = trackingBackend.initialize(frame, prompt)
-                if (track != null) {
-                    Log.d(TAG, "Tracking initialized: box=${track.boxXyxy.toList()}")
-                    _uiState.update { it.copy(agentState = "TRACKING") }
-                    break
-                }
-                Log.d(TAG, "Detection failed, retrying in 1s")
-                delay(1000L)
-            }
-        }
-    }
-
-    fun stopLocalTracking() {
-        initJob?.cancel()
-        initJob = null
-        isLocalTrackingActive = false
-        trackingBackend.stop()
-        _uiState.update { it.copy(agentState = "STOPPED", guidanceData = ObjectTrack(status = "Local tracking stopped")) }
-        appendSystemMessage("Local tracking stopped")
-    }
-
-    // ── Local frame processing (tracking + hand detection + UI + mapping feed) ──
-
-    private fun startLocalProcessing() {
-        localProcessingJob?.cancel()
-        localProcessingJob = viewModelScope.launch(Dispatchers.IO) {
-            cameraManager.frameFlow
-                .conflate()
-                .catch { e -> appendSystemMessage("[Flow error] ${e.message}") }
-                .collect { jpegBytes ->
-                    // Guiding/scanning mode: feed frames into the live mapping
-                    // stream (MappingService.UpdateMapping) — see
-                    // ToolDispatcher.feedMappingFrame. Walking is NOT included
-                    // any more — it dropped MappingService/RTAB-Map entirely
-                    // in favor of a local per-frame reactive obstacle-dodge
-                    // (see ToolDispatcher.runAvoidanceTick(), which pulls its
-                    // own frames on demand via clearestRecentFrame() instead).
-                    // sessionState.mode is forwarded as-is into
-                    // CameraManager.mappingMode so it can pick the right
-                    // window size per submode (frameIntervalMs for guiding,
-                    // scanIntervalMs for scanning) — see CameraManager.kt's
-                    // frame-selection note. Set here rather than from
-                    // ToolDispatcher so no new callback wiring is needed;
-                    // cheap to re-check every processed frame.
-                    val mappingModeActive = sessionState.mode == "guiding" || sessionState.mode == "scanning"
-                    cameraManager.mappingMode = if (mappingModeActive) sessionState.mode else ""
-                    if (mappingModeActive) {
-                        toolDispatcher?.feedMappingFrame(jpegBytes)
-                    }
-
-                    val jpegOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                    BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, jpegOpts)
-                    val frameWidth = jpegOpts.outWidth
-                    val frameHeight = jpegOpts.outHeight
-
-                    // Local ORB tracking — throttled to ~7 fps
-                    val now = System.currentTimeMillis()
-                    if (isLocalTrackingActive && _uiState.value.agentState == "TRACKING" &&
-                        now - lastTrackingUpdateMs >= trackingIntervalMs
-                    ) {
-                        lastTrackingUpdateMs = now
-                        try {
-                            val track = trackingBackend.update(jpegBytes)
-                            if (track != null) {
-                                Log.d(TAG, "TrackingBackend: visible=${track.visible} conf=${track.confidence} box=${track.boxXyxy.toList()}")
-                                val guidance = track.copy(
-                                    instruction = when {
-                                        !track.visible -> "Target lost"
-                                        track.centerX < track.frameWidth * 0.2f -> "Move right"
-                                        track.centerX > track.frameWidth * 0.8f -> "Move left"
-                                        track.centerY < track.frameHeight * 0.2f -> "Move down"
-                                        track.centerY > track.frameHeight * 0.8f -> "Move up"
-                                        else -> "On target"
-                                    },
-                                    objectBoxXyxy = track.boxXyxy.toList(),
-                                    deltaX = track.centerX - (track.frameWidth / 2f),
-                                    deltaY = track.centerY - (track.frameHeight / 2f)
-                                )
-                                _uiState.update { it.copy(guidanceData = guidance) }
-                                toolDispatcher?.updateTrackingBeacon(
-                                    track.visible, track.centerX, track.centerY, track.frameWidth, track.frameHeight
-                                )
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Tracking error: ${e.message}", e)
-                        }
-                    }
-
-                    // Hand detection — MediaPipe normalized [0,1] coords
-                    val handResult = try { handTracker.detect(jpegBytes) } catch (e: Exception) { null }
-                    val handLmX: List<List<Float>>
-                    val handLmY: List<List<Float>>
-                    val handBox: List<Float>
-                    if (handResult != null && handResult.hands.isNotEmpty() && frameWidth > 0 && frameHeight > 0) {
-                        handLmX = handResult.hands.map { hand -> hand.map { it.first * frameWidth } }
-                        handLmY = handResult.hands.map { hand -> hand.map { it.second * frameHeight } }
-                        val allX = handLmX.flatten(); val allY = handLmY.flatten()
-                        handBox = listOf(allX.min(), allY.min(), allX.max(), allY.max())
-                    } else {
-                        handLmX = emptyList(); handLmY = emptyList(); handBox = emptyList()
-                    }
-                    _uiState.update { s ->
-                        s.copy(guidanceData = s.guidanceData.copy(
-                            frameWidth = frameWidth,
-                            frameHeight = frameHeight,
-                            handBoxXyxy = handBox,
-                            handLandmarksX = handLmX,
-                            handLandmarksY = handLmY,
-                        ))
-                    }
-
-                    // Tracking mode hand-guidance [SYSTEM] tick — once both
-                    // target and hand are visible, then every 5s while both
-                    // remain visible (mirrors the old server's
-                    // tracking_guidance_active behavior, now computed
-                    // entirely on-device).
-                    if (sessionState.mode == "tracking" && handBox.isNotEmpty()) {
-                        val g = _uiState.value.guidanceData
-                        if (g.visible && g.objectBoxXyxy.size == 4 &&
-                            now - trackingGuidanceLastAtMs >= trackingGuidanceIntervalMs
-                        ) {
-                            trackingGuidanceLastAtMs = now
-                            liveClient?.sendSystemNote(
-                                "[SYSTEM] Target box=${g.objectBoxXyxy}, hand box=$handBox. " +
-                                    "Give brief directional guidance to move the hand toward the target."
-                            )
-                        }
-                    }
-                }
-        }
-    }
-
-    // ── Persistent Gemini Live session (direct on-device connection) ─────────
-
-    private fun startLiveSession(apiKey: String) {
-        liveSessionJob?.cancel()
-        liveSessionJob = viewModelScope.launch(Dispatchers.IO) {
-            while (isActive) {
-                if (apiKey.isBlank()) {
-                    appendSystemMessage("[Voice] No Gemini API key configured — set one in Settings.")
-                    delay(5000L)
-                    continue
-                }
-                doLiveSession(apiKey)
-                if (!isActive) break
-                delay(2000L)
-            }
-        }
-    }
-
-    private suspend fun doLiveSession(apiKey: String) {
-        val client = GeminiLiveClient(apiKey)
-        liveClient = client
-        streamingPlayer.start()
-        try {
-            client.events(ToolDeclarations.SYSTEM_PROMPT, ToolDeclarations.buildDeclarations()).collect { event ->
-                when (event) {
-                    is LiveServerEvent.SetupComplete -> {
-                        Log.d(TAG, "Gemini Live setup complete")
-                        appendSystemMessage("Connected to Gemini Live")
-                    }
-                    is LiveServerEvent.Audio -> {
-                        streamingPlayer.writeChunk(event.pcm)
-                        edgeDevice.emitAudio(event.pcm)
-                    }
-                    is LiveServerEvent.ToolCall -> {
-                        for (call in event.calls) {
-                            viewModelScope.launch(Dispatchers.IO) {
-                                val dispatcher = toolDispatcher ?: return@launch
-                                val response = dispatcher.dispatch(call.name, call.args)
-                                Log.d(TAG, "tool ${call.name} -> $response")
-                                client.sendToolResponse(call.id, call.name, response)
-                            }
-                        }
-                    }
-                    is LiveServerEvent.TurnComplete, is LiveServerEvent.Interrupted -> { /* no-op */ }
-                    is LiveServerEvent.Error -> {
-                        Log.e(TAG, "Live session error: ${event.message}")
-                        appendSystemMessage("[Session] Reconnecting…")
-                    }
-                    is LiveServerEvent.Closed -> {
-                        Log.d(TAG, "Live session closed")
-                    }
-                }
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Log.e(TAG, "liveSession error: ${e.message}")
-            appendSystemMessage("[Session] Reconnecting…")
-        } finally {
-            client.close()
-            if (liveClient === client) liveClient = null
-            streamingPlayer.stop()
-            _uiState.update { it.copy(isTtsPlaying = false) }
-        }
-    }
-
-    // ── Utilities ─────────────────────────────────────────────────────────────
-
-    private fun appendSystemMessage(text: String) {
-        _uiState.update { state -> state.copy(chatHistory = state.chatHistory + ChatMessage("system", text)) }
-    }
-
-    fun clearError() { _uiState.update { it.copy(error = null) } }
-
-    companion object {
-        private const val TAG = "MainViewModel"
-    }
+    fun clearError() { _boundService.value?.clearError() }
 
     override fun onCleared() {
         super.onCleared()
-        initJob?.cancel()
-        liveSessionJob?.cancel()
-        localProcessingJob?.cancel()
-        liveClient?.close()
-        toolDispatcher?.shutdown()
-        if (_uiState.value.isRecording) ptt.stopRecording()
-        if (isLocalTrackingActive) trackingBackend.stop()
-        handTracker.close()
-        streamingPlayer.stop()
-        cameraManager.shutdown()
-        grpcManager.disconnect()
+        // Deliberately does NOT call disconnect() — the whole point of the
+        // Service migration is that the session outlives this ViewModel.
+        // Only the binding itself is torn down.
+        getApplication<Application>().unbindService(connection)
     }
 }

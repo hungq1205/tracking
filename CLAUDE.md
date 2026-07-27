@@ -40,7 +40,7 @@ by the main server for live mapping) is actually run/tested via conda env
 │    live/ToolDispatcher.kt)                                           │
 │  • Local: ORB tracking continuation, MediaPipe hands, on-device      │
 │    memory store, A* path planning, HRTF beacon math                  │
-│  • 3rd-party direct: OCR (paddle_ocr_server), Gemini Live itself     │
+│  • 3rd-party direct: OCR (OCR.space), Gemini Live itself             │
 │  • Device-native: phone/alarm/calendar (in-process, no wire hop)     │
 └───────────┬─────────────────────────────────────────────────────────┘
             │ gRPC — heavy compute only (JPEG frames + IMU for mapping)
@@ -68,7 +68,10 @@ by the main server for live mapping) is actually run/tested via conda env
 │  see server_gui.py note                                              │
 └─────────────────────────────────────────────────────────────────────┘
 
-paddle_ocr_server (port 8100) — called directly by Android, not proxied.
+OCR.space (https://ocr.space/) — called directly by Android for reading
+mode, no self-hosted OCR server (see "Reading-mode OCR — OCR.space +
+block-level dedup + line-level filters" below; replaces the earlier
+self-hosted paddle_ocr_server, deleted outright).
 RTAB-Map pose service (scan_server/rtabmap_docker/, port 5556) — required
 by MappingService; no per-device camera-IMU calibration needed.
 ```
@@ -155,18 +158,23 @@ call goes through the two services below.
   in `server/services/perception_servicer.py`, thin wrappers around the same
   `tools/*.py` model wrappers `TrackingServiceServicer` already uses (no new
   model code):
-  - `AnalyzeFrame(image, ops: {DETECT, EMBED, DEPTH, TRAVERSABILITY}, prompt?,
-    box?) → detections[], embedding?, obstacle?, traversability?` — one round
-    trip for whatever combo a caller needs (`run_detection`/`check_obstacle`
-    on-demand tools; walking mode's own periodic DEPTH-op polling was removed
-    long ago, see "Local reactive HRTF obstacle-dodge" below), via
-    `detector.detect_all()` (sorted by score, replaces the old single-best
-    `detect()` for this path)/`embedder.get_embedding()`/
-    `depth_detector.check_obstacle()`/`depth_detector.estimate_traversability()`
-    (new — per-angle obstacle-clearance fan, see "Local reactive HRTF
-    obstacle-dodge" below; shares the same DA3 inference call `check_obstacle`
-    already makes, so requesting both `DEPTH` and `TRAVERSABILITY` in one call
-    doesn't pay for DA3 twice).
+  - `AnalyzeFrame(image, ops: {DETECT, EMBED, DEPTH, TRAVERSABILITY, CORRIDOR},
+    prompt?, box?) → detections[], embedding?, obstacle?, traversability?,
+    corridor?` — one round trip for whatever combo a caller needs
+    (`run_detection`/`check_obstacle` on-demand tools; walking mode's own
+    periodic DEPTH-op polling was removed long ago, see "Local reactive HRTF
+    obstacle-dodge" below), via `detector.detect_all()` (sorted by score,
+    replaces the old single-best `detect()` for this path)/
+    `embedder.get_embedding()`/`depth_detector.check_obstacle()`/
+    `depth_detector.estimate_traversability()` (per-angle obstacle-clearance
+    fan — GUIDING's local dodge signal, see "Local reactive HRTF
+    obstacle-dodge" below; BOTH modes' step-down hazard check, see "Hazard
+    warnings" below, reads its `dropoff_m` field). `CORRIDOR` op /
+    `find_corridor()` — added for WALKING's corridor-lock beacon design,
+    deleted outright once that design was superseded by "Grid-planned
+    walking route" (walking's beacon comes from an occupancy-grid path now,
+    not a per-frame corridor pick); the enum value and `corridor` response
+    field are left in the proto (unused) rather than renumbered.
   - `Synthesize(text) → stream(PcmChunk)` — KokoroTTS, unchanged voice.
   - `Embed(text) → vector` — `RagStore.embed_text()` (new method, raw
     sentence-transformer encode with no storage/search attached — Android
@@ -179,8 +187,11 @@ call goes through the two services below.
   physically relocated into `server/` yet — see the approved plan's Phase 2
   for that follow-up cleanup pass).
   - `UpdateMapping(stream MappingChunk) → stream MappingUpdate{pose, grid,
-    grid_updated, landmarks, confidence, grid_delta, full_resync}` — bidi
-    stream. **RTAB-Map is the ONLY pose source used here** (not IMU+VO) —
+    grid_updated, landmarks, confidence, grid_delta, full_resync,
+    reset_occurred}` — bidi stream. `reset_occurred` (new) is only ever set
+    for `SessionMode.WALKING`'s pose-only sessions — see "Local SLAM-backed
+    walking corridor-lock" below; `SCAN`/`GUIDING` leave it false.
+    **RTAB-Map is the ONLY pose source used here** (not IMU+VO) —
     `MappingChunk.imu_samples` is accepted on the wire but not consumed; the
     old scan_server GUI's IMU+VO pose source is untouched and still used by
     that separate, still-intact offline tool. Buffers frames the same way
@@ -204,19 +215,19 @@ call goes through the two services below.
     against `location_id`'s session frame store, via
     `ScanSession.resolve_landmark()` (tag-match first, else a first-hit
     scan — see below). Uses `scan_manager.get()` (read-only, does not
-    create a session) like `GetMapSnapshot`/`ListMappedLocations` below.
-    `ToolDispatcher.kt`'s `recomputeRoute()` calls this for EVERY guiding
-    destination now (no live-streamed landmarks list to check first).
+    create a session). `ToolDispatcher.kt`'s `recomputeRoute()` calls this
+    for EVERY guiding destination now (no live-streamed landmarks list to
+    check first). **No disk-snapshot fallback any more** — see "Map
+    persistence removed entirely" further below; a walking/guiding
+    session can only resolve a destination a live SCAN already found in
+    this same server-process lifetime.
   - On stream end (client closes/disconnects — `finally` block, so this
     fires on a clean stop or an abrupt drop): `stream.flush()` (last partial
-    batch), `session.finalize_landmarks_flat()` (see below), then persists
-    an `occupancy_snapshot.json` per location — deliberately NOT using the
-    legacy zone-shaped `map_exporter.py`/`ScanSession.export()` path (calling
-    both would double-drain the frame store's tag-pending buffer, since both
-    finalize methods flush it).
-  - `GetMapSnapshot(location_id) → found, grid, landmarks` /
-    `ListMappedLocations() → location_ids` — read `occupancy_snapshot.json`
-    directly, no live session needed.
+    batch), `session.finalize_landmarks_flat()` (see below) — **no longer
+    persists anything to disk** (originally wrote an `occupancy_snapshot.json`
+    per location here; removed, see "Map persistence removed entirely").
+  - `GetMapSnapshot`/`ListMappedLocations` — **REMOVED outright** (not
+    just disabled) — see "Map persistence removed entirely" below.
   - Registered only if `RTABMAP_ADDR` is set and a dedicated DA3 estimator
     loads — `grpc_server.py` loads a SEPARATE `DA3Estimator` for this
     (doesn't reuse walking mode's `da3_onnx`), since concurrent-inference
@@ -235,6 +246,16 @@ now source their landmarks via `_resolve_all_frame_store_landmarks()` (see
 below) instead of an immediate per-frame accumulation.
 
 ### Novelty+blur frame gating and deferred landmark resolution
+
+**The "defer ALL GroundingDINO/backprojection to on-demand query time" half
+of this section is superseded — see "Semantic mapper adapted to
+frame_extractor's Gemini -> GroundingDINO-tiny pipeline" below.** The
+novelty+blur gate itself (`OrbNoveltyGate`/`scan_session.py`'s Step 0/Step 3
+gating, `StoredFrame`→`_PendingTagFrame` batching) is still exactly as
+described here — only what happens to a frame ONCE it's accepted changed:
+detection now runs immediately, batched, per accepted frame (frame_extractor's
+own design), not deferred to a later on-demand query. Kept here for the
+novelty-gating history, which is unchanged.
 
 A real quality/cost problem, surfaced and resolved with the user during this
 work: the live pipeline used to (1) select frames for the VLM landmark
@@ -386,12 +407,208 @@ defer ALL GroundingDINO/backprojection to on-demand query time.
   `LocalPathPlanner`/`HrtfBeacon` to compute `state.navWaypoints` — this is
   the piece that makes guiding actually route anywhere for the first time.
   Landmark-name matching deliberately stays simple (server-side
-  case-insensitive substring, either direction) rather than fuzzy-matched
-  further, since `FindLandmark`'s own Tier 2 GroundingDINO fallback is
-  already the safety net for a near-miss. **Known follow-on, not yet
+  case-insensitive substring, either direction) — matches whatever
+  `resolve_landmark()` (`scan_session.py`) can find among already-resolved
+  landmarks (see "Semantic mapper adapted to frame_extractor's RAM++ ->
+  GroundingDINO-tiny pipeline" below for why there's no more on-demand
+  detection fallback to lean on for a near-miss). **Known follow-on, not yet
   built**: nothing memoizes "already tried and failed this session," so an
   unresolved destination retries the RPC on every grid update — worth a
   debounce if it turns out to spam the RPC in practice.
+
+### Semantic mapper adapted to frame_extractor's Gemini -> GroundingDINO-tiny pipeline
+
+Requested directly by the user: `scan_server/semantic_mapper.py` now adapts
+`frame_extractor/tagging.py` + `app.py`'s pipeline wholesale, instead of the
+Gemma-VLM-tag-then-defer-GroundingDINO design the previous section
+describes. Every novelty+blur-gated accepted frame is tagged AND detected
+**immediately**, batched, exactly like `frame_extractor/app.py`'s "Extract
+new frames" button does for its own output:
+1. Gemini (`gemini-3.1-flash-lite` via the `google-genai` SDK, no local
+   checkpoint) proposes open-set tags for the frame — same multi-image-
+   per-call convention `gemma_vlm.py`'s `GemmaVLMClient` already established
+   in this codebase, just aimed at short detection-prompt tags instead of a
+   navigation-landmark description.
+2. Those tags become GroundingDINO-**tiny**'s own detection prompt for that
+   SAME frame (`tagging.py`'s `_build_prompt` — lowercase, article-prefixed,
+   `" . "`-separated), so what gets boxed tracks what Gemini actually saw.
+3. Every box is immediately backprojected into a world `(x, z)` `Landmark`
+   using the frame's own depth map + pose + intrinsics (already available
+   at frame-acceptance time) — the same backprojection math the old design
+   used, just no longer deferred.
+
+**Bug found from a real scan's console output: landmark names carried a
+leading article ("a nightstand", "an outlet")** — `post_process_grounded_
+object_detection`'s returned `label` is the matched TEXT SPAN decoded
+straight out of the GroundingDINO prompt's own tokens, and since
+`_build_prompt()`'s convention prefixes every tag with "a "/"an " (step 2
+above), that article rode along into the detection label verbatim. Fixed
+via `tagging.py`'s new `_strip_leading_article()`, applied to every
+`TagDetection.label` in `_detect_batch()` — so `Landmark.name` (and
+anything downstream: `resolve_landmark()`'s substring match, spoken
+navigation destinations) sees the plain noun, not the prompt artifact.
+
+**`frame_extractor/tagging.py` itself was also changed in the same pass**:
+its `FrameTagger` originally tagged via RAM++ (a local open-set image
+tagging model, ~3GB checkpoint) — swapped for Gemini specifically because a
+RAM++ checkpoint isn't available in every deployment of this pipeline
+(notably `scan_server/`'s own environment). `FrameTagger.__init__` dropped
+`ram_checkpoint`/`ram_image_size`/`ram_tag_threshold` in favor of
+`gemini_api_key`/`gemini_model_id` (`DEFAULT_GEMINI_MODEL =
+"gemini-3.1-flash-lite"`); `_tag_batch()` now calls
+`self._gemini_client.models.generate_content(model=gemini_model_id,
+contents=[*pil_images, prompt], config=types.GenerateContentConfig(
+system_instruction=..., temperature=0.1, response_mime_type="text/plain"))`
+instead of a local `ram_model.generate_tag()` forward pass, with the same
+defensive N-line parse (`_parse_tag_response`, pad/truncate + per-line
+comma-split, capped at `max_tags_per_frame`) `semantic_mapper.py`'s old
+VLM-tag parser used. `_detect_batch` (GroundingDINO-tiny) is completely
+UNCHANGED — still a local transformers model, still prompted by whatever
+tags the tagging step returns, regardless of which model produced them.
+`frame_extractor/app.py`'s own standalone GUI was updated in lockstep — the
+"RAM++ checkpoint path" textbox became "Gemini API Key"/"Gemini tagging
+model id" textboxes (reusing `GEMINI_API_KEY`/new `GEMINI_TAGGING_MODEL_ID`
+env vars as their defaults), `_get_tagger()`'s cache key and `run()`'s
+signature updated to match. `frame_extractor/requirements.txt`'s
+`recognize-anything` (RAM++ package) install line was dropped; the
+`transformers==4.46.3` pin stays (still needed for GroundingDINO-tiny's
+`post_process_grounded_object_detection` signature, unrelated to RAM++) —
+`google-genai` needs no separate entry, already pinned in
+`scan_server/requirements.txt`. `patch_ram_package.py`/RAM++ itself are
+left in the repo, unreferenced, not deleted, in case RAM++ tagging is ever
+revisited.
+
+**`SemanticMapper` (`scan_server/semantic_mapper.py`)** now wraps a single
+`FrameTagger` (imported directly from `frame_extractor/tagging.py` via a
+sys.path bootstrap, not duplicated — unlike `orb_novelty_gate.py`'s
+deliberate duplication of `frame_extractor/extractor.py`, there's no
+"separately deployed process" reason to duplicate this one, since
+`scan_server/` already imports across that boundary for other things) in
+place of the old `vlm`/`detector` pair. `tag_and_backproject_batch(frames_bgr,
+depth_maps, world_poses, Ks, frame_idxs)` replaces `tag_landmarks_batch()` +
+`_detect_and_backproject()` — one call does tag, detect, AND backproject,
+returning one `Landmark` list per input frame. `cluster_landmarks()` is
+unchanged (same overlap-merge logic) — see "Confidence-weighted, distance-
+based landmark merging" below for a later refinement to that logic.
+
+**`scan_session.py`** — `StoredFrame`/`_frame_store` are gone; replaced by
+`_PendingTagFrame`/`_tag_pending`, a short-lived buffer (still batched at
+`SemanticMapper.IMAGES_PER_PROMPT`, same batching motive as before —
+amortizing per-call overhead, now a Gemini API round trip + GroundingDINO
+CUDA launch, across a batch) holding raw frames until a full batch is ready
+for `_flush_tag_pending()`, which now appends every resolved `Landmark`
+straight into `self._raw_landmarks` instead of recording per-frame tag
+strings. This is a real, deliberate reversion of a previous optimization:
+**`_raw_landmarks` is populated LIVE again during an active scan stream**
+(it had been left permanently empty for the stream's duration by the
+deferred design — see the previous section's own note) —
+`MappingService.UpdateMapping` already read `session._raw_landmarks` for
+its per-update `landmark_count`/`landmarks` proto fields, so this switch
+makes those fields meaningful again during scanning, not just after
+finalize. `walking_lite` sessions are unaffected either way — they still
+skip semantic tagging entirely (see "Session-mode pipeline split" below).
+
+- **`resolve_landmark(query)`** no longer runs any detection — GroundingDINO-
+  tiny already ran on every accepted frame, so this is now a plain
+  case-insensitive substring search (either direction) over
+  `self._raw_landmarks`, returning the highest-confidence match. **Real,
+  accepted trade-off**: a landmark Gemini never tagged in ANY accepted frame
+  is now never findable at all — the old design's Tier-2 "scan every stored
+  frame with the literal open-vocabulary query" fallback (e.g. finding "water
+  bottle" even though the VLM never said "water bottle") no longer exists,
+  since there's no stored-frame archive left to re-scan on demand. This is
+  an inherent consequence of adopting frame_extractor's pipeline as-is
+  (GroundingDINO-tiny there is only ever prompted with the tagging step's
+  own tags).
+- **`_resolve_all_frame_store_landmarks()`** → **`_finalize_raw_landmarks()`**
+  — no longer resolves anything (everything's already resolved live); just
+  flushes any leftover partial batch and runs `cluster_landmarks()` once
+  over the accumulated `_raw_landmarks`, same as before.
+- `finalize_landmarks()`/`finalize_landmarks_flat()` call sites updated
+  accordingly; behavior (zone assignment / flat list) unchanged.
+
+**Model construction (`scan_server/scan_server.py`, `server/grpc_server.py`)**
+— both now build a `FrameTagger(gemini_api_key, gemini_model_id,
+gdino_model_id, device)` instead of a `GemmaVLMClient` + `GroundingDINODetector`
+pair. New env vars: `GEMINI_TAGGING_MODEL_ID` (default `FrameTagger.
+DEFAULT_GEMINI_MODEL` = `gemini-3.1-flash-lite`; reuses the existing
+`GEMINI_API_KEY` for auth, no new key needed), `GDINO_TAGGING_MODEL_ID`
+(default `IDEA-Research/grounding-dino-tiny`) — deliberately separate from
+`DA3_ONNX_PATH`/other model env vars, and distinct from the full-size
+`GroundingDINODetector` (`server/tools/detector.py`) TrackingService still
+uses, which stays untouched. Both entry points add `frame_extractor/` to
+`sys.path` (same convention `scan_server/` already uses for
+`server/tools/*`) so `from tagging import FrameTagger` resolves.
+`SCAN_GEMMA_MODEL_ID`/`gemma_vlm.py` are no longer used by any live path
+(the file itself is left in place, unreferenced, not deleted).
+
+**`ScanSessionManager.semantic_mapper_model_id`/`set_semantic_mapper_model`**
+— the old live VLM-model-hot-swap (`scan_gui.py`'s "Apply" button) has no
+equivalent here: Gemini + GroundingDINO-tiny are configured once at server
+startup, not a single swappable model id. `semantic_mapper_model_id` now
+returns a fixed descriptive string (reading `FrameTagger._gemini_model_id`);
+`set_semantic_mapper_model` was removed, and `scan_gui.py`'s textbox is now
+read-only with the Apply button repurposed as an inert "Info" button
+explaining why.
+
+**Known, accepted limitations** (direct consequences of adopting this
+pipeline wholesale, not bugs):
+- Open-vocabulary queries outside whatever the tagging step actually tags
+  in a session are unreachable (see `resolve_landmark()`'s note above) — a
+  real narrowing of what's findable vs. the old design's Tier-2 fallback.
+- GroundingDINO-**tiny** (not the full-size model TrackingService still
+  uses) trades some detection accuracy/recall for speed, matching
+  `frame_extractor/app.py`'s own choice.
+- Tagging is now a network round trip (Gemini API) per flushed batch,
+  instead of a local forward pass — adds latency + an external dependency
+  vs. RAM++, in exchange for not needing a local checkpoint anywhere this
+  pipeline runs.
+- Not verified end-to-end against a live scan/device from this environment
+  — compile-verified only (`python3 -m py_compile`), same standing caveat
+  as other rounds of this project's work.
+
+### Distance-based landmark merging (confidence picks the winner) (`scan_server/semantic_mapper.py`)
+
+Requested directly by the user: batching several frames per Gemini/
+GroundingDINO-tiny call (`IMAGES_PER_PROMPT`, see above) means overlapping-
+FOV frames in the same batch routinely re-detect the same physical object —
+`cluster_landmarks()`'s job is cleaning that up before landmarks reach
+`_raw_landmarks`/export, and its merge criterion + merged-position formula
+were both too narrow for that in practice.
+
+- **Merge criterion — distance OR overlap, not overlap alone.** A same-label
+  pair now merges if EITHER their centers are within `MERGE_DISTANCE_M`
+  (0.75m — same order of magnitude as typical indoor furniture) of each
+  other, OR their footprints still overlap by `OVERLAP_MERGE_RATIO` (0.5,
+  unchanged). Distance alone catches the common case this was built for:
+  the same object seen from two different angles across a batch can
+  backproject to two boxes that barely overlap at all, even though their
+  centers land close together; overlap alone is kept as a second trigger
+  for a large object whose two detected centers happen to land farther
+  apart than `MERGE_DISTANCE_M` despite the boxes clearly describing the
+  same thing. `_center_distance()` (new) — plain X-Z Euclidean distance
+  between two `Landmark`s' `(x, z)`. Connected-components clustering
+  (unchanged) still handles chains of 3+ nearby/overlapping detections
+  correctly regardless of which trigger connected each pair.
+- **Merged position — highest-confidence member's own position, not an
+  average.** `_merge_landmark_group()` previously placed a merged landmark
+  at the midpoint of the union of every member's AABB — a value no
+  individual detection actually reported. A confidence-weighted average
+  was tried next, then reverted per direct user feedback in the same
+  round: the merged position should be a REAL detection's own reported
+  center, not any blended point — so `_merge_landmark_group()` now simply
+  takes `x`/`z` straight from `max(members, key=confidence)`, same as it
+  already did for `confidence`/`name`/`frame_idx`/`footprint_corners`.
+  `footprint_min`/`footprint_max` (union AABB across all members) is the
+  only field that still reflects the whole group rather than one member.
+- Verified via two synthetic tests (no device needed — pure `Landmark`
+  dataclass math): (1) two same-label landmarks 0.3m apart with confidences
+  0.9/0.4 merge into one landmark sitting exactly at the 0.9-confidence
+  member's own (x, z) — not a blended point — while a third same-label
+  landmark 5m away stays separate; (2) a 3-member chain (0.3m spacing
+  between consecutive members, but the 1st and 3rd are 0.6m apart — outside
+  `MERGE_DISTANCE_M` on their own) still merges into a single landmark via
+  transitive connectivity.
 
 ### Client-side frame selection (blur filtering moved off the server, then removed for mapping modes)
 
@@ -514,7 +731,118 @@ complexity without being what was wanted here.
   Detail textbox (`⚠ RTAB-Map tracking: LOST N/M frames this batch` or
   `RTAB-Map tracking: OK (M/M)`).
 
+### RTAB-Map-native ground segmentation (replaces the height-only heuristic for RTAB-Map pose mode)
+
+Requested directly by the user, after confirming with the RTAB-Map docker
+daemon actually running (`docker info` reachable) that a full rebuild +
+live smoke test was possible from this environment. Previously, EVERY pose
+source (IMU+VO/VO and RTAB-Map alike) classified ground-vs-obstacle purely
+by height above a fitted/estimated `ground_y` — `OccupancyMap.update()`'s
+own `height < OBSTACLE_MIN_H` check. RTAB-Map mode now instead uses RTAB-Map's
+OWN ground/obstacle segmentation (`util3d::segmentObstaclesFromGround` — the
+exact function RTAB-Map's own `OccupancyGrid`/`LocalGridMaker` classes use
+internally, previously never called by this project's server at all) as the
+ground/not-ground BOUNDARY decision; height is still computed and still used
+for the `OBSTACLE_MAX_H` ceiling filter and the LOW_STEP_OVER vs. normal-
+OBSTACLE tiering downstream. IMU+VO/VO sessions are unaffected — they have no
+per-point RTAB-Map segmentation to offer, so `OccupancyMap.update()`'s new
+`point_is_ground` param stays `None` for them and the original height-only
+path runs unchanged.
+
+**Coordinate mismatch, found by reading RTAB-Map's own source (not assumed):**
+`segmentObstaclesFromGround()` hardcodes its reference "ground normal" as
+world `Eigen::Vector4f(0,0,1,0)` — confirmed in `util3d_mapping.hpp`, which
+always calls `normalFiltering(..., Eigen::Vector4f(0,0,1,0), ...)`
+regardless of any parameter passed in, so there is no public way to tell it
+"up" is a different axis. This project's own convention throughout
+(`HrtfBeacon.kt`, `RotationTracker.kt`, `occupancy_map.py`'s `ground_y`) is
+camera-optical X-right/Y-down/Z-forward, where "up" (away from the floor)
+is `-Y`, not `+Z`. Fixed by building a temporary axis-remapped COPY of the
+cloud purely for this call — `(x, y, z) -> (x, z, -y)`, maps our `-Y`-up
+onto `+Z`-up — and applying the returned ground/obstacle point INDICES
+(remap-invariant) back onto the real, un-remapped cloud; the remapped copy
+is discarded immediately, never sent anywhere. `viewPoint` is passed as the
+camera's own local origin `(0,0,0,1)` (remapped the same way, matching how
+RTAB-Map's own `LocalGridMaker` passes the SENSOR's own local position —
+not this function's default `(0,0,100,0)`, which models a viewpoint far
+above pointing down, wrong for a camera at roughly head/room height looking
+sideways).
+
+- **`rtabmap_server.cc`** — new `segment_ground_flags()` (the axis-remap +
+  `segmentObstaclesFromGround` call, using RTAB-Map's own `Grid/*` defaults
+  confirmed against `Parameters.h`: `NormalK=20`, `MaxGroundAngle=45°`,
+  `ClusterRadius=0.1`, `MinClusterSize=10`, `FlatObstacleDetected=true`,
+  `MaxGroundHeight=0` disabled). Runs per-node, in the node's own
+  CAMERA-LOCAL frame, BEFORE the world-pose transform — matches RTAB-Map's
+  own default pipeline order (`Grid/PreVoxelFiltering=true`: voxel-filter
+  first, segment second) since `reconstruct_node_cloud()` already voxelizes
+  before this runs. `GET_CLOUD`'s wire reply gained a trailing
+  `uint8[point_count] is_ground` array per node, after the existing `rgb`
+  array — documented in the header comment.
+- **`rtabmap_client.py`** — `ReconstructedNode` gained `is_ground: np.ndarray`
+  (bool, aligned with `points`/`colors`). Same backward-compat convention
+  `node_id`/`inlier_fraction` already established: an un-rebuilt server that
+  didn't send the trailing bytes degrades to all-`False` rather than
+  crashing.
+- **`scan_session.py`** — new `_voxel_majority_flags(points, flags, centers,
+  vsize)`: aggregates the per-POINT `is_ground` into a per-VOXEL majority
+  vote aligned with `voxelize_cloud()`'s own returned `centers`. Open3D's
+  `VoxelGrid` exposes no per-voxel source-point membership directly, so this
+  independently recomputes each point's grid index using the exact same
+  fixed anchor (`_VOXEL_GRID_MIN_BOUND`) and voxel size `voxelize_cloud()`
+  itself uses — `create_from_point_cloud_within_bounds`'s own `origin` is
+  guaranteed to equal that anchor exactly (see `voxelize_cloud`'s own
+  docstring), so the same point always buckets into the same voxel index
+  either way. A tie resolves to obstacle (the safer default). Wired into
+  `_rtabmap_process_nodes()`: `is_ground` is threaded through the SAME SOR
+  keep-mask that already filters `points`/`colors` (both the cached-mask and
+  fresh-SOR paths), so all three arrays stay index-aligned through to
+  `voxelize_cloud()`, then majority-voted per voxel and passed to
+  `occupancy_map.update(..., point_is_ground=...)`.
+- **`occupancy_map.py`** — `OccupancyMap.update()` gained `point_is_ground:
+  Optional[np.ndarray] = None`. When given (and correctly aligned — a
+  misaligned length falls back to height-only rather than raising or
+  misapplying flags to the wrong points), it decides ground-vs-obstacle
+  per point directly instead of the `height < OBSTACLE_MIN_H` comparison;
+  height is still computed for the ceiling filter and downstream tiering.
+
+**Verified two ways, both against the REAL rebuilt `tracking-rtabmap` docker
+image (not assumed/simulated)**:
+1. A synthetic scene (uniform-noise-textured RGB for real ORB/GFTT features,
+   a depth map constructed so the lower half of the frame hits a flat floor
+   at camera-local `Y=+1.0` and the upper half hits a "wall") sent through a
+   real `TRACK`/`GET_CLOUD` round trip: ground points came back at EXACTLY
+   `Y=1.00` (min=max=mean), every obstacle point on the correct other side —
+   direct confirmation the axis-remap orientation is correct, not just
+   plausible.
+2. The same node's cloud run through the real `voxelize_cloud()` ->
+   `_voxel_majority_flags()` -> `OccupancyMap.update(point_is_ground=...)`
+   pipeline end-to-end: `ground_y` converged to `1.025` (true value `1.0`),
+   ground/obstacle cells classified with no height threshold involved in the
+   boundary decision at all.
+
+**Known, accepted limitations**: `groundNormalsUp` left at RTAB-Map's own
+default (`0.0`) — its exact effect wasn't independently verified beyond
+"the two synthetic tests above passed," since it disambiguates normal
+direction in cases the tests didn't specifically construct for. Not
+verified against a REAL indoor recording (textured real furniture/floor
+materials, real lighting/shadows, real depth noise) — only the synthetic
+uniform-noise scene above; a real scan may need `Grid/MaxGroundAngle`/
+`ClusterRadius` retuned if the defaults (inherited from RTAB-Map's own
+LIDAR/robot-oriented tuning) don't generalize well to this project's
+monocular-depth-estimated, handheld-camera use case.
+
 ### Occupancy-grid persistence across sessions (coarse re-seed)
+
+**REMOVED — see "Map persistence removed entirely" further below.** This
+whole re-seed mechanism (`occupancy_snapshot.json`, `OccupancyMap.
+seed_from_summary()`, `MappingServiceServicer._save_snapshot()`/
+`_load_snapshot()`, the `GetMapSnapshot`/`ListMappedLocations` RPCs) was
+deleted per a later, direct user request: "remove the map storing
+entirely, just new map every scan, guide." `seed_from_summary()` itself is
+left in `occupancy_map.py`, unreferenced (same "kept in case revisited"
+precedent this codebase uses elsewhere) — everything that called it is
+gone. Kept here for history/rationale only.
 
 A real design gap, surfaced and resolved with the user during this work:
 the Bayesian belief behind the occupancy grid (`_CellState.logodds`/
@@ -655,6 +983,14 @@ itself) from `PerceptionService.AnalyzeFrame`'s `DEPTH` op, which is what
 got removed from walking mode's polling loop specifically.
 
 ### Local reactive HRTF obstacle-dodge (replaces walking's occupancy-grid steering)
+
+**Superseded for WALKING — see "Local SLAM-backed walking corridor-lock"
+below.** GUIDING's beacon (goal-biased scoring off this same traversability
+fan) is completely unaffected and still works exactly as documented in this
+section. Kept here for history/rationale — walking's per-tick,
+no-world-state design below is a further iteration on the same "steering
+command, not a position" philosophy this section established, not a
+reversal of it.
 
 Worked out with the user across several rounds of design discussion, then
 implemented. Two problems with the occupancy-grid-based steering documented
@@ -817,17 +1153,18 @@ point") is deleted outright, along with its usage in `mapping_servicer.py`
 `beacon_world_xz`/`beacon_pixel` computation block) — it modeled the OLD
 grid-based beacon and has no correct equivalent for a client-computed
 azimuth. Replaced by `ReportBeaconDirection` (above) feeding a NEW
-`server_gui.py` panel on the **Perception tab** (not Mapping — walking no
-longer touches `MappingService` at all, so its only server traffic is
-`PerceptionService.AnalyzeFrame(TRAVERSABILITY)` + `StatusService`;
-`_TAB_BY_CLIENT_MODE["walking"]` now points at `tab_perception`
-accordingly): `_render_beacon_polar()` draws the last traversability fan as
-a Plotly polar bar chart (forward = 12 o'clock, azimuth-right reads
-clockwise, matching `HrtfBeacon.kt`'s sign convention) with a marker at the
-client-reported final azimuth, greyed out when muted. The old magenta
-circle overlays on the Mapping tab's frame/occupancy-map views are removed
-(nothing to draw any more — the real beacon direction was never grid-space
-to begin with now).
+`server_gui.py` panel — originally placed on a standalone **Perception
+tab** (walking touched no `MappingService` traffic at the time this was
+written, only `PerceptionService.AnalyzeFrame(TRAVERSABILITY)` +
+`StatusService`), later merged into the **Mapping tab** instead once
+walking rejoined `MappingService` — see "Grid-planned walking route"'s
+dashboard note below for the current layout: `_render_beacon_polar()`
+draws the last traversability fan as a Plotly polar bar chart (forward =
+12 o'clock, azimuth-right reads clockwise, matching `HrtfBeacon.kt`'s sign
+convention) with a marker at the client-reported final azimuth, greyed out
+when muted. The old magenta circle overlays on the Mapping tab's frame/
+occupancy-map views are removed (nothing to draw any more — the real
+beacon direction was never grid-space to begin with now).
 
 **Known, accepted limitations** (discussed with the user, not solved by
 this design):
@@ -845,6 +1182,1278 @@ this design):
   since they serve genuinely different layers and the latter is a
   lightweight unary call, not a stream.
 
+### Local SLAM-backed walking corridor-lock (supersedes walking's Local reactive HRTF obstacle-dodge)
+
+**Superseded — see "Grid-planned walking route" below.** In real on-device
+testing this design did not work: a single-frame "widest open arc" corridor
+selection turned out too easy to false-trigger the dead-end alert on
+(anything vaguely close in ANY direction could read as "no corridor," even
+with open space elsewhere), and the world-anchored lock's dwell/hysteresis
+behavior didn't feel right in practice. Replaced with a design that goes
+back to a real, continuously-updated local occupancy grid (the RTAB-Map
+integration/reset-on-loss machinery this section built is still current —
+only the beacon-steering mechanism on top of it changed). Kept here for
+the RTAB-Map F2M research/rationale, which is still accurate.
+
+Worked out across a long design discussion, starting from a real weakness
+in the per-tick design just above: a single stateless frame has no memory
+across a bad reading (motion blur, a momentary lost tracker), and re-scoring
+"most open direction" every tick doesn't behave like a real sound source —
+turning your head shouldn't make a good target jump to a new direction
+computed from scratch. Two things came out of that discussion:
+
+1. **RTAB-Map's own odometry already solves the memory problem, for
+   pose specifically.** Confirmed by reading `rtabmap_server.cc`:
+   `Odom/Strategy` is set to `"0"` — F2M (Frame-to-Map), RTAB-Map's default
+   — which matches new frames against a local multi-frame feature map, not
+   naively against just the previous frame; a single bad frame doesn't
+   permanently break tracking the way naive frame-to-frame VO would. This
+   is exactly the ORB-SLAM3-style "local map, not one frame" robustness
+   that was being asked for, already running in this project's stack.
+2. **The beacon should behave like a real landmark in the room.** Instead
+   of re-deriving a direction every tick, the beacon locks onto a specific
+   corridor — a real point in 3D space — and steers toward that fixed
+   **world** target continuously as the user turns/moves, only
+   reconsidering the lock after a sustained (not incidental) gaze change.
+
+**Chosen design** — a state machine, not a per-tick reactive score:
+
+- **Locked**: the beacon plays toward a fixed world `(x, z)` target.
+  `HrtfBeacon.directionTo()` (already existed, unchanged) recomputes the
+  egocentric azimuth to that fixed point every tick from the current pose —
+  turn right and the sound swings toward the left, exactly like a real
+  external sound source, because the *target* doesn't move, only the
+  listener's pose does.
+- **Dwell hysteresis**: while locked, if the current bearing to the lock
+  diverges by more than `REEVALUATE_ANGLE_DEG` (35°), a timer starts; only
+  after holding that divergence for `DWELL_MS` (3s) does the client
+  re-evaluate the *current* view for a new corridor and switch the lock (or
+  drop it if the current view has none). A glance back toward the lock
+  before 3s cancels the timer outright — no re-evaluation happens. This is
+  what stops the target from jittering every time the head moves
+  incidentally while walking toward it.
+- **Arrival**: within `ARRIVAL_RADIUS_M` (1.0m, matching
+  `checkWaypointProgress()`'s existing guiding radius) of the locked
+  target, the lock clears and the next tick searches fresh — otherwise the
+  beacon would eventually point behind the user forever.
+- **Dead end**: whenever unlocked (never acquired a lock yet, or one was
+  just dropped) and the current view also has no viable corridor, a
+  distinct alert plays instead of silence or the corridor tone — repeated,
+  not one-shot, so the user keeps getting a cue while turning to search.
+- **Recovery**: the instant a corridor is found while unlocked, the lock
+  acquires immediately — no dwell wait. The dwell timer only protects an
+  *existing* lock from being abandoned too eagerly; there's nothing to
+  protect when nothing is locked.
+
+**Server — corridor detection (`server/tools/traversability.py`)**:
+`estimate_traversability()`'s ground-plane-fit + azimuth-binned-clearance
+body was extracted into `_clearance_fan_from_depth()` (no logic change) so
+a new `find_corridor(depth_map, num_bins, max_range_m,
+min_corridor_width_m=0.7, min_corridor_range_m=1.2) -> CorridorResult`
+could reuse it instead of duplicating the RANSAC ground fit. `find_corridor`
+scans the same clearance-per-bin array for contiguous runs where every bin
+clears `min_corridor_range_m` (deep enough to actually step into, not just
+a doorway visible but not reachable), computes each run's real-world width
+(`angle_span_rad * representative_range`, representative_range = the run's
+own minimum clearance — conservative), keeps runs `>= min_corridor_width_m`,
+and picks the widest (ties: smallest `|center_azimuth|`).
+`found=False` (all other fields 0) means nothing qualified — the dead-end
+case. `DA3DepthDetector.find_corridor()` (`server/tools/depth.py`) mirrors
+the existing `estimate_traversability()` wrapper, sharing the same
+`_depth_map()` DA3 call — requesting `CORRIDOR` costs no extra inference.
+New `AnalysisOp.CORRIDOR` + `CorridorInfo{found, azimuth_deg, distance_m,
+width_m}` in `tracking.proto`/`AnalyzeFrameResponse`, handled in
+`perception_servicer.py` alongside `DEPTH`/`TRAVERSABILITY`.
+
+**Server — reviving `MappingService` for walking, pose-only
+(`mapping_servicer.py`, `scan_session.py`, `stream_session.py`)**: walking
+needed to drop `MappingService` entirely per "Local reactive HRTF
+obstacle-dodge" above (no world map, no destination) — but world-anchoring
+a lock target requires CONTINUOUS pose, which a stateless per-frame
+`AnalyzeFrame` call can't provide. Walking reopens its own
+`UpdateMapping` stream (`SessionMode.WALKING`), but strictly for RTAB-Map's
+F2M pose tracking — no grid, no landmarks, no VLM tagging, no destination.
+`process_frames_batch()` gained `pure_walking: bool` (parallel to the
+existing `walking_lite`, which stays `True` for both `WALKING` and
+`GUIDING`): `pure_walking` is `WALKING` specifically and skips Step 4's
+Bayesian `occupancy_map.update()`/`_merge_voxels()` entirely — nothing ever
+reads the grid for pure walking any more (corridor detection is a separate
+stateless call, not fed from this stream at all), so computing it would be
+pure waste. `mapping_servicer.py`'s `UpdateMapping` branches early for
+`pure_walking`: `MappingUpdate` carries only `pose` (+ `reset_occurred`,
+below) — no grid/delta/landmarks work at all. The stream's `finally` block
+also skips `finalize_landmarks_flat()`/snapshot-save for `pure_walking` —
+nothing meaningful ever accumulates (walking_lite already skips VLM
+tagging, and pure_walking additionally skips the grid), so saving a
+snapshot here would silently overwrite a real prior SCAN's snapshot with
+an empty one for that `location_id`.
+
+**Total-tracking-loss reset**: F2M relocalization is robust against a
+single bad frame, but not infinite — if RTAB-Map reports zero pose for
+`PURE_WALKING_LOST_RESET_S` (2.0s) of UNBROKEN consecutive loss (any single
+tracked frame clears the streak — this means genuinely no sign of
+recovery, not merely frequent loss), `pure_walking` sessions reset:
+`ScanSession.reset_cloud()` was split into a lock-free `_reset_cloud_locked()`
+body plus a thin `reset_cloud()` wrapper, since `process_frames_batch()`
+already holds `self._lock` for its whole body and `threading.Lock()` isn't
+reentrant — the streak check calls the lock-free body directly, right after
+Step 2 and before Step 3 would otherwise back-project the known-garbage
+pose into anything. New `MappingUpdate.reset_occurred` (proto) signals this
+to the client on the one update where it fires; `ToolDispatcher.kt`'s
+walking pose-stream collector responds by clearing `corridorLockTarget`/
+`corridorDwellStartMs` — silently (confirmed with the user: matches
+walking's existing "no spoken alerts, ambient only" design; the beacon just
+mutes until a fresh pose locks in, same as any other momentary gap).
+
+**Client-side warm-up (cold-start latency)**: the pipeline's first-ever
+inference pass is typically much slower than steady state (model/CUDA
+warm-up) — real enough that by the time a throwaway first frame is
+actually processed, the phone has likely moved from where it was captured,
+making that frame a poor session origin. `ToolDispatcher.toolStartWalking()`
+sends exactly one frame on a disposable stream
+(`warmUpWalkingPoseStream()`), awaits the round trip (or a timeout,
+best-effort — proceeds into real walking either way), then discards it by
+letting that stream close and opening a fresh one
+(`startWalkingPoseStream()`) — no server-side code needed for the discard
+itself, since a new `StreamingScanSession` already calls `reset_cloud()` on
+construction. `sendSystemNote()` cues bookend this ("loading" then "ready")
+so Gemini can tell the user walking mode is starting up, then that it's
+live — the one place walking breaks its own "no spoken alerts" convention,
+since this is a one-time session-start event, not an ongoing obstacle
+signal.
+
+**Client (`client/android/app/src/main/java/com/tracking/client/live/`)**:
+- **`HrtfBeacon.kt`** — new `worldPointFrom(pose, azimuthDeg, distanceM):
+  Pair<Float, Float>`, the exact inverse of the existing `directionTo()`:
+  rotates a floor-plane forward vector by the pose's quaternion (direct
+  rotation, not `directionTo()`'s conjugate) and offsets by the pose
+  position. Converts a corridor detection's one-shot egocentric reading
+  into the fixed world target the lock holds onto.
+- **`LiveSessionState.kt`** — new `corridorLockTarget: Pair<Float, Float>?`
+  / `corridorDwellStartMs: Long?`, cleared in `reset()` and on a
+  `reset_occurred` signal. `smoothedBeaconAzimuthDeg` is GUIDING-only now.
+- **`ToolDispatcher.kt`** — `startLocalAvoidanceTicks()`'s tick body now
+  branches on mode: GUIDING still calls the unchanged `runAvoidanceTick()`
+  (TraversabilityScorer); WALKING calls the new
+  `runWalkingAvoidanceTick()`, which pulls one frame via `latestFrame()`
+  (the same blur-aware `recentBufferMs` pull guiding/tracking already use —
+  see "Client-side frame selection" above, unaffected by any of this) and
+  feeds it to BOTH `sendWalkingPoseFrame()` (walking's own pose stream,
+  NOT `feedMappingFrame()`/`MainViewModel`'s continuous camera collector —
+  `CameraManager.kt`/`MainViewModel.kt` needed no changes at all) and a new
+  `fetchCorridor()` (`AnalyzeFrame(CORRIDOR)`), then runs the state machine
+  above. `startWalkingPoseStream()`/`stopWalkingPoseStream()`/
+  `sendWalkingPoseFrame()` are fully separate from guiding/scanning's
+  `startMappingStream()`/`feedMappingFrame()` (untouched) — walking owns
+  its own job/channel (`walkingPoseJob`/`walkingPoseChannel`).
+- **Dead-end alert** — `playDeadEndAlert()` uses `android.media.ToneGenerator`
+  (`TONE_SUP_ERROR`, rate-limited via `ALERT_PERIOD_MS`), not a bundled
+  audio asset: confirmed with the user that a genuinely distinct sound was
+  wanted (not just a pulsed version of the existing fluttering-loop
+  corridor tone), and a synthesized tone works out-of-the-box with no audio
+  file to source — can be swapped for a bundled asset later behind the same
+  call site if preferred.
+
+**Known, accepted limitations** (discussed with the user):
+
+- No long-horizon drift correction — this is RTAB-Map's raw odometry
+  (F2M), not a loop-closed graph (walking never pulls `get_cloud()`/runs
+  graph optimization, see `pure_walking` above). Accepted because a lock's
+  lifetime is inherently short (cleared on arrival or dwell-triggered
+  re-evaluation within a handful of metres/seconds) — ordinary VO drift at
+  that horizon is a non-issue.
+- `server_gui.py`'s dashboard was NOT updated in this pass —
+  `_TAB_BY_CLIENT_MODE["walking"]` still pointed at `tab_perception` (a
+  leftover from the fully-stateless design this supersedes), even though
+  walking's `UpdateMapping` traffic already landed in `ActivityMonitor`'s
+  mapping bucket. A real, known gap at the time — fixed in "Grid-planned
+  walking route" below's dashboard note, once walking's `MappingService`
+  usage was no longer a lock-based special case and a straight tab-mapping
+  fix made sense.
+
+### Grid-planned walking route (supersedes the corridor-lock design above)
+
+**Superseded — see "Server-planned walking path + client-side latency
+bridging" below.** Path PLANNING itself (the A* this section describes)
+moved server-side; the client-side `LocalPathPlanner.kt` this section
+introduced is deleted outright, not deprecated. Kept here for history —
+the underlying planning goals (curve around obstacles, prefer open space,
+alert only on a true dead end) are still exactly what the server-side
+planner does now, just relocated.
+
+The corridor-lock design above didn't work in real testing (see its own
+"Superseded" note). Feedback from that testing, addressed by this design:
+
+1. **Bring back a real local occupancy grid**, fed continuously by
+   RTAB-Map every frame — same grid GUIDING already builds — instead of a
+   single-frame "widest open arc" read. Never persisted, and reset far
+   more aggressively on tracking loss than a scan/guiding session would
+   want (0.5s of unbroken loss, was 2.0s — confirmed with the user: the
+   grid is cheap to rebuild, so a fast reset-and-restart beats limping
+   along on stale state while F2M tries to recover).
+2. **Plan an actual path, not a single direction.** The route doesn't need
+   to be straight — it can curve around an obstacle. Walking has no
+   destination, so it always targets a synthetic point straight ahead of
+   the CURRENT pose, replanned from scratch on every grid update (no lock,
+   no dwell timer — a turn is reflected on the very next update).
+3. **Prefer the most open path, not the shortest one** — nudge around an
+   obstacle while keeping distance from it, rather than hugging the
+   nearest edge of a gap.
+4. **Only alert when there is truly no walkable path anywhere in view** —
+   not just because something is detected roughly ahead. A chair a metre
+   to one side with open space elsewhere should never trigger anything.
+
+**Chosen implementation — reuse `LocalPathPlanner` (GUIDING's existing A*)
+wholesale, pointed at a synthetic target instead of a real destination**:
+its clearance-aware cost model (see "Continuous obstacle clearance" above)
+already does exactly #3 — an exponential-decay penalty for low-clearance
+cells means the search naturally prefers a wider gap over a tighter
+shortest path — and its existing closest-approach fallback (see
+"Closest-approach navigation" above) already does exactly #2 — when the
+literal forward target is blocked, A* falls back to the reachable cell
+closest to it, which is exactly "bend the route toward whatever's open" —
+and `findPath()` already returns `null` only when NOTHING is reachable at
+all (start cell blocked, or the search can't expand anywhere), which is
+exactly #4's trigger condition. No new path-search algorithm was needed —
+this whole redesign is almost entirely reusing already-built, already-
+tested machinery differently, not new pathfinding code.
+
+- **Server**: `scan_session.py`'s `pure_walking` flag (SessionMode.WALKING)
+  no longer skips Step 4 (`occupancy_map.update()`/`_merge_voxels()`) — it
+  gets the exact same live grid GUIDING does. `PURE_WALKING_LOST_RESET_S`
+  dropped from 2.0 to 0.5. `mapping_servicer.py`'s `UpdateMapping` no
+  longer special-cases `pure_walking` into a pose-only branch — it flows
+  through the same grid/delta/full_resync logic as GUIDING now, with only
+  two `pure_walking`-specific behaviors left: (a) a `session.last_reset_occurred`
+  check before the normal "no pose yet" gate, which also pops
+  `self._last_full_bounds[location_id]` so the client's next real update is
+  forced to a full resync (the client's own grid is gone too after a
+  reset); (b) skipping `finalize_landmarks_flat()`/snapshot-save at stream
+  close (still never persisted).
+- **Client (`ToolDispatcher.kt`)**: walking now calls the SAME
+  `startMappingStream()`/`feedMappingFrame()` GUIDING/SCANNING use — no
+  more separate pose-only stream, no more warm-up handshake (dropped as
+  unnecessary complexity now that everything is continuously replanned
+  relative to current pose anyway — a stale first position self-corrects
+  within a tick or two, there's no persistent lock to be wrong about).
+  `recomputeRoute()` (already existed, GUIDING-only before) now branches:
+  GUIDING keeps its exact existing FindLandmark-based logic; WALKING
+  computes `HrtfBeacon.worldPointFrom(pose, 0f, WALKING_LOOKAHEAD_M)` (6m)
+  as the target, calls the same `LocalPathPlanner.findPath()`, and either
+  steers toward the result (`steerWalkingBeacon()`, new — points the
+  beacon at `state.navWaypoints[state.navWaypointIdx]`, called after every
+  replan AND after every `checkWaypointProgress()` waypoint advance so it
+  tracks smoothly off fresh pose between full replans) or, on `null`,
+  plays `playDeadEndAlert()` (unchanged tone mechanism, new trigger
+  condition). `checkWaypointProgress()` now also branches — advances
+  `navWaypointIdx`/speaks arrival notes for GUIDING only (matches
+  walking's existing "ambient only, no spoken alerts" design), but
+  re-steers WALKING's beacon on every call regardless. On the mapping
+  stream's `resetOccurred` signal (either mode, though only WALKING ever
+  actually sets it server-side), the collector now clears
+  `mutableGrid`/`lastMappingGrid`/`navWaypoints` and mutes the beacon —
+  the local grid the client had is gone too.
+- **`CameraManager.kt`/`MainViewModel.kt`**: walking rejoined the
+  no-blur-filter mapping-mode frame bucket (reverting the carve-out from
+  "Local reactive HRTF obstacle-dodge") — new `walkingIntervalMs` (default
+  350ms, set from `avoidanceIntervalMs` in `MainViewModel.connect()`)
+  keeps its send rate fast/responsive rather than inheriting guiding's
+  much slower default. `MainViewModel`'s `mappingModeActive` gate and
+  `CameraManager.processFrame()`'s interval selection both now cover
+  `"walking"` alongside `"guiding"`/`"scanning"`. `clearestRecentFrame()`
+  (backing `latestFrame()`) still works for WALKING's own avoidance tick
+  even while in mapping mode — `CameraManager`'s `recentBuffer` is kept
+  fresh unconditionally regardless of `mappingMode`, only the *continuous*
+  `frameFlow` emission is skipped during mapping mode, not the pull-based
+  buffer itself.
+- **Dead code removed**: `AnalysisOp.CORRIDOR`/`CorridorInfo` are left in
+  the proto (marked unused in their own comments — no wire-compat benefit
+  to reclaiming the values) but `find_corridor()` (`traversability.py`,
+  `depth.py`, `perception_servicer.py`) and the whole corridor-lock
+  Kotlin state machine (`LiveSessionState.corridorLockTarget`/
+  `corridorDwellStartMs`, `ToolDispatcher`'s `startWalkingPoseStream()`/
+  `stopWalkingPoseStream()`/`sendWalkingPoseFrame()`/
+  `warmUpWalkingPoseStream()`/`fetchWalkingAnalysis()`) are deleted
+  outright. `traversability.py`'s `_clearance_fan_from_depth()`/
+  `estimate_traversability()`/`dropoff_m` are all still current — see
+  "Hazard warnings" below, which is unaffected by this section's changes
+  except for one trigger simplification it documents itself.
+- **Dashboard fixed** (`server/server_gui.py`) — the tab-gap noted in the
+  superseded corridor-lock section above is now closed:
+  `_TAB_BY_CLIENT_MODE["walking"]` points at `tab_mapping` (was
+  `tab_perception`, stale since before this whole redesign). The old
+  standalone Perception-tab beacon panel (`_render_beacon_polar()`/
+  `_beacon_status()`) was also merged directly into the Mapping tab,
+  alongside the occupancy map — both GUIDING and WALKING steer through
+  that same grid now, so showing the beacon on a separate tab no longer
+  made sense. The Perception tab itself still exists, narrowed to just
+  ad-hoc `run_detection`/`check_obstacle` debug traffic.
+- **Bug fix — `worldToCell()`/`world_to_cell()` truncation** (`LocalPathPlanner.kt`,
+  `live_path_planner.py`): both used `Float/float -> Int` truncation
+  (`.toInt()` / `int(...)`), which rounds TOWARD ZERO, not down — a point
+  just outside the grid's negative edge (e.g. `x - originX == -0.3`) read
+  as cell `0` instead of cell `-1`, silently aliasing an out-of-bounds
+  query onto a real in-bounds cell rather than correctly reading it as
+  unmapped. Since `findPath()`'s very first check is
+  `passable(start)`, a mis-resolved start cell could read the WRONG
+  cell's class and bail out immediately — `LocalPathPlanner.findPath()`
+  returning `null` (WALKING's dead-end alert, silence otherwise) even
+  though the user's actual current position was fine. Both fixed to use
+  `floor()`/`math.floor()` instead.
+
+**Known, accepted limitations** (same horizon as the corridor-lock design
+this supersedes): no long-horizon drift correction (RTAB-Map's raw F2M
+odometry, no loop-closed graph — walking never pulls `get_cloud()`); the
+grid itself has no persistence across a reset (by design — see point 1
+above).
+
+### Server-planned walking path + client-side latency bridging (supersedes grid-planned walking route)
+
+Requested directly by the user, via a detailed written spec, after
+observing that "grid-planned walking route"'s beacon was fully gated on
+the server round trip (RTAB-Map + occupancy update) with no bridging of
+in-between latency, and that walking's fixed "6m straight ahead" target
+made for a stop-and-turn experience rather than a smooth one. The user's
+own framing: the goal is **not** SLAM accuracy — it's a continuously
+stable HRTF steering cue with minimal perceived latency. Two changes
+follow directly from that:
+
+1. **Path PLANNING moves fully server-side.** The occupancy grid was
+   already computed server-side; now the actual route search
+   (`LiveGridPathPlanner`, previously only used by `scan_gui.py`'s debug
+   UI) runs there too and the client receives a ready-to-follow path
+   instead of a grid to search itself. GUIDING: plans toward the
+   `FindLandmark`-resolved destination (client still resolves the name —
+   only the coordinate now also travels to the server). WALKING: plans
+   toward "the farthest open direction within a turn budget" — a NEW
+   server-side heuristic, `find_farthest_open_path()`, since there's no
+   real destination to route toward at all.
+2. **The client bridges the ~1Hz gap between server updates with its own
+   cheap local motion estimate** — frame-to-frame rotation (no scale
+   ambiguity, unlike translation) via monocular Essential-matrix
+   decomposition, and walked distance via Android's built-in step
+   detector + a fixed stride length — so the beacon keeps responding
+   smoothly to a head turn or a few steps without waiting on the network.
+
+**Server — path planning (`scan_server/live_path_planner.py`,
+`server/services/mapping_servicer.py`)**: `find_farthest_open_path(planner,
+start_xz, heading_rad, max_turn_rad=π/2, num_candidates=9,
+probe_range_m=8.0)` (new) reuses `LiveGridPathPlanner.find_path()` as a
+black box rather than a new constrained search — probes `num_candidates`
+goal points spread evenly across `[heading - max_turn, heading +
+max_turn]` at `probe_range_m`, and keeps whichever result has the greatest
+ACTUAL path length (`_path_length()`, cumulative segment length, not
+straight-line distance to the probe — a route that has to detour around
+an obstacle should score on how far it really lets the user walk).
+`find_path()`'s own closest-approach fallback already makes a blocked/
+short candidate score low, and its existing clearance-cost model already
+biases each candidate toward wider corridors, so no new search machinery
+was needed — this is the server-side analogue of the old (reverted)
+per-tick client-side `findMostOpenDirection()`/`castOpenRay()` design (see
+"Local reactive HRTF obstacle-dodge" above for why that got reverted —
+re-deciding a target once per ~1Hz server update, instead of every ~300ms
+client tick, doesn't have that jitter failure mode). Returns `None` only
+if every candidate direction returns `None` (nothing walkable anywhere) —
+WALKING's sole dead-end trigger, matching the user's explicit "only alert
+when there's truly no path" requirement. Verified via synthetic ground-
+truth tests (a long corridor at a turn-budget-respecting angle vs. a
+short dead-end straight ahead; a fully sealed-off start) — same technique
+used elsewhere in this codebase for `traversability.py`'s ground-plane fit.
+`heading_rad` is derived server-side from the session's own RTAB-Map
+pose (new `_pose_heading_rad()` in `mapping_servicer.py` — rotates the
+camera-local forward vector `(0,0,1)` by the pose's rotation matrix into
+world space, `atan2(x, z)`, matching `HrtfBeacon.kt`'s own azimuth
+convention) — no new client-sent heading field needed.
+`MappingServiceServicer.UpdateMapping` builds a `LiveGridPathPlanner` from
+`session.occupancy_map.extract_full_grid()` on every update (not gated on
+`grid_updated` — pose changes far more often than grid structure does, and
+the route needs to originate from the current pose) and branches on
+`session_mode`: `WALKING` → `find_farthest_open_path()`; `GUIDING` with a
+resolved goal → `planner.find_path(pose_xz, goal_xz)`; otherwise → an
+empty path. **The `grid`/`grid_delta` wire fields are still computed and
+sent every update, unchanged** — the client no longer consumes them for
+anything (path search moved server-side), but this was deliberately left
+as-is in this pass rather than also ripping out the delta-sync machinery;
+a real, small, known bandwidth waste worth revisiting in a follow-up, not
+a correctness issue.
+
+**Bug found via the dashboard (once it could actually show the route —
+see the Mapping-tab overlay note below) and fixed: WALKING's route left
+confirmed territory, hugging the edge of the explored area through
+unknown cells.** `probe_range_m` (8m default) is very often farther than
+the currently mapped area actually extends — every candidate goal then
+lands outside the grid's own bounds, `find_path()`'s closest-approach
+fallback (correctly) finds whatever reachable cell gets geometrically
+closest to that unreachable off-map point, and since unknown cells are
+passable-at-a-premium (not blocked), the resulting route can wind along
+the boundary of what's mapped chasing a point that was never actually
+reachable — visibly confirmed by the dashboard's own dashed-orange
+"speculative" route styling. Fixed by adding `confirmed_only: bool` to
+`find_path()` (`live_path_planner.py`): when True, the raw A* path is
+truncated at the first `CLASS_UNKNOWN` cell (new `_truncate_to_confirmed()`
+helper) BEFORE simplification, so the returned route can never leave
+genuinely observed territory (`confirmed` is then always `True`;
+`reached_exactly` reflects whether that confirmed prefix happens to reach
+the goal). `find_farthest_open_path()` now calls `find_path(...,
+confirmed_only=True)` for every candidate — WALKING-only; GUIDING's own
+`find_path()` call is deliberately left unqualified, since flooding into
+unexplored territory is exactly how it's supposed to reach a destination
+that isn't fully mapped yet. Verified via a synthetic test reproducing the
+observed bug shape (a small confirmed blob, a probe point far outside its
+bounds) — confirms every returned waypoint lands on a non-`CLASS_UNKNOWN`
+cell; re-ran the earlier corridor/dead-end synthetic tests too, unaffected.
+
+**Follow-up, requested directly by the user (superseded — see "Directional-
+distance candidate selection" below): candidate selection wasn't
+weighing openness at all, only raw length — a route that hugs a wall for
+longer could beat a shorter route straight through open space.**
+`find_path()`'s own per-cell clearance-cost model only shapes WHICH route
+reaches a GIVEN candidate goal — it never affected WHICH candidate goal
+`find_farthest_open_path()` picked among the `num_candidates` directions
+it probes, since that selection was pure `max(length)`. Fixed two ways,
+confirmed with the user as "prioritize open space over a bit of extra
+length":
+- New `_path_min_clearance(planner, start_xz, waypoints)`
+  (`live_path_planner.py`) — a candidate's BOTTLENECK width: the smallest
+  `clearance_m` value among cells actually along its route, sampled every
+  `planner.resolution` metres along each simplified straight-line segment
+  (not an average — a route that's mostly wide but squeezes through one
+  tight gap is only as safe as that squeeze).
+- `find_farthest_open_path()` now scores each candidate `length * quality`,
+  not `length` alone, where `quality = 1 / (1 + clearance_penalty_scale *
+  exp(-clearance_decay_rate * min_clearance))` — same exponential-decay
+  shape `LiveGridPathPlanner._clearance_multiplier()` already uses for
+  per-cell costing, but with a much GENTLER decay rate (1.5 vs. the
+  per-cell model's 8.0) — the per-cell model only cares about avoiding
+  imminent collision and saturates by ~1m, but candidate SELECTION should
+  keep rewarding a genuinely spacious room over a merely-adequate corridor
+  well beyond that range, per the user's explicit ask.
+- `mapping_servicer.py` also now constructs WALKING's `LiveGridPathPlanner`
+  with `min_path_clearance_m=0.6` (was the default-disabled 0.0) — an
+  additional, steeper A* cost penalty for narrow cells, reinforcing the
+  same preference WITHIN whichever candidate direction is chosen, not just
+  when picking between candidates. Left at the default for GUIDING's own
+  planner instance (now constructed separately per-mode, not shared) — an
+  aggressive narrow-gap penalty there risks failing to route through a
+  real, legitimately narrow doorway on the way to an actual destination.
+
+Verified via a synthetic test: two candidate directions, one a long
+(5.5m) narrow (0.5m-wide) corridor, one a shorter (5.0m) but much wider
+(3m) room — confirmed the wide room wins now (it lost under the old
+pure-length scoring). **Found and fixed a real test-construction mistake
+first**: an initial version of this test bounded the synthetic world with
+`CLASS_OBSTACLE` everywhere outside the carved corridors, which made
+`confirmed_only`'s truncation frontier read an artificially low clearance
+for BOTH candidates equally (right at the edge of any carved region is
+adjacent to "obstacle" by that construction, regardless of the corridor's
+real width) — masking the very difference the test was trying to measure.
+Rebuilt with `CLASS_UNKNOWN` as the default backdrop and explicit
+real walls (`CLASS_OBSTACLE`) only at each corridor's own edges, matching
+how a real partially-explored map actually looks; the fix then measured
+correctly. Re-ran the earlier corridor-preference/dead-end/no-clearance-
+data-fallback tests too — all still pass.
+
+**Directional-distance candidate selection (supersedes the openness-
+weighted `length * quality` scoring above; itself later superseded —
+`find_farthest_open_path()` was deleted outright when WALKING moved to
+`find_natural_path()`'s cost-function search, see "Natural path planner"
+further below)** — requested directly by the user as a deliberate
+simplification: "longest" for
+`find_farthest_open_path()`'s candidate selection no longer means the
+candidate's own raw path length (weighted by clearance or otherwise). It's
+now a two-tier rule:
+1. **Primary — directional distance.** New `_directional_distance(start_xz,
+   end_xz, heading_rad)` (`live_path_planner.py`) — the candidate's NET
+   start→end displacement dotted with the CURRENT heading's own unit
+   vector, i.e. "how far did this candidate actually get me in the
+   direction I'm facing," not the candidate's own (possibly very different)
+   probe angle and not its raw path length. A candidate angled far from
+   center needs a lot of real travel to make much progress along this
+   axis, which naturally penalizes wide-angle candidates relative to ones
+   that go more directly forward — even if the wide-angle one has a longer
+   raw path.
+2. **Tiebreak — shortest actual path.** Among candidates whose directional
+   distance is within `directional_tie_tolerance_frac` (0.01, i.e. 1%,
+   with a small absolute floor so a near-zero/negative best directional
+   distance doesn't collapse the window to nothing) of the best one, pick
+   whichever has the smallest `_path_length()` — pure cumulative length,
+   "accounting for every direction," not just the heading-aligned
+   component. Prefers the more direct/efficient route among near-equally-
+   forward options over one that wanders further off-axis for a marginal
+   edge.
+
+`_path_min_clearance()` and the `clearance_penalty_scale`/
+`clearance_decay_rate` params are deleted outright — no remaining caller.
+The underlying PER-CELL clearance-cost model is unaffected and still
+active (`LiveGridPathPlanner`'s `min_path_clearance_m=0.6` for WALKING,
+set in `mapping_servicer.py`, still shapes WHICH route reaches a GIVEN
+candidate goal) — only the top-level candidate-selection formula changed.
+Verified via two synthetic tests: (1) a straight-ahead 5m corridor beats
+an 85°-angled 8m corridor (directional distance 5.0 vs. 0.8, despite the
+8m one being the longer RAW path — confirms directional distance, not raw
+length, is now primary); (2) a straight-ahead 5.0m corridor beats a
+15°-angled 5.3m corridor whose directional distance (5.10) is within
+tolerance of the straight one's (5.00) — confirms the shorter path wins
+the tiebreak once directional distances are close. Re-ran the existing
+dead-end (fully sealed-off start → `None`) test too, unaffected.
+
+### RTAB-Map confidence weighting skipped for WALKING (`scan_session.py`)
+
+Requested directly by the user: WALKING needs an immediately-usable
+occupancy grid for real-time navigation, not scan-grade caution about a
+momentarily-uncertain frame. `process_frames_batch()`'s Step 4 still
+COMPUTES the same per-batch depth-consistency confidence as before
+(`batch_confidence = mean(1 - frac_bad)` across the batch's frames) and
+still surfaces it via `self.last_batch_confidence` (e.g. `server_gui.py`'s
+dashboard "confidence=" text is unaffected) — but the value actually fed
+into `occupancy_map.update(..., confidence=...)` (the WEIGHT that scales
+how much a hit/miss moves a cell's log-odds belief, see occupancy_map.py's
+"Confidence-weighted occupancy updates" note) is now forced to `1.0` for
+`pure_walking` specifically (`update_confidence = 1.0 if pure_walking else
+batch_confidence`). A real obstacle now registers at full log-odds
+strength on a single walking-mode hit, rather than needing several
+confirming hits to reach the same belief a full-confidence hit already
+would — matching the user's explicit "we need immediate navigation, take
+all into account" framing. GUIDING and SCAN are unaffected — they still
+use the real computed `batch_confidence` (unchanged), since neither has
+WALKING's same "must react to a single frame, right now" requirement.
+
+**Reported by the user from a live run: the route (both on the occupancy
+map AND — more tellingly — the frame overlay, which showed NOTHING at
+all despite a wide-open, obviously-walkable floor) didn't align with
+their actual facing direction.** Investigated as far as possible without
+device access:
+- Re-verified `_pose_heading_rad()` (`mapping_servicer.py`) and
+  `_project_world_to_pixel()` (`server_gui.py`) against EACH OTHER with a
+  proper non-identity-rotation synthetic test (several yaw angles, not
+  just the identity-rotation case the original frame-overlay test used,
+  which is blind to any rotation-direction/order bug) — a "straight
+  ahead" probe point constructed from the computed heading always
+  projects to dead-center in the frame, for every tested yaw. The two
+  functions are mutually self-consistent; if there's a bug, it's not in
+  how they interact.
+- That leaves two real possibilities, either of which the frame showing
+  NOTHING at all (not even a partial/off-center line) is consistent with:
+  (a) RTAB-Map's actual pose convention doesn't match what's assumed
+  (camera-to-world, X-right/Y-down/Z-forward) despite that being
+  established elsewhere in this codebase, or (b) `ground_y` (a single
+  scalar estimate, not a per-point measurement) is inaccurate enough that,
+  combined with camera pitch, it flips the FULL 3D camera-local Z
+  negative for points that are genuinely in front of the user
+  horizontally — a failure mode the original identity-rotation-only test
+  couldn't have caught, since it always passed `ground_y == pose.y`
+  (zero Y delta).
+- **Fixed (b) regardless of which is the true cause**: `_project_world_to_pixel()`'s
+  "is this point visible" decision is now HORIZONTAL-ONLY (dot product of
+  the world delta against the camera's own floor-plane forward direction —
+  the same computation `_pose_heading_rad()` does), decoupled from the
+  full 3D projection. `ground_y` is still used for vertical (v) pixel
+  placement, but an inaccurate value now degrades to "drawn at the wrong
+  height" instead of "silently dropped entirely." Verified via a
+  synthetic test: a deliberately absurd `ground_y` (50m off) combined
+  with a modest 15° camera pitch no longer drops a genuinely-in-front
+  point (it draws off-screen vertically instead, which is the honest
+  degrade), while a point truly behind the user is still correctly
+  rejected.
+- **Not resolved**: whether (a) is also true is still open — added a
+  one-shot-per-batch console diagnostic in `mapping_servicer.py`
+  (`heading_rad` in both radians and degrees, `pose_y`, `ground_y`, and
+  the resulting path-point count) specifically so the next live run's
+  console output can be compared against the user's own real-world sense
+  of which way they were facing, to localize the mismatch precisely
+  rather than guessing further from this environment.
+
+**Proto (`tracking.proto`)** — `MappingChunk` gained `has_goal`/`goal_x`/
+`goal_z` (GUIDING only, set once `FindLandmark` resolves a destination;
+left unset for WALKING). New `PathPoint`/`PlannedPath` messages
+(`points`, `confirmed`, `reached_exactly` — mirrors `find_path()`'s own
+return shape). `MappingUpdate` gained `frame_timestamp_ns` (echoes back
+whichever `MappingChunk` this update was computed from — see latency
+compensation below) and `planned_path`.
+
+**Client — rotation tracking (`RotationTracker.kt`, new)**: mirrors
+`TrackingBackend.kt`'s existing on-device ORB detect/match pattern (same
+`ORB.create`/`BFMatcher` calls, same JPEG→gray decode) but computes
+`Calib3d.findEssentialMat` + `Calib3d.recoverPose` between consecutive
+frames instead of a Homography for a 2D box — confirmed both are present
+in the `org.opencv:opencv:4.11.0` AAR this project already ships (checked
+via `javap` against the actual jar before writing this). Deliberately
+rotation-only: monocular vision has no scale for translation (`recoverPose`'s
+`t` output is discarded), but rotation decomposition has no such ambiguity
+— exactly as metrically correct as RTAB-Map's own rotation. Uses the same
+"no real calibration, guess a pinhole K" convention
+(`fx=fy=0.8*max(w,h)`) `HrtfBeacon.kt`'s `directionFromBox()` and
+`server/tools/depth.py`'s `_estimate_K` already established. Maintains an
+internal accumulated-rotation-since-reset quaternion
+(`accumulatedRotation()`/`resetAccumulator()`), composed via `newAccum =
+oldAccum ⊗ conjugate(recoverPose's R, as a quaternion)` — **not verified
+against a live device**: `recoverPose`'s `R` maps a point in the
+PREVIOUS frame's camera coordinates into the CURRENT frame's, the
+opposite direction needed to compose onto a running world-frame
+orientation, hence the conjugate; if a head turn ever sounds mirrored on
+a real device, this composition is the first thing to check.
+
+**Client — translation estimate (`PdrStepEstimator.kt`, new)**: registers
+Android's built-in `Sensor.TYPE_STEP_DETECTOR` directly (confirmed via
+codebase search that `ImuSensor.kt`/`ImuRecorder.kt` are orphaned dead
+code — never instantiated anywhere in the live app, shaped for offline
+accel/gyro CSV export, not step counting — so this is a small
+purpose-built listener instead of resurrecting them). `distanceSinceReset()
+= stepsSinceReset * STRIDE_LENGTH_M` (fixed at `0.7f` — no per-user stride
+model, matching the user's own "centimetre accuracy is unnecessary"
+framing; the error only ever has to survive the ~1s gap before the next
+authoritative server fix corrects it, per the design below, so it never
+gets the chance to accumulate the way a full PDR session's would).
+
+**Client — combining the two (`HrtfBeacon.extrapolate()`, new)**: given an
+authoritative server `Pose`, a rotation-delta quaternion, and a walked
+distance, returns a best-current-estimate `Pose` — composes the rotation
+(`authoritative.quat ⊗ rotationDelta`, derived to be consistent with
+`RotationTracker`'s own accumulation convention above) and walks the
+distance along the NEW (rotation-updated) heading, not the stale
+authoritative one (negligible difference over the short bridge window,
+and the more correct choice of the two). `worldPointFrom()` (walking's old
+synthetic-target helper) is deleted outright — dead once server-side
+planning took over target selection.
+
+**Client — latency compensation (`ToolDispatcher.kt`,
+`LiveSessionState.PoseSendSnapshot`)**: the server's `update.pose`
+describes whichever frame carried `update.frameTimestampNs` — already
+slightly stale by network + RTAB-Map/DA3 processing time by the time the
+response arrives. `buildMappingChunk()` snapshots
+`rotationTracker.accumulatedRotation()`/`pdrStepEstimator.
+distanceSinceReset()` into `state.poseSendHistory` (a bounded
+timestamp-keyed buffer) at the moment each chunk is actually sent. When
+the matching `MappingUpdate` arrives, the mapping-stream collector looks
+up that snapshot, computes the ADDITIONAL rotation/distance accumulated
+since THAT send (`deltaSinceSend = conjugate(accumAtSend) ⊗ accumNow`,
+`distanceSinceSend = distanceNow - distanceAtSend`), and fast-forwards
+`update.pose` by that amount via `HrtfBeacon.extrapolate()` rather than
+accepting the server's pose as "now" outright. Both estimators'
+accumulators reset to zero at this point — a fresh bridging window starts
+for the next gap. Buffer entries at/before the consumed timestamp are
+pruned.
+
+**Client — path-following (`PathPursuit.kt`, new)**: replaces
+`LocalPathPlanner.kt`'s role entirely (deleted outright, along with
+`MutableOccupancyGrid.kt` — the client no longer holds a local grid at
+all now that it doesn't search one). Pure stateless polyline geometry, no
+search: `nearestPointOnPath()` projects the current (extrapolated)
+position onto the path (clamped per-segment, not the infinite line) and
+returns the projection's cumulative arc-length; `advanceAlongPath()` walks
+forward from that arc-length by a configurable look-ahead
+(`PATH_LOOKAHEAD_M = 0.4f`, the middle of the user's suggested 30-50cm
+range), clamping at the path's end. Matches the user's own spec exactly:
+"compute the closest point on the path, project onto it, move forward by
+a small look-ahead distance" — the beacon target is always a point ON the
+path, sliding forward continuously as the user progresses, never a fixed
+waypoint index and never off the path.
+
+**Client — unified steering (`ToolDispatcher.kt`)**: `runAvoidanceTick()`
+(GUIDING's old goal-biased `TraversabilityScorer` dodge) and
+`runWalkingAvoidanceTick()`/`recomputeRoute()`/`steerWalkingBeacon()`/
+`checkWaypointProgress()` (WALKING's old grid-planned-route driving code)
+are ALL deleted, replaced by one `runUnifiedAvoidanceTick()` +
+`steerBeaconAlongPath()` pair used by BOTH modes: the server-planned path
+is already obstacle-aware (searched against the occupancy grid's own
+clearance costs), so there's no separate local re-scoring needed any
+more — a local dodge on top of an already-obstacle-aware path could also
+push the beacon off the path, which contradicts the user's explicit "must
+never leave the path" requirement. `TraversabilityScorer.kt` is deleted
+outright as a result (no remaining caller). The step-down/drop-off hazard
+check (`checkAndWarnHazard()`) is unrelated to steering and unaffected —
+still runs every tick for both modes via the same
+`AnalyzeFrame(TRAVERSABILITY)` call, now serving only that purpose (not a
+steering input) for GUIDING too, matching WALKING's already-established
+design. GUIDING's arrival announcement moves to a new
+`checkGuidingArrival()` (distance from the extrapolated position to the
+path's final point, one-shot per destination via `guidingArrivalAnnounced`)
+since there's no more discrete waypoint index to advance past.
+
+**Known, accepted limitations / open risks** (discussed above inline,
+collected here):
+- Rotation composition order (`RotationTracker`'s conjugate convention) is
+  derived, not device-verified — flagged as the first thing to check if a
+  head turn ever sounds mirrored.
+- Fixed stride length, no per-user gait model — acceptable per the user's
+  own framing, since the bridging window is short enough that the error
+  never compounds across a whole session the way general PDR positioning
+  would.
+- `find_farthest_open_path()`'s candidate-cone approach is a v1 heuristic,
+  not an exact "maximize walkable distance under a turn budget" search.
+- `grid`/`grid_delta` are still computed and sent server-side even though
+  the client no longer reads them — a real, small, deliberately-deferred
+  cleanup, not a correctness bug.
+- Not verified end-to-end on a real device/RTAB-Map rig from this
+  environment — compile-verified only (`./gradlew :app:compileDebugKotlin`,
+  `python3 -m py_compile`), same caveat as every round of this feature's
+  development.
+
+### WALKING route-selection redesign — straight-ahead-first, morph-around, minimal joints
+
+**Superseded — see "Natural path planner (heading-biased, turn-averse A*)"
+below.** The two-stage straight-ahead/cone-fallback heuristic this section
+describes (`find_farthest_open_path()`) has been deleted outright, not
+deprecated — the user requested a full replacement with a proper cost-
+function-driven search after finding this heuristic still wasn't producing
+a natural-feeling route (see that section for the full spec and design).
+Kept here for history — the underlying goals (prioritize heading, morph
+around obstacles, minimal joints) are unchanged, just achieved differently
+now (an actual weighted cost function baked into a direction-aware search,
+not a discrete probe-and-pick heuristic).
+
+Reported directly by the user from the dashboard: the WALKING route was
+visibly favoring a diagonal detour along the edge of the mapped area
+instead of continuing straight in the user's actual facing direction, even
+when the floor straight ahead was open. Root cause: the old
+`find_farthest_open_path()` always ran its full multi-candidate cone
+search and picked purely by directional-distance-then-length across ALL
+candidates — nothing in that scoring gave the exact-heading candidate any
+priority over a diagonal one that happened to score marginally higher, so
+a modest score edge for an angled candidate could win even when straight
+ahead was perfectly walkable.
+
+**Redesigned as a two-stage strategy in `find_farthest_open_path()`
+(`scan_server/live_path_planner.py`), confirmed directly with the user**:
+1. **Stage 1 — straight ahead, always tried first.** A single
+   `find_path(start_xz, straight_target, confirmed_only=True)` toward a
+   target `probe_range_m` directly along `heading_rad`. A*'s own
+   clearance-cost model already bends this route around a SINGLE obstacle
+   in the way while still reaching as far forward as it can — this alone
+   is "morph the path around a blockage but keep heading the same general
+   direction," no separate logic needed. If the result makes at least
+   `min_forward_progress_frac` (0.35) of `probe_range_m` worth of real
+   forward progress (`_directional_distance()`), it's returned directly —
+   no cone search at all, so the user's own heading stays centered in the
+   route whenever there's any reasonable way to honor it.
+2. **Stage 2 — cone fallback, only when straight-ahead is missing or too
+   shallow** (a real wall-like blockage dead ahead): the previous
+   multi-candidate probe + directional-distance-primary/length-tiebreak
+   selection, unchanged in mechanism — this is the "turn to another
+   direction if needed" case. Straight-ahead's own (too-shallow) result is
+   also compared against the winning fallback candidate on the same terms
+   before deciding, so a straight sliver that's still objectively better
+   than every turn option isn't discarded just for having triggered the
+   fallback path.
+
+Both stages still call `find_path(..., confirmed_only=True)` — unchanged
+from before, still needed so a route never leaves genuinely observed
+territory (see the existing "Bug found via the dashboard" note above this
+section). Verified via synthetic grids: a fully open field returns a
+single straight waypoint (1 joint); a small obstacle centered dead ahead
+with open space on both sides returns a 3-waypoint route that goes around
+it while still reaching the full forward distance; a full-width wall
+straight ahead correctly falls back and, when one side has a real opening
+(an L-shaped corridor), turns into it while still maximizing forward
+progress.
+
+**Minimum-joints polyline (`LiveGridPathPlanner._simplify()`)**: added
+`SIMPLIFY_COST_SLACK_FRAC` (0.08) — the existing cost-aware string-pulling
+only used to drop a waypoint when the straight-line shortcut cost NO MORE
+than the original zig-zag route it replaces; now it also drops a waypoint
+when the shortcut costs up to 8% more. Requested directly by the user
+("choose a polyline path with as minimum joints as possible") — a blind
+user following a beacon benefits far more from fewer, clearer turns to
+react to than from an A*-optimal (but jointier) polyline, and the existing
+clearance-cost model already keeps a shortcut route from actually hugging
+an obstacle (a straight line through a tight, low-clearance gap costs
+enough to fail the slack check on its own). Still current — `_simplify()`
+is shared by both `find_path()` (GUIDING) and `find_natural_path()`
+(WALKING, below).
+
+### Natural path planner (heading-biased, turn-averse A*) — supersedes WALKING route-selection redesign
+
+Requested directly by the user via a fully-specified planner design (a
+priority-ordered objective list, an explicit weighted cost formula, and an
+explicitly recommended architecture: distance-transform clearance -> A*
+with heading/clearance/turn costs -> polyline simplification) after the
+straight-ahead/cone-fallback heuristic (previous section) still wasn't
+producing the route an orientation & mobility instructor would choose.
+**`find_farthest_open_path()` is deleted outright** (not deprecated) —
+`LiveGridPathPlanner.find_natural_path()` (`scan_server/live_path_planner.py`)
+replaces it entirely as WALKING's target/route strategy. GUIDING's own
+`find_path()` (toward a real destination) is completely unaffected — this
+whole redesign is WALKING-only.
+
+**The user's stated priority order** (highest to lowest): (1) continue in
+the current heading whenever safely possible; (2) stay near the center of
+wide free space; (3) maintain comfortable obstacle clearance; (4) delay
+turning until forward progress is genuinely blocked; (5) minimize turn
+count; (6) minimize total turn angle; (7) minimize path length. The
+planner must never sacrifice a higher priority to improve a lower one.
+
+**Architecture — a direction-augmented Dijkstra, not a plain cell-only
+A***: a normal grid A* (like `find_path()`'s own `_astar()`) has no way to
+penalize TURNING, only which cell a step lands in — there's no notion of
+"the direction I was already moving in." `find_natural_path()`'s search
+state is `(row, col, incoming_direction)` instead of just `(row, col)`,
+letting each edge's cost depend on whether that step continues straight or
+changes direction. This is the "custom A* cost: heading bias + clearance
+reward + turn penalty + corridor-center preference" the user's own
+recommended architecture called for — implemented as one additive
+weighted cost per edge, mirroring their formula almost verbatim
+(`_natural_step_cost()`):
+
+```
+step_cost = 10 * heading_error      (quadratic, see below)
+          +  8 * obstacle_proximity  (0 once clearance >= safe_clearance_m)
+          +  7 * turn_count          (flat, only when direction changes)
+          +  5 * turn_angle          (proportional to how sharp the turn is)
+          +  2 * path_length         (real metres, class-tier-weighted)
+```
+
+- **Heading bias**: `heading_error = |wrap(step_azimuth - heading_rad)|`,
+  penalized as `W_HEADING * (heading_error / pi) ** 2` — quadratic, so 0
+  deg is free, 15 deg is tiny (~0.07), 30 deg moderate (~0.28), 60 deg
+  large (~1.11), 90 deg very large (~2.5), matching the user's own example
+  bands. Backward motion (180 deg) isn't specially prohibited — at ~10
+  per step it's simply expensive enough, accumulated over any real
+  backward-biased route, that it's "almost never selected unless no other
+  route exists" purely as an emergent consequence of the search always
+  finding the minimum-TOTAL-cost path.
+- **Obstacle proximity / corridor-centering, same term**: reuses the
+  EXISTING `clearance` field (`scipy.ndimage.distance_transform_edt`,
+  already computed by `occupancy_map.py` for `find_path()`'s own clearance
+  shaping) rather than a second distance-transform pass. `proximity = 0`
+  once a cell's own clearance already meets `safe_clearance_m`, else
+  `(1 - clearance/safe_clearance_m) ** 2` (steep, not linear — "maintain
+  COMFORTABLE clearance" reads as more than a soft nudge once you're
+  actually close). No separate "stay centered" logic exists or is needed:
+  a corridor's centerline is exactly where clearance — and therefore this
+  term's cost — is locally lowest, so the search is pulled there for free.
+- **Turn count + turn angle, two separate terms**: a flat `W_TURN_COUNT`
+  the instant a step's direction differs at all from the previous step's,
+  PLUS `W_TURN_ANGLE * (turn_angle / pi)` scaling with how sharp that turn
+  actually is — a 45 deg jog costs less than a 135 deg near-reversal, but
+  even the gentlest turn still pays the flat per-turn cost, matching
+  "prefer `──────────────┐│` over `──────╱────╲────`" even when the
+  zigzag is shorter.
+- **Path length, deliberately the smallest weight**: real distance in
+  metres, tiered by the SAME `_COST_BY_CLASS` traversability multiplier
+  `find_path()`'s A* uses (a step-over cell costs more per metre than
+  plain ground) — but only ever a tie-breaker in practice, never a
+  deciding factor on its own, per the user's explicit ordering.
+- **"Delay turning until forced" and "prefer few gentle turns over a
+  shorter zigzag" are NOT special-cased anywhere** — they're an emergent
+  property of a turn-penalized shortest-path search: turning earlier or
+  more often than strictly necessary always costs strictly more for zero
+  benefit, so the minimum-cost path to any given point naturally goes as
+  straight as possible for as long as possible. No extra logic was needed
+  to implement these two priorities specifically — confirmed by the
+  synthetic tests below never observing an unnecessary early/extra turn.
+
+**Obstacle "inflation" — implemented as cost, not a hard block, a
+deliberate departure from the user's literal suggested pipeline step**:
+the recommended architecture said "inflate obstacles" as a preprocessing
+step. A LITERAL hard-block inflation (marking every cell within
+`safe_clearance_m` of an obstacle as impassable) would contradict this
+codebase's established, repeatedly-reaffirmed "never hard-block a
+genuinely narrow gap, only discourage it" philosophy (see
+`min_path_clearance_m`'s own docstring, `grid_path_planner.py`'s
+clearance-cost note) — a real doorway or narrow hallway narrower than
+`safe_clearance_m` would become completely unreachable rather than merely
+discouraged. The `obstacle_proximity` cost term above achieves the same
+practical effect (strongly avoid getting close to obstacles) while
+preserving the "still usable as a genuine last resort" property this
+project consistently chooses elsewhere.
+
+**Search region — a literal spatial cone, escalating**: expansion is
+pruned to cells whose BEARING FROM THE START (not from the current cell —
+a region constraint, distinct from the per-step turn-angle cost above)
+falls within the current stage's cone half-angle of `heading_rad`. Starts
+at 45 deg per the user's spec; if that yields nothing OR only a sliver of
+real forward progress (less than `min_progress_frac`, 0.3, of
+`max_distance_m`), escalates to 90 deg, then 180 deg. **The
+"only escalate on a sliver of progress, not just on zero" refinement was
+a fix found during testing**: an initial version escalated only when a
+narrower cone found NOTHING AT ALL — but a corridor with a metre or two of
+real open floor before a full-width wall would "succeed" at 45 deg (SOME
+path exists) and never even look for a real opening off to the side,
+which isn't what "only turn when genuinely blocked" means. Since every
+wider cone's reachable set is a strict superset of a narrower one's (same
+edges, plus more), escalating never discards a better result already
+found. The widest attempted stage's own result — even if still short of
+`min_progress_frac` — is always returned rather than `None`, matching this
+codebase's established "closest-approach beats no answer" philosophy;
+`None` (WALKING's dead-end trigger) is reserved for truly nothing
+reachable at all, even at 180 deg.
+
+Expansion never crosses into a still-unexplored (`CLASS_UNKNOWN`) cell —
+pruned directly during expansion now, rather than via the old
+`find_path(confirmed_only=True)` post-hoc truncation, which was removed
+outright alongside `find_farthest_open_path()` since nothing else called
+it (`_truncate_to_confirmed()` deleted too). This preserves the same
+"never leave confirmed territory" bug fix that parameter existed for (see
+the earlier "Bug found via the dashboard" note).
+
+**Target selection**: among every cell the search actually reaches within
+`max_distance_m`, pick whichever has the greatest `_directional_distance()`
+progress along the heading axis — not the farthest by raw distance, not
+the cheapest by cost alone. Since edge cost already strongly penalizes
+heading deviation and turning, the cell that progresses farthest ALONG
+THE HEADING axis naturally tends to be the one reached via the straightest,
+safest available route — this single criterion is what replaces the old
+two-stage straight-then-cone-fallback heuristic with one continuous
+decision. Ties (same directional distance) are broken implicitly by
+whichever state the search SETTLED first (heap-pop/cost order), which
+tends to favor the cheaper of two equally-far options with no extra code
+needed for an explicit tiebreak.
+
+**Verified via synthetic grids** (same technique used throughout this
+project — hand-built occupancy grids with a real `scipy.ndimage.
+distance_transform_edt`-computed `clearance` field, not just class labels):
+a fully open field returns a single straight waypoint (0 turns); a small
+obstacle centered dead ahead with open space on both sides morphs around
+it (2 waypoints, 1 turn) while still reaching ~full forward distance; a
+full-width wall with an opening far to one side correctly escalates
+through the cone stages and turns into the opening (confirming the
+sliver-of-progress escalation fix actually works, not just the
+zero-progress case); a wall positioned closer than `safe_clearance_m` to
+the starting position causes the route to drift toward the open side for
+comfortable clearance (confirming corridor-centering emerges from the
+clearance-cost term with no separate centering logic); a start cell fully
+boxed in by obstacles on all 8 sides correctly returns `None`.
+
+**mapping_servicer.py** — the WALKING branch now constructs a plain
+`LiveGridPathPlanner(grid_for_planning)` (no `min_path_clearance_m` —
+`find_natural_path()` doesn't use `_cost()`/`_clearance_multiplier()` at
+all, it has its own independent `safe_clearance_m` concept) and calls
+`planner.find_natural_path(pose_xz, heading_rad, max_distance_m=
+_WALKING_MAX_PLANNING_DISTANCE_M, safe_clearance_m=_WALKING_SAFE_CLEARANCE_M)`
+— `_WALKING_MAX_PLANNING_DISTANCE_M` (5.0m, the middle of the user's
+"typically 4-6m" spec) and `_WALKING_SAFE_CLEARANCE_M` (0.5m, repurposed
+from the old `_WALKING_MIN_PATH_CLEARANCE_M` constant) replace the old
+`_WALKING_MAX_TURN_RAD`/`_WALKING_MIN_PATH_CLEARANCE_M` pair. `heading_rad`
+(`_pose_heading_rad()`) is unchanged — still computed unconditionally per
+update (see "Facing-direction GUI indicator" below), still what feeds this
+planner. GUIDING's own `LiveGridPathPlanner(grid_for_planning)` +
+`find_path(pose_xz, current_goal_xz)` call is completely untouched.
+
+**Known, accepted limitations** (not yet verified live):
+- Not verified end-to-end on a real device/RTAB-Map rig — synthetic-grid-
+  verified only (`py_compile` + the hand-built-grid tests above), same
+  standing caveat as every round of this feature's development. Whether
+  the route "feels natural" in practice, and whether `min_progress_frac`/
+  `safe_clearance_m`/the weight constants need real-world tuning, is
+  unverified from this environment.
+- The direction-augmented search visits up to (cells within
+  `max_distance_m` of start, bounded further by the cone) × 8 direction-
+  states — bounded and Python-`heapq`-based like `find_path()`'s own A*,
+  but a genuinely large explored area combined with a wide (180 deg)
+  escalation could cost more per update than the old heuristic's fixed
+  9-candidate probe did. Not benchmarked against a live RTAB-Map grid from
+  this environment.
+- `cone_stages_deg`/`min_progress_frac` are call-site defaults on
+  `find_natural_path()`, not yet independently GUI-tunable the way
+  `min_path_clearance_m` is exposed in `scan_gui.py`'s own settings — a
+  reasonable follow-up if real-world tuning turns out to be needed.
+
+**Follow-up round, from a real live-device screenshot** (heading arrow now
+confirmed pointing the right way — see "Facing-direction GUI indicator"
+below — but the route itself was hugging one obstacle despite clearly more
+open space on the other side; the joint count already looked reasonable
+and needed no change; and a serious HRTF-placement bug was found while
+checking the beacon marker's position against the route):
+
+**1. Corridor-centering gap, fixed** — `_natural_step_cost()`'s
+`obstacle_proximity` term originally had a hard cutoff: ANY cell whose
+clearance already met `safe_clearance_m` cost exactly 0, so a cell 0.6m
+from a wall and one 3m from a wall (much more open) scored IDENTICALLY —
+nothing ever pulled the route toward the wider side of a room once the
+bare minimum was satisfied, which is exactly what let it hug close to one
+obstacle with far more open space just to the other side. Fixed by
+splitting the term into two: the original hard-cutoff `steep` component
+(priority #3, "maintain comfortable clearance") stays, PLUS a new `soft`
+component with no cutoff at all — a gentle, always-active exponential
+decay (`SOFT_CLEARANCE_DECAY_RATE=1.5`, deliberately much gentler than
+`_clearance_multiplier`'s own `CLEARANCE_DECAY_RATE=8.0`, which is tuned
+for "avoid imminent collision" and is negligible past ~1m — this needs to
+keep discriminating over several metres of open room) that genuinely
+implements priority #2 ("stay near the center of wide free space") as an
+always-active preference, not just a threshold. Verified via a synthetic
+asymmetric-room test: a wall close on one side, wide open space on the
+other — the route now visibly drifts toward the open side instead of
+running parallel to the wall at a constant offset.
+
+**2. Polyline joint count — confirmed already correct, no change made.**
+Re-checked against the user's own "1-3 joints is fine, more starts to feel
+taxing" guidance: the existing synthetic tests already produce 1 joint
+(open field), 2 (single obstacle morph), and 3 (wall with a real opening)
+— already inside the stated comfortable range. `SIMPLIFY_COST_SLACK_FRAC`
+left unchanged.
+
+**3. HRTF beacon placement bug — a real navigation bug, not just a
+dashboard display quirk.** Investigating "why does the beacon marker sit
+so far up the route instead of close to the user" found the actual root
+cause: `nearest_point_on_path()`/`advance_along_path()`
+(`live_path_planner.py`'s Python mirror AND `PathPursuit.kt`, the real
+on-device logic they mirror) only ever operate on whichever segments are
+IN the `path` list passed to them — and the server's own waypoints NEVER
+include the start position (documented convention throughout this
+codebase). This means the very first leg (start -> first real waypoint)
+never existed as a segment to project onto/advance along at all; worse, a
+path that collapsed to a SINGLE waypoint (which `find_natural_path()`'s
+new minimal-joint design produces often — see the "open field" test
+above) hit both functions' `len(path) == 1` special case, which returns
+`path[0]` directly, ignoring the current position and the look-ahead
+distance ENTIRELY — placing the beacon straight at the far target instead
+of a short lookahead ahead of the user. This is exactly the symptom in
+the screenshot (magenta marker sitting at the route's far end).
+
+Fixed on BOTH sides by prepending the pursuit's actual starting position
+to the path BEFORE calling `nearestPointOnPath()`/`advanceAlongPath()` —
+not inside those functions themselves (kept as generic, unchanged
+utilities, still exact mirrors of each other):
+- **Client (`ToolDispatcher.kt`)**: the mapping-stream collector now sets
+  `state.plannedPath = listOf(update.pose.x to update.pose.z) +
+  rawWaypoints` (only when `rawWaypoints` is non-empty — an empty path
+  stays empty, preserving the existing dead-end-mute detection via
+  `plannedPath.isEmpty()`). Critically, this anchor is a FIXED point,
+  captured ONCE per `MappingUpdate` (the authoritative `update.pose` the
+  server actually planned from), not re-added every `steerBeaconAlongPath()`
+  tick — re-adding a FRESH (moving) pose every tick was considered and
+  rejected: since the newly-prepended point would always be at distance
+  0 from itself, it would trivially "win" the nearest-point search every
+  single time regardless of real progress, which would break correct
+  progression along a genuine multi-waypoint route (the beacon would
+  never advance past treating "toward waypoint 1" as the target, even
+  after the user had already walked past it toward waypoint 2). A FIXED
+  anchor avoids this: real distance-based nearest-point search against the
+  REST of the path still works exactly as before once the user has
+  genuinely progressed past the first leg.
+- **Server (`mapping_servicer.py`)**: the dashboard-only `beacon_point`
+  mirror prepends `pose_xz` fresh on every call instead — safe here
+  (unlike the client) because this is a single-instant snapshot
+  calculation, not a repeated per-tick one; `pose_xz` and the path are
+  always from the exact same `MappingUpdate`, never re-anchored across
+  ticks.
+
+**4. HRTF distance/loudness was never real — also fixed.** Checking
+whether the beacon's perceived distance ("should sound different than
+close one") was correct surfaced a second, independent gap:
+`HrtfBeaconPlayer.updateDirection(azimuth, elevation, distanceM)` already
+computes a real distance-based gain falloff (`overallGain = (1 -
+distanceM/MAX_RANGE_M).coerceIn(...)`) — but `steerBeaconAlongPath()` was
+passing the FIXED `beaconRadiusM` constant (6f) into it instead of any
+REAL distance, so the beacon's loudness NEVER actually varied with true
+proximity to anything, regardless of how close or far the target really
+was. Fixed: `steerBeaconAlongPath()` now computes a real distance via
+`HrtfBeacon.directionTo(pose, gx, gz).distanceM` where `(gx, gz)` is
+`state.plannedPath.last()` — the path's actual FINAL point (the real
+destination for GUIDING, or how far the currently-planned route reaches
+for WALKING), NOT the short look-ahead steering point used for azimuth.
+This distinction is deliberate: the look-ahead point is always ~
+`PATH_LOOKAHEAD_M` (0.4m) away by construction, so ITS real distance would
+barely vary tick to tick and wouldn't communicate anything meaningful — the
+path's actual endpoint is a genuine, continuously-varying "how far is
+there left to go" signal, while azimuth still comes from the look-ahead
+point for smooth, responsive steering. `beaconElevationDeg`/`beaconRadiusM`
+(ToolDispatcher constructor params) are left declared but unused by this
+path now — not removed, since they're still user-settable via
+`SettingsScreen` and could matter again if tracking mode's own beacon path
+(a separate call site, `directionFromBox()`-driven, unaffected by any of
+this) is ever revisited. Not verified end-to-end on a real device from
+this environment — the gain curve itself (`MAX_RANGE_M=15f`,
+`MIN_GAIN`/`MAX_GAIN`) was not retuned, only fed real data for the first
+time.
+
+**5. Dashboard layout — beacon graph now side by side with BOTH detail
+boxes** (`server_gui.py`'s Mapping tab): requested directly by the user.
+The mapping Detail textbox used to be its own full-width row between the
+frame/occupancy-map row and the beacon row; now the beacon polar plot
+shares one `gr.Row()` with a single column holding BOTH the mapping detail
+and the beacon detail textboxes stacked together, instead of the mapping
+detail floating alone above the beacon section.
+
+### Facing-direction GUI indicator (dashboard display only)
+
+Requested directly by the user, in the middle of debugging whether the
+WALKING route/heading was actually wrong (see the two entries above and
+below) — a direct visual answer to "which way does the server think the
+user is currently facing," so it can be compared at a glance against the
+route and the actual camera frame instead of only inferred from console
+`heading_rad` prints.
+
+`_pose_heading_rad(pose_mat)` (`mapping_servicer.py`) is now computed
+UNCONDITIONALLY per update (previously only inside the WALKING branch,
+for `find_farthest_open_path()`'s own use) and passed into
+`record_mapping()` as `heading_rad` — `None` on a `pure_walking` RESET
+update (stale, same reasoning as clearing `planned_path`/`beacon_point`
+there). `server_gui.py` renders it two ways, both reusing the field
+directly with no new computation:
+- **Occupancy map** (`_render_occupancy`): a short yellow arrow via
+  `fig.add_annotation()` from the current position, `arrow_len` (0.6m)
+  along `(sin(heading_rad), cos(heading_rad))` — same world X/Z
+  convention every other angle in this codebase uses. `add_annotation()`
+  draws the arrow but doesn't add a legend entry on its own, so a
+  near-invisible marker (`size=0.1`) at the arrow tip stands in for one.
+- **Frame overlay** (`_annotate_mapping`): appended to the existing green
+  pose/confidence text line as `heading=NNdeg`.
+
+Purely diagnostic/display — doesn't change any planning or steering
+behavior. If the arrow's direction visibly doesn't match where the camera
+frame is actually pointed, that's the clearest possible signal that
+`_pose_heading_rad()`'s assumed camera-local convention (or RTAB-Map's
+actual reported convention) is the real bug, vs. the route-selection
+algorithm itself.
+
+### WALKING occupancy-map "no accumulation / doubled voxel size" — tried, reverted
+
+Briefly tried, per two follow-up questions from the user (was there any
+accumulation before a WALKING frame's points land on the map — point-cloud
+accumulation was already confirmed absent (`walking_lite` skips Step 3b's
+`get_cloud()`/SOR pull entirely, WALKING's points come only from Step 3's
+per-frame local back-projection); Bayesian LOG-ODDS BELIEF accumulation
+was real, though, so `OccupancyMap.update()` gained a per-call
+`bayesian_override` param and `scan_session.py` passed
+`bayesian_override=False` + a doubled `occupancy_voxel_size` for
+`pure_walking`, meaning a single hit classified its cell immediately at a
+coarser resolution instead of needing several agreeing observations.
+
+**Reported by the user as not working in practice — reverted outright.**
+`OccupancyMap.update()` is back to its original signature (no
+`bayesian_override` param); `scan_session.py`'s Step 4 is back to the
+plain `voxelize_cloud(new_cloud_clean, voxel_size=occupancy_voxel_size,
+...)` / `self.occupancy_map.update(traj, occ_centers,
+confidence=update_confidence)` calls, unconditional on `pure_walking`
+again. What specifically broke wasn't diagnosed from this environment (no
+device/live run available here) — if revisited, start by checking whether
+single-hit immediate classification let through more depth-noise false
+positives than the accumulate-and-revise design was filtering out, since
+that's the main safety property `enable_bayesian=True` provides.
+
+### Server-side HRTF beacon placement mirror (dashboard display only)
+
+Requested directly by the user: show where the HRTF beacon is actually
+pointing on the dashboard, not just the route it's derived from. The real
+beacon placement — pose extrapolation via `RotationTracker`/
+`PdrStepEstimator`, then `PathPursuit`'s project-onto-path-then-advance —
+only ever happens on-device (see "Server-planned walking path" above);
+this adds a **server-side mirror of the placement math only** (not the
+extrapolation, which is meaningless server-side — the server only ever has
+its own last authoritative pose, never a latency-bridged estimate), purely
+so `server_gui.py` can show a directly comparable "this is where the sound
+source is" marker alongside the route it's already drawing.
+
+`scan_server/live_path_planner.py` gained a direct Python port of
+`PathPursuit.kt`: `nearest_point_on_path()`, `advance_along_path()`, and
+`beacon_target_point()` (combines both — project the current pose onto
+`planned_path`, then move forward by `PATH_LOOKAHEAD_M`, a module constant
+kept at `0.4` to match `ToolDispatcher.kt`'s own constant exactly). Verified
+against hand-computed expected points (pose at the path start, pose offset
+to the side of a segment, pose near the path's end clamping at the final
+point) — all three match the Kotlin implementation's documented behavior
+exactly.
+
+`mapping_servicer.py`'s `UpdateMapping` calls `beacon_target_point()` right
+after computing `planned_path_proto` (using the SAME `pose_xz` and path
+points already being sent to the client) and records the result into
+`ActivityMonitor` as `beacon_point` (`None` when there's no path — mirrors
+the client's own mute-when-no-path behavior; also explicitly cleared on a
+`pure_walking` reset, alongside `planned_path`, so the dashboard doesn't
+keep showing a stale marker from before the reset). `server_gui.py` draws
+it as a magenta marker in both places the route already appears: a
+`go.Scatter` point on the occupancy map (`_render_occupancy`, added via
+`fig.add_trace()` after `render_plotly()` returns), and a magenta ring on
+the frame overlay (`_annotate_mapping`, via the same
+`_project_world_to_pixel()` the route polyline already uses) — distinct
+color from the cyan route so it reads as "the sound source," not just
+another route point.
+
+### Hazard warnings — step-down frames fed to Gemini Live (walking + guiding)
+
+Requested directly by the user: when there's a step down/stairs, the
+current frame should go to Gemini Live with context so it can give the
+user a specific spoken warning — not just an ambient tone/beacon nudge.
+Applies to BOTH walking and guiding — both modes' avoidance ticks already
+fetch a `TraversabilityInfo` fan every cycle (`fetchTraversability()`), so
+this slots into both with no new per-tick round trip.
+
+**Originally also covered plain nearby obstacles — removed.** The first
+version of this warned on ANY close obstacle in the fan (`clearance_m`
+below a threshold, anywhere), which turned out to false-trigger constantly
+in real testing: something a metre off to one side with plenty of open
+space elsewhere would still fire a warning, which is exactly the "too
+eager" complaint that also killed the corridor-lock design above. Per the
+user's explicit call: keep the step-down/drop-off check proximity-based
+(falling is dangerous enough to warrant its own signal regardless of
+whether a path exists around it) but drop the plain-obstacle trigger
+entirely — a nearby obstacle the grid/path-planner already routes around
+silently is not itself hazard-warning-worthy; only "no path at all"
+(WALKING's `playDeadEndAlert()`, see "Grid-planned walking route" above)
+is.
+
+**A real gap surfaced while designing the step-down check**: the existing
+clearance fan (`_clearance_fan_from_depth`) only ever classified points
+ABOVE the fitted ground plane as obstacles. A downward step, ledge, or
+staircase registers as neither obstacle nor ground under that scheme —
+simply absent from `clearance_m`.
+
+**Fix — `dropoff_m`, a second per-bin array (`server/tools/traversability.py`,
+`tracking.proto`'s `TraversabilityInfo`)**: alongside the existing
+`is_obstacle = height_above > _OBSTACLE_MIN_HEIGHT_M` check,
+`_clearance_fan_from_depth()` now also computes `is_dropoff = height_above
+< -_DROP_MIN_DEPTH_M` (0.15m — same order of magnitude as
+`_OBSTACLE_MIN_HEIGHT_M`, a real step/curb is typically at least that
+deep) whenever a ground plane was found, bins those points by azimuth the
+same way, and returns the nearest-drop-off-per-bin distance as `dropoff_m`
+(same shape/sentinel-at-`max_range_m` semantics as `clearance_m`). Only
+computed when `plane is not None` — no plane means no reference to measure
+"below" against, and the existing "no confident floor -> treat everything
+as obstacle" fallback already covers that frame conservatively. Still
+current and unaffected by the corridor-lock design's removal —
+`estimate_traversability()`/`dropoff_m` are what both `runAvoidanceTick()`
+(GUIDING) and `runWalkingAvoidanceTick()` (WALKING) call every tick now.
+
+**Client (`ToolDispatcher.kt`) — `checkAndWarnHazard(trav, frame)`**,
+shared by both ticks: scans `dropoff_m` for the nearest drop-off; within
+`STEP_DOWN_WARN_RANGE_M` (3.0m), sends the current frame via
+`sendVideoFrame()` (walking/guiding don't otherwise stream any video into
+the Gemini Live session — frames only reach Gemini via explicit tool
+calls like `get_latest_frame`/`start_vision_stream` — so this is
+necessary, not redundant with anything already flowing) followed by a
+`sendSystemNote()` whose text deliberately asks Gemini to describe what it
+SEES rather than just read back the distance number. Additive, not a
+replacement, for whichever ambient signal the mode already gives (the
+beacon's own steering, or `playDeadEndAlert()`'s tone for walking's
+dead-end case) — the tone/beacon stays the zero-latency instant cue, this
+is the more-informative one a beat later once Gemini responds.
+Rate-limited (`hazardActive`/`lastHazardWarnedAtMs`): fires once when the
+hazard first appears, then at most once per `HAZARD_REWARN_COOLDOWN_MS`
+(8s) while it persists — a standing hazard doesn't get re-announced every
+single tick, but also isn't silently forgotten if the user just stands
+there.
+
+**`dropoff_m` false-positive fix (`server/tools/traversability.py`)**:
+`is_dropoff` originally flagged a bin the instant a SINGLE pixel read more
+than `_DROP_MIN_DEPTH_M` below the fitted ground plane — with monocular
+(DA3) depth being noisy per-pixel, a couple of stray floor pixels
+routinely dipped below that threshold, so nearly every frame read a
+drop-off SOMEWHERE, defeating the whole point of a proximity check. Fixed
+via `_MIN_DROPOFF_POINTS_PER_BIN` (4) — a bin's drop-off distance is only
+trusted once that many points in the SAME bin agree, mirroring
+`_MIN_GROUND_INLIERS`'s own "require several agreeing observations"
+principle for the plane fit itself. Obstacle detection (`clearance_m`)
+never had this problem — a bin's reported distance is naturally dominated
+by whichever real cluster is nearest, noise or not.
+
+**Grouped into one hedged prompt, obstacle warning brought back
+alongside drop-off (`ToolDispatcher.kt`'s `checkAndWarnHazard()`)**:
+requested directly by the user, given that neither heuristic (obstacle
+clearance OR drop-off) is reliable enough to assert as fact even after the
+fix above — single-frame monocular depth + RANSAC ground-plane fitting is
+inherently rough. `checkAndWarnHazard()` now checks BOTH `clearance_m`
+(new `OBSTACLE_WARN_RANGE_M`, 2.0m) and `dropoff_m`
+(`STEP_DOWN_WARN_RANGE_M`, 3.0m still) and, if either trips, sends ONE
+system note per tick (never two) with a single fixed, deliberately hedged
+prompt: check the frame for a step-down/drop-off/obstacle right in front
+of the user, only warn if one is CLEARLY visible right in front, otherwise
+say nothing — handing the actual judgment call to Gemini's own vision on
+the real frame rather than asserting a distance number as fact. This
+replaced an earlier, more detailed version of the prompt that spelled out
+which heuristic(s) fired and their distances — simplified per direct user
+feedback to just the fixed instruction above.
+
 ### Session-mode pipeline split — SCAN vs. WALKING/GUIDING (`walking_lite`)
 
 Real bug, found via a live device session and fixed: walking mode was
@@ -855,14 +2464,22 @@ every single mini-batch, making walking unusably slow (30-53s stalls
 between occupancy updates) for a mode that only ever needed a live
 occupancy grid, never a persisted point cloud or landmark discovery.
 
-**Note (post "Local reactive HRTF obstacle-dodge"): `SessionMode.WALKING`
-is now effectively dead.** Walking dropped `MappingService` entirely, so
-`feedMappingFrame()` is never called while `state.mode == "walking"` any
-more — nothing ever sends this enum value in practice. The `walking_lite`
-mechanism described below stays fully alive and necessary for `GUIDING`
-(still a non-`SCAN` mode), which is the only mode that reaches it now. The
-enum value itself was left in the proto rather than removed — harmless to
-keep, and removing it would be a wire-compatibility churn for no benefit.
+**Update (post "Grid-planned walking route"): `SessionMode.WALKING` is live
+again, through the SAME `feedMappingFrame()`/`startMappingStream()` path
+GUIDING/SCANNING use — not a separate stream.** Walking dropped
+`MappingService` entirely per "Local reactive HRTF obstacle-dodge," making
+`SessionMode.WALKING` dead for a while; a later redesign ("Local SLAM-backed
+walking corridor-lock," now itself superseded) revived it on a dedicated
+pose-only stream; the current design ("Grid-planned walking route") merged
+it back into the shared stream, now carrying the FULL grid — walking gets
+the same live occupancy grid GUIDING does (`pure_walking` no longer skips
+Step 4), just never persisted and reset far more aggressively on tracking
+loss (`PURE_WALKING_LOST_RESET_S`, 0.5s). `walking_lite`'s existing
+`pure_walking`-gated skip of Step 3b (get_cloud/SOR) and VLM tagging still
+applies regardless, so the original "unusably slow" bug this section fixed
+stays fixed — walking's per-batch cost is still Step 3's local
+back-projection + Step 4's grid update, same as it's always been for this
+mode, just no longer skipping Step 4 specifically.
 
 **Chosen fix**: an explicit `SessionMode` (`tracking.proto`: `SCAN`,
 `WALKING`, `GUIDING`) on `MappingChunk`, set once by the client
@@ -884,13 +2501,13 @@ process_frames_batch(walking_lite=True)`:
   entirely** — Step 3's local back-projection already fed `new_cloud`,
   which Step 4's occupancy update (already fully generic across pose
   sources) picks up unchanged. This is the single biggest cost removed.
-- **VLM/semantic tagging (`StoredFrame`/`_frame_store`/`_tag_pending`) is
+- **Semantic tagging (`_PendingTagFrame`/`_tag_pending`) is
   skipped entirely** — semantic mapping is scan-only now; walking/guiding
   never discover landmarks live.
 - **`FindLandmark` gained a persisted-snapshot fallback**
   (`MappingServiceServicer._find_in_snapshot()`) for exactly this reason —
-  a walking/guiding session's `_frame_store` is always empty (VLM tagging
-  never ran), so `session.resolve_landmark()` alone would never find
+  a walking/guiding session's `_raw_landmarks` is always empty (semantic
+  tagging never ran), so `session.resolve_landmark()` alone would never find
   anything for it; `_find_in_snapshot()` does the same case-insensitive
   substring match against whatever a PRIOR scan already persisted to
   `occupancy_snapshot.json`, giving "if there's already a map with
@@ -904,7 +2521,7 @@ process_frames_batch(walking_lite=True)`:
 
 **Verified** (mocked estimator/RTAB-Map client, no GPU/docker dependency):
 `process_frames_batch(use_rtabmap_pose=True, walking_lite=True)` populates
-the occupancy map via local back-projection, leaves `_frame_store` empty,
+the occupancy map via local back-projection, leaves `_raw_landmarks` empty,
 and never calls the mock `get_cloud()` (which raises if invoked) — matching
 the intended behavior exactly.
 
@@ -987,47 +2604,62 @@ otherwise" split this codebase already uses for RTAB-Map loop closure
   recomputing from scratch each export) was considered out of scope for
   this pass.
 
-### Drop-to-latest mapping-chunk ingestion — tried, then reverted (`mapping_servicer.py`)
+### Drop-to-latest mapping-chunk ingestion — tried, reverted, then re-adopted (`mapping_servicer.py`)
 
-**Current state: REVERTED.** `UpdateMapping` iterates the raw gRPC
-`request_iterator` directly again (`for chunk in request_iterator:`) — the
-full queue, no chunk ever silently dropped. Confirmed with the user: bring
-the queue back. Documented in full below since the reasoning for trying
-the alternative in the first place is still real context (and the "Round
-1" reasoning in "DA3 model default + per-frame processing" below, about
-this mailbox interacting with `mini_batch`, refers to this same mechanism
-— it no longer exists, but the mini_batch conclusions it led to are still
-current).
+**Current state: RE-ADOPTED, deliberately, as of the "Server-planned
+walking path" work.** `UpdateMapping` iterates `_latest_only_chunks(
+request_iterator)`, not the raw `request_iterator` directly — chunks
+arriving while the server is still busy on an earlier one ARE silently
+dropped again. This is a **conscious re-reversal**, not a regression: the
+user explicitly asked for it (to keep the server from working through a
+growing backlog) after being shown the exact history below, and paired it
+with a shorter consecutive-tracking-loss reset
+(`PURE_WALKING_LOST_RESET_S`, `scan_session.py`, bumped from 0.5s to 1.0s
+in the same pass) as the accepted mitigation for the known risk this
+reintroduces. The mailbox itself had to be reconstructed from this
+section's own prose (the original revert happened within uncommitted
+session work, so there was no git history to recover the literal code
+from) — same single-slot-mailbox shape as before: a background daemon
+thread drains the real `request_iterator`, overwriting one shared slot +
+a monotonic sequence counter under a `threading.Condition`; the generator
+blocks on the condition and yields whatever's currently in the slot once
+notified. Verified via a standalone synthetic test (slow consumer sees a
+strictly-increasing but gapped sequence, always including the first and
+last item; a fast consumer sees ~every item; an upstream exception/an
+empty source both terminate cleanly) rather than trusted on prose alone.
 
-**What was tried**: gRPC's own request iterator queues incoming messages
-internally — if the server-side loop falls behind the client's send rate
-even briefly (a slow `push_frame()` mini-batch, GPU contention from
-another stream, a depth-estimation stall), the default behavior is to keep
-working through that backlog in arrival order, so the pose/grid state this
-stream reports gets further behind real time and doesn't recover on its
-own — the same kind of compounding lag this project has hit before (see
-"Mode exclusivity" above for a related GPU-contention incident).
-`_latest_only_chunks(request_iterator)` wrapped the raw iterator in a
-single-slot mailbox — a background reader thread continuously drained
-`request_iterator` and overwrote one shared slot with each new chunk as it
-arrived (a chunk not yet consumed by the main processing loop was silently
-dropped in favor of whatever was newest), while the main loop blocked on a
-`threading.Condition` and always pulled whatever was CURRENTLY in the slot.
-This mirrored `CameraManager.kt`'s own `frameFlow`
-(`extraBufferCapacity` + `DROP_OLDEST`) — the same "prefer fresh over
-complete" policy already used client-side.
+**What this trades away (unchanged from the original attempt — read this
+before assuming the risk is gone)**: gRPC's own request iterator queues
+incoming messages internally — if the server-side loop falls behind the
+client's send rate even briefly (a slow `push_frame()` mini-batch, GPU
+contention from another stream, a depth-estimation stall), the DEFAULT
+behavior (full queue) works through that backlog in arrival order, so
+RTAB-Map always sees every consecutive frame even if its reported pose
+lags real time. The mailbox instead keeps the server current in wall-clock
+time by dropping whatever piled up while it was busy — but RTAB-Map's own
+frame-to-frame odometry needs CONTINUITY, not freshness: dropping frames
+widens the visual/motion gap between two frames it actually processes back
+to back, which was the confirmed contributor to a real tracking-loss
+regression the first time this was tried (see "DA3 model default +
+per-frame processing" below, Round 1's reasoning — that investigation's
+own conclusions about `mini_batch` are unaffected either way). This mirrors
+`CameraManager.kt`'s own `frameFlow` (`extraBufferCapacity` + `DROP_OLDEST`)
+— the same "prefer fresh over complete" policy already used client-side,
+and now also reflected in `ToolDispatcher.kt`'s outbound
+`mappingChunkChannel` (`Channel.CONFLATED`, replacing `Channel.UNLIMITED`)
+and `LiveSessionState.lastSentSnapshot` (a single latest-sent pose/PDR
+snapshot, replacing a multi-entry history buffer — see "Server-planned
+walking path" for why a full history stopped making sense once the server
+no longer guarantees processing every sent chunk in order). Applies only
+to `UpdateMapping` — the only streaming RPC left in this codebase
+(`TrackingService`/`PerceptionService` are unary, one frame per call, so
+they have no equivalent queueing exposure).
 
-**Why it was reverted**: RTAB-Map's own frame-to-frame odometry needs
-CONTINUITY, not freshness — dropping frames (even just the ones arriving
-while the server is briefly busy) can widen the visual/motion gap between
-two frames RTAB-Map actually processes back to back, which is a real
-contributor to the tracking-loss investigation in "DA3 model default +
-per-frame processing" below (Round 1's reasoning). Restoring the full
-queue trades "never falls behind in wall-clock time" for "never
-drops a frame RTAB-Map needed to stay tracked" — the latter matters more
-for this pipeline. Applies only to `UpdateMapping` — the only streaming
-RPC left in this codebase (`TrackingService`/`PerceptionService` are
-unary, one frame per call, so they have no equivalent queueing exposure).
+**Not verified end-to-end against a live RTAB-Map rig** — the mailbox's
+own drop/keep-latest logic is unit-tested (above), but whether it actually
+degrades real tracking-loss frequency in practice, and whether the 1.0s
+reset is enough headroom to absorb that, is unverified from this
+environment, same standing caveat as this session's other changes.
 
 ### DA3 model default + per-frame processing + pre-DA3 blur gate (`scan_session.py`, `stream_session.py`, `da3_wrapper.py`, `grpc_server.py`)
 
@@ -1240,8 +2872,10 @@ New package, one Gemini Live session per connection, replacing the old
   destination — see "Novelty+blur frame gating and deferred landmark
   resolution" in the 3D Scanning Pipeline section.
 - `LiveSessionState.kt` — Kotlin port of `LiveSessionState` (mode, reading
-  buffer, nav waypoints, walking obstacle cache), held in `MainViewModel` now
-  instead of server-side.
+  blocks, nav waypoints, walking obstacle cache), held in `MainViewModel` now
+  instead of server-side. `readingBuffer: String` is now `readingBlocks:
+  MutableList<String>` (+ `readingBufferText()` to join them) — see
+  "Reading-mode OCR" below for why a flat string's dedup broke down.
 - `ToolDispatcher.kt` — Kotlin port of `_dispatch_tool` + the `live_tools/*.py`
   implementations. One implementation per tool, routed by weight:
   - **Remote** (`grpc.perceptionStub`/`mappingStub`, new fields on
@@ -1251,18 +2885,22 @@ New package, one Gemini Live session per connection, replacing the old
     `start_walking`/`start_scan` → `UpdateMapping` bidi stream (fed by
     `feedMappingFrame()`, called from `MainViewModel`'s existing camera-frame
     collector whenever `mode` is `guiding`/`walking`/`scanning`).
-    `recomputeRoute()` (fixed — was a no-op placeholder) resolves
+    `recomputeRoute()` (fixed — was a no-op placeholder) resolved
     `guidingDestinationLabel` via `FindLandmark` on every grid update while
-    unresolved, then routes with `LocalPathPlanner` below.
+    unresolved, then routed with `LocalPathPlanner` below — **this
+    paragraph describes the original migration; path planning has since
+    moved server-side and `LocalPathPlanner.kt` is deleted, see
+    "Server-planned walking path + client-side latency bridging"**.
   - **3rd-party direct**: `OcrClient.kt` — multipart POST straight to
-    `paddle_ocr_server`, bypassing the gRPC server as a proxy.
+    OCR.space, bypassing the gRPC server as a proxy (and the earlier
+    self-hosted `paddle_ocr_server`, deleted outright — see "Reading-mode
+    OCR — OCR.space + block-level dedup + line-level filters" below).
   - **Local**: `LocalMemoryStore.kt` (on-device JSON files under
     `filesDir/memory/` — labels/notes + a small embedding index, cosine
     search in Kotlin; the `Embed` RPC is the only remote step),
-    `LocalPathPlanner.kt` (full Kotlin port of `live_path_planner.py`'s A* —
-    same cost model, closest-approach fallback, min-clearance penalty —
-    run against the `OccupancyGrid` `MappingService` streams back, so
-    routing has zero network round-trip per step), `HrtfBeacon.kt`
+    `LocalPathPlanner.kt` (deleted — see the note above; was a full Kotlin
+    port of `live_path_planner.py`'s A* run against the streamed grid),
+    `HrtfBeacon.kt`
     (`directionTo()` — egocentric azimuth/elevation of the next waypoint
     from the current `Pose`, quaternion-rotation math, camera==head pose
     since the camera is glasses-mounted — see the earlier HRTF
@@ -1306,9 +2944,12 @@ New package, one Gemini Live session per connection, replacing the old
     PCM16 chunk for that future device to just stream to earbuds, no
     compute of its own. Filter changes are crossfaded across one ~46ms
     chunk to avoid an audible click when the nearest HRIR direction
-    changes. Reading-buffer dedup (`MemoryTextUtils` in
-    `LocalMemoryStore.kt`) ports `memory_store.py`'s sentence-overlap
-    filtering exactly.
+    changes. `MemoryTextUtils` in `LocalMemoryStore.kt` ports
+    `memory_store.py`'s sentence-overlap filtering exactly — still used for
+    `save_memory`'s overlap-trim, but no longer for the reading buffer
+    itself; see "Reading-mode OCR — OCR.space + block-level dedup +
+    line-level filters" below for why that moved to a different algorithm
+    (`OcrBlockFilters.integrateBlock()`).
   - **Device** (unchanged): routes straight to the existing
     `DeviceToolHandler`/`AndroidDeviceToolHandler` — in-process now, no
     `DeviceToolCall`/`DeviceToolResult` wire round-trip needed since Gemini
@@ -1319,9 +2960,10 @@ New package, one Gemini Live session per connection, replacing the old
   ported to a callable RPC in this pass. `play_video`/`stop_music` still
   work (routed to the device handler, which already expects a
   pre-resolved stream URL).
-- `MainViewModel.kt`: `connect()` gained `geminiApiKey`/`ocrServerUrl`/
-  `locationId` params (new `SettingsScreen.kt` fields, persisted via
-  `SettingsViewModel`); `doLiveSession()` rewritten around
+- `MainViewModel.kt`: `connect()` gained `geminiApiKey`/`ocrApiKey`/
+  `locationId`/`blurSharpnessThreshold`/`saveDebugOcrFrames` params (new
+  `SettingsScreen.kt` fields, persisted via `SettingsViewModel` — see
+  "Reading-mode OCR" below for the latter two); `doLiveSession()` rewritten around
   `GeminiLiveClient.events()` + `ToolDispatcher.dispatch()` in place of the
   old `stub.voiceChatStream(...)` call. The old IMU-frame relay to the
   server was dropped entirely (Gemini Live never used it — "IMU frames
@@ -1339,27 +2981,2501 @@ New package, one Gemini Live session per connection, replacing the old
   type-checking across the whole new + modified codebase, but is not a
   substitute for an on-device run.
 
-### Server-side scan_server.py deletion
+### Reading-mode OCR — OCR.space + block-level dedup + line-level filters
 
-`scan_server/scan_server.py` (the FastAPI `/api/upload` entrypoint +
-`mount_gradio_app` launcher) was deleted — confirmed zero remaining callers
-repo-wide once `ScanViewModel.kt` (its only HTTP client) was removed. The
-rest of `scan_server/` (`scan_gui.py`, `stream_simulator.py`,
-`zone_labeler.py`, the zone-based `map_exporter.py` export path, etc.) was
-**deliberately left in place, not deleted** — `scan_gui.py`'s rich Live
+Reading mode's OCR backend was switched from the self-hosted
+`paddle_ocr_server` microservice (deleted outright, not deprecated — its
+whole directory is gone) to OCR.space, a free hosted OCR API, per a direct
+user decision (accepting the tradeoff: an external network dependency and
+rate-limited free tier, vs. no local GPU/PaddlePaddle service to run).
+Developed and tuned first in a standalone Gradio test harness
+(`~/Desktop/gt.py`, outside this repo) against real, noisy phone-camera OCR
+output of a physical book, before being ported here — that harness's own
+comments carry the full "why" for each threshold below; this section is the
+condensed version.
+
+**The core problem this redesign solves**: `MemoryTextUtils.filterNewSentences()`
+(still used for `save_memory`'s overlap-trim) assumes near-identical OCR
+text on a repeat read — a sentence is only recognized as "already read" via
+EXACT substring containment. Real OCR noise varies pass to pass (typos,
+misread watermark text, a badly-truncated reread of the same page), so that
+check rarely fires and the reading buffer fills with near-duplicate
+paragraphs. Confirmed directly against real output: the same paragraph
+reread 3-5 times with 1-2 word OCR differences each time ("shed"/"she'd",
+"Morn"/"Mom") all got appended in full.
+
+**Fix — block-level fuzzy dedup (`OcrBlockFilters.integrateBlock()`,
+`TextBlockFilters.kt`) — superseded, see "Reading-mode OCR correction +
+fuzzy stitching" below for the current `integrateRawBlock()`/`ReadingBlock`
+design; kept here for the original dedup rationale, which is still
+current**: `LiveSessionState.readingBuffer: String` became
+`readingBlocks: MutableList<String>` (+ `readingBufferText()` to join them
+for callers that just want the accumulated text). Each OCR pass is folded
+into `readingBlocks` as one whole BLOCK, matched against every block
+already stored via `blockSimilarity()` — an ASYMMETRIC, WORD-LEVEL
+containment score: "how much of the SHORTER text's content shows up as
+runs of >=2 consecutive matching words somewhere in the longer one",
+computed via a Kotlin port of Python difflib's Ratcliff/Obershelp matching-
+blocks algorithm (`findLongestMatch()`/order-preserving, not a plain
+bag-of-words/bigram overlap — that would let common short phrases match
+across unrelated positions). Two cheaper approaches were tried and
+discarded first: a plain symmetric character-level ratio scores a short,
+garbled reread of an already-stored page far too low purely from the
+length mismatch, letting it slip past as a spurious "new" block;
+character-level containment (no word tokenization) fixed that but then
+scored UNRELATED paragraphs too high, since arbitrary short substrings
+coincidentally recur throughout any English text. Requiring >=2-consecutive-
+WORD matching runs needs a genuine shared phrase, cleanly separating true
+rereads (~0.75-0.9 in practice) from unrelated paragraphs (~0.05-0.1) — a
+`DUP_CONTAINMENT = 0.45` threshold sits comfortably in that gap. A
+duplicate doesn't get re-appended; if the new capture is longer (cleaner/
+more complete), it replaces the stored block outright. A middle "partial
+merge" band (stitching in just the sentences that don't already appear)
+was also tried and reverted: at real-world OCR noise levels almost no
+sentence matches exactly, so it re-appended nearly the whole paragraph
+anyway — duplicates are a single yes/no call now.
+
+**Line-level filters, chained in `OcrClient.analyze()` before dedup ever
+runs** — OCR.space's overlay (`isOverlayRequired=true`) gives per-word
+axis-aligned boxes (`OcrLine`/`OcrWord`, `TextBlockFilters.kt`), letting
+each detected line be filtered on its own merits:
+
+1. **Rotation-consistency** (`filterLinesByRotation()`) — OCR.space's own
+   `detectOrientation` only corrects whole-PAGE rotation (0/90/180/270);
+   it has no concept of one box being crooked relative to the rest of an
+   already-correctly-oriented page. Each line's orientation is instead
+   ESTIMATED from the slope between its first and last word centers (needs
+   >=2 words; single-word lines have no evidence and are kept by default).
+   A line whose angle deviates more than `ROTATION_MAX_DEVIATION_DEG` (15°)
+   from the page's dominant (median) angle is dropped — catches a stray
+   diagonal watermark stamp the body text doesn't share.
+2. **Short/small/isolated noise** (`filterLinesByNoise()`) — catches page
+   numbers, watermark stamps, and garbled debris that survive rotation
+   filtering untouched (a single-word line has no slope to measure at
+   all). A line is dropped only when it's BOTH ISOLATED (edge-to-edge gap
+   to the nearest other line is large relative to the page's own median
+   line height, `ISOLATION_GAP_FACTOR = 1.8`) AND either short
+   (`MIN_TEXT_CHARS = 8`) or undersized (`SMALL_HEIGHT_FRAC = 0.72`).
+   Isolation is required, not optional — it's what tells a genuine short
+   in-paragraph word/exclamation (sitting right next to its paragraph,
+   normal font size) apart from a page number floating alone in the
+   margin; length or font size alone would risk dropping real text.
+3. **Per-line blur** (`filterLinesByBlur()`) — a real gap found from a
+   live screenshot: a page mid-turn can be motion-blurred on one side and
+   still sharp on the other, but `CameraManager`'s existing blur check
+   (see below) measures sharpness for the WHOLE frame as one aggregate
+   number, which the sharp side's pixels pull well above any reasonable
+   threshold — the frame passes the whole-frame check easily while still
+   containing an individually unreadable region. This crops each line's
+   OWN bounding box out of the frame and measures variance-of-Laplacian
+   sharpness (same metric/formula as `CameraManager.computeSharpness()` —
+   `meanStdDev`, variance = stddev²) on just that patch, independent of
+   the rest of the frame. `MIN_LINE_SHARPNESS = 60.0`; 0 disables.
+
+Each dropped line survives into the optional debug frame overlay (below)
+with a distinct color, so a real run's filtering decisions are visible,
+not just inferred from the final text.
+
+**Whole-frame blur skip/retry (`ToolDispatcher.acquireSharpFrame()`,
+distinct from the per-line filter above — this one decides whether to spend
+an OCR CALL at all, before any line-level data exists to filter)**: before
+`toolScanCurrentView()` calls OCR.space, it checks the current frame's
+overall sharpness via `CameraManager.clearestRecentFrameWithSharpness()`
+(new — same pull as the existing `clearestRecentFrame()`, also exposing the
+score). Below `blurSharpnessThreshold` (SettingsScreen-configurable,
+default 40, 0 disables), it re-samples up to `BLUR_MAX_RETRIES` (2) times,
+waiting `BLUR_RETRY_WAIT_MS` (500ms) between each — standing in for "let
+the live camera produce a fresher frame" — before giving up on the cycle
+entirely (no OCR call made) rather than spending one on known-bad input.
+
+**Debug frame storage (`DebugFrameStore.kt`, off by default)**: writing
+every scanned camera frame to device storage has real storage-growth and
+privacy cost in a production assistive app, so this is gated behind
+`SettingsScreen`'s "Save debug OCR frames" toggle (`saveDebugOcrFrames`,
+persisted via `SettingsViewModel`) — off, it's a no-op (`ToolDispatcher`'s
+`saveDebugFrame` callback stays `null`, wired from `MainViewModel` only
+when the toggle is on). When on, `annotateOcrFrame()` draws each line's box
+on a copy of the frame (green = kept, red = dropped for rotation, orange =
+dropped as noise, magenta = dropped as locally blurry) and
+`MainViewModel` writes it to `filesDir/debug_ocr_frames/` on `Dispatchers.IO`
+(fire-and-forget, same precedent as `reportMode()`'s dropped-report
+tolerance — a failed debug save is never something the read-aloud flow
+itself should fail over).
+
+### Reading-mode OCR correction + fuzzy stitching (raw/corrected split)
+
+Ported from `~/Desktop/gt.py`'s own iteration on the reading-mode dedup
+above (same standalone Gradio harness cited at the top of the previous
+section) — developed and tuned there against real noisy phone-camera OCR
+output before being carried into the production Android client. Two real
+gaps in the original block-level dedup drove this:
+
+1. **No OCR-error correction at all.** Raw OCR text (typos, garbled words,
+   broken punctuation) was stored and spoken verbatim — the harness added
+   an LLM correction pass; this ports that pass into the app.
+2. **Overlapping-but-different reads either got wrongly merged or silently
+   lost content.** A sliding scan (camera panning across a page) produces
+   captures like "A B C" then "B C D E" — the old `integrateBlock()` only
+   ever replaced-if-longer or left alone; it never appended the genuinely
+   new tail. Worse, when the old whole-block "same page, cleaner capture"
+   replace path fired but the new capture's own OCR pass happened to start
+   partway through the existing text (not from its beginning), the
+   original opening content was silently discarded forever — a real,
+   observed, data-losing bug (see `gt.py`'s own commit history for the
+   exact reproduction) that this design fixes on both sides at once.
+
+**`LiveSessionState.readingBlocks` is now `MutableList<OcrBlockFilters.
+ReadingBlock>`** (`TextBlockFilters.kt`) — `ReadingBlock(id, raw, corrected)`
+replaces the plain `MutableList<String>` `integrateBlock()` used. `raw` is
+the OCR output, stored immediately; `corrected` starts as a mirror of `raw`
+and is only later, asynchronously, patched in place once a Gemini
+correction response lands for that specific block — `readingBufferText()`
+joins `.corrected` (== raw for any block whose correction hasn't landed
+yet), so reading/dedup/`get_reading_section` never wait on the LLM call.
+
+**`OcrBlockFilters.integrateRawBlock(blocks, newRawText)`** (replaces
+`integrateBlock()`, deleted outright — no remaining caller) returns
+`(kind, block)`:
+- **`"stitched"`** — `newRawText` fuzzily CONTINUES the MOST RECENT block
+  (`findFuzzyOverlapMerge()`) — that block's raw is extended in place with
+  only the genuinely-new tail. Only ever checked against `blocks.last()`:
+  stitching against an arbitrary earlier block would conflate "this
+  continues from where I just was" with "this is a reread of something
+  from a while ago" (a different, position-agnostic question the existing
+  `blockSimilarity()` duplicate/updated check below already answers).
+  Two-pass: (1) a strict exact-word `matchingBlocks()` anchor requiring the
+  match to reach near the END of the existing block's words AND the START
+  of the new capture's words (`boundarySlack`, 2 words); falling back to
+  (2) `findWindowedFuzzyOverlap()` — OCR quality is typically WORST right
+  at a frame's edge (motion blur, a partially-cut-off word), exactly where
+  the strict anchor needs to be clean, so pass 2 slides a window comparing
+  trailing/leading word pairs via character-ratio fuzzy equality
+  (`wordFuzzyEqual`, Ratcliff/Obershelp `charMatchRatio >= 0.6`, reusing
+  the same `matchingBlocks()` machinery at the character level) instead of
+  requiring exact string equality — tolerates typos IN the anchor words
+  themselves, not just gaps around them. Verified against both a
+  clean-boundary case and a typo'd-boundary case (`"foxx jurnps"` still
+  continuing `"fox jumps"`), plus stress-tested against 4 genuinely
+  unrelated text pairs sharing only common filler words at the seam with
+  zero false-positive stitches.
+- **`"updated"`** — matched an existing block via `blockSimilarity()`
+  (whole-text containment, position-agnostic, unchanged from the original
+  dedup) and this capture is longer/cleaner. Previously a blind overwrite;
+  now goes through **`findMidtextRealignMerge()`** first — finds where in
+  the EXISTING block's own text the best word-level match against the new
+  capture begins (unrestricted position, unlike the boundary-anchored
+  stitch search above), and returns the existing block's own PREFIX up to
+  that point + the new capture in full, instead of discarding whatever
+  existing content precedes the overlap. Falls back to a plain overwrite
+  only if no anchor is found at all. This is the fix for the data-loss bug
+  described above — verified via the exact real-world capture pair that
+  originally exposed it (a two-sentence opening that the old code
+  silently dropped is now preserved, confirmed word-for-word present in
+  the merged result).
+- **`"duplicate"`**/**`"new"`**/**`"empty"`** — unchanged in spirit from
+  the original `integrateBlock()`.
+- Every outcome is logged (`Log.d("OcrBlockFilters", ...)`, full text, not
+  truncated) — ported directly from a real debugging need in `gt.py`: an
+  earlier version there silently swallowed correction failures and only
+  showed a truncated preview, which made "did it actually append or
+  replace" impossible to answer from the log alone.
+
+**`GeminiCorrectionClient.kt`** (new) — plain REST call to Gemini's
+`generateContent` endpoint (`gemini-3.1-flash-lite`), deliberately NOT the
+`BidiGenerateContent` WebSocket protocol `GeminiLiveClient.kt` uses (this
+is one-shot request/response, no session/turn state) and deliberately NOT
+a Google SDK (same reasoning `GeminiLiveClient.kt`'s own comment gives for
+avoiding Firebase AI Logic — a hand-rolled OkHttp + `org.json` call needs
+no extra project setup, consistent with this module's existing style).
+Reuses the same `geminiApiKey` already entered for Gemini Live — no
+separate Settings field; a blank key means `MainViewModel` passes `null`
+for `ToolDispatcher`'s `geminiCorrectionClient`, which disables correction
+entirely (blocks behave exactly as before: `corrected` permanently mirrors
+`raw`). Two system prompts, selected by detected language (fix-only for
+English, fix+translate-to-English otherwise) — ported verbatim from
+`gt.py`'s own prompts. Language detection is **ML Kit's on-device Language
+Identification** (`com.google.mlkit:language-id`, new Gradle dependency) —
+chosen over trying to port/bundle `gt.py`'s fastText model, since ML Kit is
+a standard Android library needing no model-management code here (lazily
+downloads its own small model on first use). Deliberately does NOT swallow
+failures internally — throws on any error, logging the real exception
+first (same "never silently degrade into looking like nothing needed
+correcting" lesson `gt.py` learned the hard way once already).
+
+**`ToolDispatcher`'s correction queue** — Kotlin port of `gt.py`'s
+`ReadingPipeline` correction-queue/worker split: OCR results are stored
+(and, for `"new"`/`"stitched"`, spoken) IMMEDIATELY in
+`toolScanCurrentView()`; correction is pushed onto an unlimited
+`Channel<CorrectionJob>` and runs on ONE background coroutine
+(`correctionWorkerJob`, started in `init {}` only when
+`geminiCorrectionClient` is non-null) that drains it strictly
+SEQUENTIALLY — one Gemini call finishes before the next starts, same
+contract `gt.py`'s worker thread had — entirely decoupled from the
+tool-call path, so a slow or failed correction never blocks scanning or
+reading. `"new"`, `"stitched"`, AND `"updated"` all get queued for
+correction (matching `gt.py`'s push condition exactly) even though only
+`"new"`/`"stitched"` are spoken as new text this cycle — an `"updated"`
+block (a longer/cleaner reread) still needs its own fresh correction. Each
+job carries `(blockId, rawText, langCode)`; `OcrBlockFilters.
+applyCorrection()` on the worker side only patches `corrected` if that
+block's `raw` still matches `rawTextAtRequest` — a block whose raw was
+superseded by an even newer capture while its correction was in flight
+gets its stale result silently discarded (the newer capture already
+queued its own fresh correction). `shutdown()` cancels the worker job and
+closes the channel alongside every other mode's cleanup.
+
+**`start_live_reading()`/`stop_live_reading()` (new tools) — continuous
+capture, superseding the note below about `gt.py`'s capture-pacing model
+NOT being ported (it now is)**: mirrors `gt.py`'s Live Reading tab's
+3-stage pipeline exactly, adapted to Kotlin coroutines —
+`ToolDispatcher.toolStartLiveReading()` starts two background jobs instead
+of `enter_reading_mode()`'s one-shot state reset:
+- **Capture** (`liveReadingCaptureJob`) — every `LIVE_READING_INTERVAL_MS`
+  (5s, not yet Settings-exposed — a reasonable follow-up), calls the SAME
+  `acquireSharpFrame()` blur skip/retry `scan_current_view()` uses, and
+  sends the result to `liveReadingOcrChannel` (`Channel<ByteArray>`,
+  unlimited). A still-blurry frame after `acquireSharpFrame()`'s own
+  retries waits `LIVE_READING_BLUR_GIVEUP_MS` (4s) before the next attempt
+  instead of the normal interval — same `BLUR_GIVEUP_WAIT_S` precedent
+  `gt.py` established. Runs on its own fixed real-time cadence, never
+  blocked by how long OCR/correction take — same "play it out like
+  realtime reading" simplification `gt.py` settled on (one interval
+  control, not a separate capture-interval/video-advance split).
+- **OCR worker** (`liveReadingOcrJob`) — drains the channel ONE AT A TIME
+  (never starts a new OCR call until the previous one's response is back),
+  calls `OcrClient.analyze()` then `OcrBlockFilters.integrateRawBlock()`.
+  `"new"`/`"stitched"` are spoken IMMEDIATELY via a new shared
+  `speakReadingText()` helper (factored out of `toolReadAloud()`, reused
+  by both) — RAW text, since correction hasn't run yet, same as the
+  one-shot `scan_current_view()` path. `"new"`/`"stitched"`/`"updated"`
+  all get queued onto the SAME `correctionChannel`/`correctionWorkerJob`
+  the one-shot path already uses — one shared correction queue regardless
+  of which reading tool produced the block.
+
+`toolStopLiveReading()` cancels both jobs and closes the channel but
+leaves `state.readingBlocks` intact — `read_aloud(scope="all")`/
+`get_reading_section()`/`save_reading_buffer()` still work afterward,
+mirroring `gt.py`'s separate Start/Stop/Clear-Buffer semantics
+(`stopActiveModes()`/`toolExitReadingMode()`/`shutdown()` all now also
+call `stopLiveReadingPipeline()`, so switching to any other mode, exiting
+reading mode entirely, or tearing down the whole session correctly halts
+it too).
+
+**`save_reading_buffer(label)` (new tool)** — pulls `state.
+readingBufferText()` directly rather than relying on `save_memory(label,
+note)` with Gemini retyping the scanned text into `note` itself (the
+original save-memory path is a general-purpose tool with no idea reading
+mode's buffer even exists) — avoids Gemini having to faithfully reproduce
+a whole scanned document into a function-call argument, which risks
+truncation/paraphrasing for anything beyond a short note. Works
+identically regardless of whether the buffer was filled by one-shot
+`scan_current_view()` calls or a live-reading session, since both write
+into the same `state.readingBlocks`. Saved through the existing
+`LocalMemoryStore.append()` + `embedAndStore()` path (same as
+`save_memory()`), so it's queryable later via the existing
+`query_memory()` semantic search — no new retrieval path needed.
+
+**Known, accepted limitations** (same standing caveat as the rest of this
+feature's development): not verified end-to-end on a real device — compile-
+verified only (`./gradlew :app:compileDebugKotlin`, clean build, zero new
+warnings). `LIVE_READING_INTERVAL_MS` is a hardcoded constant, not yet a
+Settings field (unlike `frameIntervalMs`/`scanIntervalMs`/
+`avoidanceIntervalMs`, which are) — a reasonable follow-up if 5s needs
+per-user tuning. `gt.py`'s block-by-block debug viewer (raw vs. corrected
+side by side, Prev/Next buttons) was NOT ported — that's specific to that
+standalone test harness's Gradio UI; the production app speaks results
+instead of displaying them, so there's no equivalent need.
+
+### Server-side scan_server.py — deleted, restored, then reduced to a plain Gradio launcher
+
+`scan_server/scan_server.py` (originally: a FastAPI `/api/upload`
+entrypoint + `mount_gradio_app` launcher) was deleted once
+`ScanViewModel.kt` (its only HTTP client) was removed, then restored on
+user request as `scan_gui.py`'s launcher — `scan_gui.py`'s rich Live
 Reconstruction/Occupancy Map/Voxelization/Live Navigation Preview panels
-were meant to be merged into the main server's Gradio dashboard
-(`server_gui.py`, port 7860) as the debugging/monitoring UI for
-`MappingService`, but that richer merge still hasn't happened.
-`server_gui.py`'s own "Mapping" tab (see the ActivityMonitor rewrite above)
-only shows the last received frame + pose/grid_updated/confidence — a much
-thinner view than `scan_gui.py`'s Occupancy Map/Voxelization/Confidence Map
-panels, which still have no equivalent on the live dashboard; deleting
-`scan_gui.py` now (or the modules it depends on) would remove the only way
-to visually inspect the live mapping pipeline in that depth. `scan_gui.py`
-currently has no launcher (its only one, `scan_server.py`, is gone) — it's
-orphaned, not functional, until either the richer Gradio-dashboard merge
-happens or someone launches it with a small ad-hoc script.
+were left in place through the deletion (meant to eventually be merged
+into `server_gui.py`'s Mapping tab, which still only shows a much thinner
+last-frame/pose/grid view) but had no way to run without this file.
+
+**Current state: plain Gradio launch, no HTTP API at all.** Video
+ingestion (originally added to this file as a `POST /api/upload` endpoint
+accepting a video file, decoded server-side via OpenCV) has been moved
+**into the GUI itself** — `scan_gui.py`'s "Load from Video" accordion
+(was "Load from Android Upload") now has its own `gr.Video` upload widget
++ "Extract Frames" button, calling `_extract_video()` directly in-process.
+With that gone, `scan_server.py` had nothing left to serve over HTTP, so
+the FastAPI app / `mount_gradio_app()` / `uvicorn.run()` wrapper this file
+used to also carry (both when originally restored and during the
+video-upload experiment) was removed outright — `_build_ui()` returns the
+`gr.Blocks` app directly and `__main__` just calls `demo.launch(server_name=
+"0.0.0.0", server_port=GRADIO_PORT)`. `uploads/` on disk is unchanged in
+meaning (still where extracted `dataset/` folders land, still what
+`create_scan_ui(..., upload_dir=...)` browses for the "Past Uploads"
+dropdown) — only the thing that populates it changed, from an HTTP POST to
+a GUI button.
+
+One other deliberate deviation from the original file, carried through
+every version since restoration: the `--da3-model torch` path's
+`SCAN_DA3_TORCH_MODEL_ID` fallback is `depth-anything/DA3METRIC-LARGE`,
+not the original `depth-anything/da3-large` — the latter is a multi-view,
+non-metric checkpoint that caused a real RTAB-Map total-tracking-failure
+incident (see "DA3 model default + per-frame processing + pre-DA3 blur
+gate" below); `grpc_server.py` already carries this same fix, and leaving
+this file's own copy un-fixed would silently reintroduce that bug for
+anyone launching offline scans via `--da3-model torch` with no
+`SCAN_DA3_TORCH_MODEL_ID` set. Run: `cd scan_server && python
+scan_server.py` (port 7861, `SCAN_GRADIO_PORT` to override; `--da3-model
+onnx` for the lighter DA3-METRIC ONNX path instead of torch).
+
+**`scan_gui.py`'s `_extract_video()`** (the ported video-ingestion logic,
+now GUI-side): decodes an uploaded video via `cv2.VideoCapture` into
+`uploads/<scan_id>/dataset/`: `images/000000000.jpg, ...` +
+`camera.csv` (`timestamp_ns,filename`) — the same layout
+`stream_simulator.py` already expects, so nothing downstream needed to
+change. Every decodable frame is extracted (no subsampling at extraction
+time); `timestamp_ns` is derived from the video's own reported fps
+(`frame_idx / fps`, falling back to 30fps if the container reports
+0/NaN), so the *existing* replay-time fps slider
+(`stream_simulator.build_event_timeline`) subsamples an ingested video
+exactly like it already subsamples an Android-recorded dataset — no
+separate code path needed. **No `imu.csv` is produced** — a video
+container carries no IMU stream, and this isn't a special case downstream:
+`ScanSession.set_imu_file()` is simply never called for it, and IMU + VO
+pose mode already falls back to VO-only rotation when no `imu.csv` is
+present (the same fallback an Android recording with a missing/corrupt
+`imu.csv` would already hit); RTAB-Map pose mode needs no IMU either way.
+On success, the extracted `dataset/` path is written straight into
+`dataset_path_input` (same output slot `_load_upload()`/"Load Selected"
+already targets), so the existing `dataset_path_input.change()` wiring
+picks it up and loads the gallery/segment table automatically — no new
+propagation path needed. `_upload_dir` also now defaults to a local
+`scan_server/uploads/` folder when `create_scan_ui()` is called without an
+explicit `upload_dir` (previously this made the "Past Uploads"
+dropdown/video-extraction target `None`-guarded and silently inert without
+one), so the GUI is self-sufficient even outside `scan_server.py`'s own
+wiring.
+
+### Foreground-service migration + calls/SMS/YouTube (`LiveAssistantService`)
+
+The whole point of this round of work: the Gemini Live session (gRPC, camera
+frames, mic, tool dispatch) used to live entirely inside `MainViewModel`'s
+`viewModelScope` — Activity/ViewModelStore-scoped, so it died on screen-off/
+task-swipe. That made call-answering/SMS-reacting while the phone is in a
+pocket impossible. Also added: voice-callable YouTube search/playback.
+
+**`live/LiveAssistantService.kt`** (new) — a `LifecycleService`, foreground +
+bound, now owns everything `MainViewModel` used to own directly:
+`GrpcClientManager`, `CameraManager`, `PushToTalkRecorder`,
+`StreamingAudioPlayer`, `HrtfBeaconPlayer`, `TrackingBackend`, `HandTracker`,
+`RotationTracker`, `PdrStepEstimator`, `AndroidDeviceToolHandler`,
+`LocalMemoryStore`, `LiveSessionState`, `GeminiLiveClient`, `ToolDispatcher`,
+`uiState`. Started via `startForegroundService()` (survives independently of
+any binding) AND bound via a plain `LocalBinder` (no DI/Hilt in this
+codebase). Holds a `PARTIAL_WAKE_LOCK` while a session is connected (new to
+this codebase — no prior wakelock usage). **Deliberately does NOT call
+`stopSelf()` in `onTaskRemoved`** — the one intentional divergence from
+`device/PlaybackService.kt`'s otherwise-mirrored foreground-notification
+pattern (`NotificationChannel` + `NotificationCompat`, `IMPORTANCE_LOW`),
+since surviving task removal is the entire point. `onStartCommand` also
+handles `ACTION_INCOMING_CALL`/`ACTION_SMS_RECEIVED` intents from the two
+new receivers below, relaying to `liveClient?.sendSystemNote(...)` — a
+no-op if no session is currently connected.
+
+**`ui/MainViewModel.kt`** — reduced to a thin bound-client facade: binds to
+`LiveAssistantService` from `init {}` (via Application context — keeps
+`MainActivity.kt` completely unchanged, still a plain `viewModel()` call, no
+new plumbing there), re-exposes the bound service's `uiState`/
+`pendingYoutubeVideoId` via `flatMapLatest`, and delegates
+`connect()`/`disconnect()`/`startPtt()`/`stopPtt()`/`clearError()` to the
+bound instance. **`onCleared()` deliberately does NOT call `disconnect()`**
+— only unbinds; the whole point is the session outlives this ViewModel.
+
+**`camera/CameraManager.kt`** — `bind(lifecycleOwner)` no longer takes a
+`PreviewView` and is now called exactly ONCE for the Service's entire
+lifetime (from `LiveAssistantService.onCreate()`), binding Preview +
+ImageAnalysis together as before (the existing "never call
+`bindToLifecycle` twice" comment is now actually never violated, instead of
+merely being a warning). The on-screen preview plugs in/out via new
+`attachPreviewSurface(previewView)`/`detachPreviewSurface()` — just calling
+`Preview.setSurfaceProvider(...)`/`(null)` on the already-bound `Preview`
+use case, independent of any lifecycle binding. `MainScreen.kt`'s
+`AndroidView` factory calls `viewModel.attachCameraPreview(previewView)`
+(new `MainViewModel` method) instead of the old direct `cameraManager.bind`
+call, with a `DisposableEffect` calling `detachCameraPreview()` on dispose.
+Both `CameraManager` and `MainViewModel` remember a `pendingPreviewView` and
+re-apply it once the async `ProcessCameraProvider`/Service-binding
+completes, guarding the real race between a `PreviewView` attaching before
+either finishes.
+
+**Telephony (`receivers/CallBackgroundReceiver.kt`, new)** — a transient
+`BroadcastReceiver` for `PHONE_STATE`; on ringing, resolves the caller via
+`ContactsContract.PhoneLookup` and starts (not binds)
+`LiveAssistantService` with `ACTION_INCOMING_CALL`. New `answer_phone_call`
+tool (`ToolDeclarations.kt`/`ToolDispatcher.kt`/`AndroidDeviceToolHandler
+.answerPhoneCall()`) — `ANSWER_PHONE_CALLS` + `TelecomManager
+.acceptRingingCall()`. **Known, accepted risk, not yet verified on a real
+device**: proceeding on the documented API for a non-default-dialer app;
+search results were inconclusive on whether this actually works without
+claiming the dialer role on current Android versions — if it throws
+`SecurityException` in practice, that's the first thing to check (the
+handler already catches and surfaces that specific exception distinctly).
+
+**SMS (`receivers/SmsBackgroundReceiver.kt`, new)** — same transient-receiver
+pattern for `SMS_RECEIVED`, starting `LiveAssistantService` with
+`ACTION_SMS_RECEIVED`. New `send_sms`/`check_unread_sms` tools
+(`AndroidDeviceToolHandler`) — `send_sms` reuses the existing
+`lookupContactNumber()` helper (same name→number resolution
+`make_phone_call` already does) before falling back to treating the input
+as a raw number; `check_unread_sms` queries `Telephony.Sms.Inbox` with
+`read = 0`. **Personal/sideloaded distribution only** (confirmed with the
+user) — Google Play's policy restricting `READ_SMS`/`RECEIVE_SMS` to
+default SMS/Phone/Assistant handler apps is a Store-listing policy, not an
+OS-level technical block, so it doesn't apply here; would need
+re-addressing before any Play Store submission.
+
+**YouTube (`live/YouTubeSearchClient.kt`, new)** — direct 3rd-party OkHttp
+calls to YouTube Data API v3 (`/search`, `/videos`), same pattern as
+`OcrClient.kt`; new "YouTube API Key" Settings field
+(`SettingsViewModel.kt`/`SettingsScreen.kt`, mirrors the existing
+`ocrApiKey` field exactly). `search_youtube`/`get_video_info` were already
+declared (previously routed to a hardcoded "not available" stub in
+`ToolDispatcher.kt` — that stub is now replaced with real calls). New
+`play_youtube_video(video_id)` tool — deliberately NOT wired through
+`play_video`/`PlaybackService` (which expects a resolved stream URL):
+playback uses the official `com.pierfrancescosoffritti.androidyoutubeplayer`
+(IFrame) library instead, chosen specifically for ToS compliance over a
+yt-dlp-style stream resolver. **Real, accepted limitation**: the IFrame
+player is a WebView-based `YouTubePlayerView` that can only run with a
+visible on-screen surface — YouTube's own ToS requires the player be
+visibly rendered during playback — so `play_youtube_video` only works while
+`MainActivity`'s UI is actually in the foreground with the small embedded
+player visible (`MainScreen.kt`'s `YouTubePlayerOverlay`), unlike every
+other tool in this app, which works with the screen off. `stop_music` now
+stops BOTH playback surfaces (the existing `PlaybackService`/ExoPlayer path
+AND the YouTube player, via `ToolDispatcher`'s new `onStopYoutubeVideo`
+callback) — matches the user's "stop the music" intent regardless of which
+tool started it, rather than adding a second, easily-confused stop tool.
+
+**Manifest additions**: `ANSWER_PHONE_CALLS`/`READ_PHONE_STATE`/
+`READ_CALL_LOG` (telephony), `RECEIVE_SMS`/`READ_SMS`/`SEND_SMS`,
+`FOREGROUND_SERVICE_MICROPHONE`/`FOREGROUND_SERVICE_CAMERA`/`WAKE_LOCK`/
+`POST_NOTIFICATIONS`/`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, plus the new
+`<service>` (`foregroundServiceType="microphone|camera"`) and the app's
+first two `<receiver>` entries. `MainActivity.kt`'s existing single bulk
+`permissionLauncher.launch(...)` call was extended with all the new
+dangerous permissions (same mechanism, no new pattern). Battery-optimization
+exemption (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) is a Settings-screen
+button (`PowerManager.isIgnoringBatteryOptimizations` check + the special
+intent), not an automatic launch-time prompt.
+
+**Not verified end-to-end on a real device from this environment** —
+compile-verified only (`./gradlew :app:compileDebugKotlin`), same standing
+caveat as every other round of Android work in this repo. Specifically
+unverified: the Service actually surviving task-swipe/process death in
+practice; `acceptRingingCall()` without the dialer role; `EXTRA_INCOMING_
+NUMBER` availability given `READ_CALL_LOG` on the target Android version;
+SMS broadcast delivery/priority timing; the YouTube player's actual
+play/pause behavior across foreground/background transitions.
+
+### Ducking TTS/music while the user is speaking (PTT) — superseded
+
+**Superseded — see "Continuous VAD-gated listening + interruptible
+sentence-level reading" below.** Push-to-talk itself was removed; the
+`StreamingAudioPlayer.duck()`/`unduck()` mechanism this section describes
+was deleted outright (replaced by `stopAndFlush()`), and the
+`PlaybackService.ACTION_PAUSE`/`ACTION_RESUME` actions are now triggered by
+VAD utterance-boundary events instead of button press/release. Kept here
+for history — the underlying insight (nothing coordinated recording state
+with playback state) is still what motivated the next redesign.
+
+Real gap found and fixed: nothing coordinated "the user is actively
+recording" with "audio is currently playing" anywhere in this codebase —
+`ChatPanel.kt`'s PTT button was never blocked (fine, no fix needed there),
+but `StreamingAudioPlayer` (Gemini's own TTS voice) and `PlaybackService`'s
+ExoPlayer (music) both play completely independently of recording state,
+and `PushToTalkRecorder` requests no audio focus at all — so TTS/music
+audio could bleed into the mic as echo/feedback while the user tries to
+speak, and `LiveAssistantService.startPtt()`/`stopPtt()` had zero
+interaction with either playback path.
+
+**Chosen fix: duck (pause) both playback surfaces for the duration of a PTT
+hold, rather than requesting OS audio focus** — this app already knows
+exactly when the user starts/stops speaking (`startPtt()`/`stopPtt()`,
+explicit push-to-talk, not VAD-triggered), so explicit pause/resume calls at
+those two points are simpler and more reliable than negotiating Android's
+audio-focus stack (which `StreamingAudioPlayer`'s raw `AudioTrack` and
+`PushToTalkRecorder`'s raw `AudioRecord` don't participate in at all today).
+
+- **`StreamingAudioPlayer.duck()`/`unduck()`** (new) — `AudioTrack.pause()`/
+  `.play()`, not `.stop()`/release — incoming chunks from `writeChunk()`
+  (still arriving from Gemini's audio stream regardless of PTT state) keep
+  queuing in the track's own buffer while paused, so playback resumes
+  smoothly rather than dropping audio.
+- **`PlaybackService`** gained `ACTION_PAUSE`/`ACTION_RESUME` (new,
+  `onStartCommand` branches on these BEFORE the existing `stream_url`-based
+  play flow) — `player?.pause()`/`.play()`; a pause/resume signal with no
+  player yet (nothing playing) calls `stopSelf()` rather than lingering as
+  an empty non-foreground service. Reused as a plain `startService()` call
+  (this service has always been started-only, never bound — see `onBind()`
+  stub) from `LiveAssistantService`.
+- **`LiveAssistantService.startPtt()`/`stopPtt()`** now call
+  `streamingPlayer.duck()`/`unduck()` and send `PlaybackService`'s new
+  actions, symmetric with each other.
+- **YouTube IFrame player** — its `YouTubePlayer` instance lives in
+  Compose (`MainScreen.kt`'s `YouTubePlayerOverlay`), not the Service, so
+  it can't be reached from `startPtt()`/`stopPtt()` directly; instead
+  `YouTubePlayerOverlay` takes `isRecording` (already surfaced via
+  `AppUiState`/`uiState.isRecording` — no new StateFlow needed) and a
+  `LaunchedEffect(isRecording, player)` calls `player.pause()`/`.play()`
+  directly. **Known, accepted quirk**: if the user manually paused the
+  YouTube video themselves via its own on-screen controls, ending a PTT
+  hold will resume it anyway (this effect can't distinguish "paused because
+  we ducked it" from "user paused it") — a minor rough edge, not fixed,
+  consistent with this feature's overall scope.
+- **Not changed**: `PushToTalkRecorder`'s `AudioSource.MIC` (no platform
+  echo cancellation) — considered, but not needed once playback is fully
+  ducked during recording rather than left running concurrently; there's no
+  overlapping audio left for echo cancellation to clean up.
+
+### Continuous VAD-gated listening + interruptible sentence-level reading
+
+Push-to-talk (tap-and-hold) is removed entirely, per the user's explicit
+request. The mic now streams continuously, gated by a client-side amplitude
+VAD — finally consuming `vadThreshold`/`startThreshold` ("Noise Gate"/
+"Start Volume" in Settings), which had been threaded all the way from
+`SettingsScreen.kt` through `MainViewModel.connect()` into
+`LiveAssistantService.connect()` since the original migration but never
+actually read inside the function body (a real, confirmed-dead pair of
+parameters — `Parameter 'vadThreshold' is never used` was a standing
+compiler warning until this landed).
+
+**`audio/ContinuousVadRecorder.kt`** (new, replaces `PushToTalkRecorder.kt`
+— deleted outright) — same `AudioRecord` capture shape (16kHz mono PCM16,
+512-sample chunks, daemon thread, `computeRms()` reused verbatim) but runs
+for the Service's whole connected lifetime (`start()` in `connect()`,
+`stop()` in `disconnect()`/`onDestroy()`), not per-gesture. Per-chunk state
+machine: **IDLE** — RMS `>= startThreshold` transitions to SPEAKING, fires
+`onSpeechStart()`, forwards the chunk; otherwise the chunk is discarded
+(never sent to Gemini), only `onVolumeChange()` fires (UI meter). **SPEAKING**
+— every chunk forwarded via `onChunkReady`; once RMS has stayed below
+`noiseGate` (`vadThreshold`) for `hangoverMs` (800ms), transitions back to
+IDLE and fires `onSpeechEnd()` — "the user's line has been registered."
+
+**Explicit design choice, confirmed with the user: NO ducking during
+capture.** Music/reading keep playing normally through the entire window
+from `onSpeechStart` to `onSpeechEnd` — this is a deliberate reversal of the
+previous PTT-era ducking (see the now-superseded section above). Ducking
+only happens once the utterance is fully registered, since that's when
+Gemini's response is about to arrive and would otherwise overlap whatever
+was already playing.
+
+**`live/LiveAssistantService.kt`'s `onSpeechEnd` handler** — the actual
+orchestration point: `liveClient.sendAudioStreamEnd()`, sets
+`isRecording=false, isAwaitingResponse=true` on `AppUiState`, calls
+`toolDispatcher.interruptReadingForUserTurn()` (see below), and sends
+`PlaybackService.ACTION_PAUSE`.
+
+**Response-drain timing (replaces `doLiveSession()`'s previously-no-op
+`TurnComplete` handling)** — `resumeAfterResponse()` (music/`isAwaitingResponse`
+only, deliberately never touches reading) fires after an estimated delay
+computed from `responseBytesWritten * 1000 / 48000` (24kHz 16-bit mono
+bytes/sec) minus elapsed time since the first response chunk, plus a small
+`DRAIN_MARGIN_MS` (200ms) safety margin. **Accepted approximation**:
+estimates drain time from bytes-written/sample-rate rather than polling the
+AudioTrack's real playback-head position — good enough given the small
+buffer sizes involved, not gold-plated on purpose.
+
+**Reading interruption is a hard stop, not a duck** — `StreamingAudioPlayer`
+is a single shared `AudioTrack` used by BOTH Gemini's own conversational
+voice and reading-mode TTS, so they can never truly play concurrently on it.
+`StreamingAudioPlayer.duck()`/`unduck()` were removed (see the superseded
+section above); replaced by **`stopAndFlush()`** — `pause(); flush(); play()`
+— which discards whatever reading audio is still queued (as opposed to a
+plain pause, which would preserve it and play it back before Gemini's
+response, stale and out of order) so the response starts clean.
+
+**`live/ToolDispatcher.kt` — sentence-level reading pipeline (replaces
+`speakReadingText()`, deleted outright)**:
+- `splitIntoSentences(text)` — same `(?<=[.!?])\s+` boundary regex
+  `toolGetReadingSection()`'s `splitChunks()` already used, just without
+  repacking into ~500-char groups.
+- `speakSentences(sentences)` — fire-and-forget, launches a cancellable
+  `readingJob`. **Lookahead pre-synthesis**: sentence N+1's `Synthesize`
+  call starts as an `async` child the moment sentence N *begins* playing
+  (not when it finishes) — maximizes overlap so there's no gap between
+  sentences as long as synthesis keeps pace with playback. On natural
+  completion, clears `pendingReadingContinuation`. On cancellation, captures
+  `sentences.subList(currentIndex, size)` into `pendingReadingContinuation`
+  — storing the actual remaining sentence STRINGS (not a block-id+index
+  pair) sidesteps any indexing drift across appended reading blocks.
+- **`interruptReadingForUserTurn()`** (new, public) — called by
+  `LiveAssistantService`'s `onSpeechEnd`: cancels `readingJob`, then calls
+  the new `flushPlayback` constructor lambda (wired to
+  `streamingPlayer.stopAndFlush()`). No-ops if nothing was reading.
+- **New tool `continue_reading()`** → `toolContinueReading()` — resumes
+  `pendingReadingContinuation` via `speakSentences()`, or returns
+  `{"status":"nothing_to_continue"}`. **Deliberately never auto-triggered**
+  — only this explicit voice command resumes interrupted reading, per the
+  user's explicit requirement.
+- `toolReadAloud()` and the live-reading OCR worker's "new"/"stitched"
+  branch both switched from awaiting `speakReadingText()` to firing
+  `speakSentences()` and returning immediately. **This is a deliberate,
+  necessary behavior change, not an accidental regression**: Gemini Live's
+  function calling is synchronous-only ("the model will not start
+  responding until you've sent the tool response") — if `toolReadAloud()`
+  awaited an entire page's TTS before returning, Gemini couldn't react to
+  the user's interrupting speech at all until the whole page finished,
+  defeating the point of VAD-based interruption. `toolReadAloud()`'s
+  response shape changed accordingly: `{"status":"reading_started",...}`
+  instead of the old `{"status":"read_aloud",...}` (which implied
+  completion).
+
+**`live/ToolDeclarations.kt`** — new `continue_reading` decl; SYSTEM_PROMPT
+note that reading stops automatically the instant the user talks (nothing
+to call for that) and `continue_reading()` resumes it on request.
+
+**UI simplified** (`ui/ChatPanel.kt` deleted outright — no remaining
+caller; `ui/MainScreen.kt` stripped down to exactly three things, per direct
+user request: camera preview, the Settings button, and the YouTube IFrame
+player). The chat history/transcript, connection chip, tracking/hand
+bounding-box overlay, and guiding/walking banner are all gone from the
+screen — `AppUiState` still carries the underlying data (nothing upstream
+was removed), only this screen stopped rendering it. The YouTube player is
+now **always mounted** (not conditionally composed on a non-null pending
+video id) so it's immediately ready rather than being torn down/recreated
+between playbacks; it shows/hides its own close button and loads/pauses
+based on a nullable `videoId` param instead. `MainViewModel.startPtt()`/
+`stopPtt()` and `LiveAssistantService.startPtt()`/`stopPtt()` are deleted
+outright — nothing calls them any more.
+
+**Known, accepted limitations**:
+- No barge-in interruption of Gemini's OWN in-progress spoken reply if the
+  user starts a new utterance while it's still talking — only reading-mode
+  TTS gets interrupted by a new turn. `LiveServerEvent.Interrupted` (still
+  a no-op) is the existing hook if this is revisited later.
+- `continue_reading()` resumes the exact sentence list captured at
+  interruption time — a stale-but-harmless snapshot, not re-derived from
+  `readingBlocks` if reading-mode activity changed in between.
+- VAD thresholds/hangover and the response-drain estimate are unverified on
+  a real device (no device available from this environment, same standing
+  caveat as every other round of Android work here) — compile-verified only.
+
+### Self-echo / output-aware VAD gating, service restart recovery, reading-interrupt race (found via user report, fixed)
+
+Real incident, reported directly by the user right after continuous
+listening shipped: with the mic always live, the device's own speaker
+output (Gemini's spoken reply, reading-mode TTS, the HRTF beacon's
+continuous guidance tone during walking/guiding, music/YouTube) could be
+picked up by the mic and misread as the user talking — feeding the
+assistant's own voice back to itself and looping. Investigated and fixed
+five distinct issues from that report:
+
+1. **Self-echo/self-interruption loop — the core issue, fixed with real
+   AEC, not just muting.** `ContinuousVadRecorder` used to capture on plain
+   `AudioSource.MIC` with zero awareness of playback state. Fixed two ways,
+   deliberately NOT by pausing playback during capture (that was already
+   ruled out earlier — see the "Continuous VAD-gated listening" section
+   above; the HRTF beacon alone makes blanket muting-while-anything-plays
+   unworkable, since it's audible through nearly all of walking/guiding —
+   gating the VAD off for that whole duration would make the assistant deaf
+   during navigation):
+   - **`AudioSource.VOICE_COMMUNICATION`** (not `MIC`) — enables platform
+     acoustic echo cancellation/noise suppression on most devices for this
+     capture session, the standard Android idiom for full-duplex voice
+     apps. `AcousticEchoCanceler`/`NoiseSuppressor` are also explicitly
+     attached to the `AudioRecord`'s session (`isAvailable()`-guarded, both
+     released in the loop's `finally`) as a belt-and-suspenders measure —
+     some devices need the explicit attach even with this source. This is
+     the primary defense and preserves genuine barge-in.
+   - **Output-aware threshold raise, defense-in-depth** — `ContinuousVadRecorder
+     .start()` gained an `isOutputActive: () -> Boolean` param, polled once
+     per chunk; while true, the effective start threshold is multiplied by
+     `OUTPUT_ACTIVE_THRESHOLD_MULTIPLIER` (3.0x), so residual echo that
+     leaks past AEC needs to be well above ambient to mis-register, while a
+     genuinely louder direct interruption still gets through.
+   - **Every output source wired in, per the user's explicit "check every
+     output audio" instruction** (`LiveAssistantService.connect()`'s
+     `isOutputActive` lambda): `streamingPlayer.isPlaying` (Gemini's own
+     reply + reading TTS), `hrtfBeacon.isEmitting` (new — `overallGain >
+     0.02f`, the beacon's own continuous guidance tone), `PlaybackService
+     .isPlaying` (new — a companion `MutableStateFlow`, since
+     `PlaybackService` is started-only/unbound and there was previously no
+     way to query its state at all), and `_pendingYoutubeVideoId != null`
+     (a proxy for the YouTube overlay — its real player instance lives in
+     Compose/a WebView, not reachable from the Service, so presence of a
+     pending video id stands in for "probably playing").
+2. **(Same root cause as #1, not a separate fix.)**
+3. **Service killed by the OS while running never recovered — fixed with a
+   persisted-flag-gated auto-reconnect.** `LiveAssistantService.onStartCommand`
+   now branches on `intent == null` specifically (not `intent?.action ==
+   null`) — a null Intent object is unambiguous for "the system restarted
+   this process after killing it" (`START_STICKY`); `MainViewModel`'s own
+   initial `startForegroundService()` call always passes a real Intent
+   object (its `action` happens to be null, but the object itself isn't),
+   so this doesn't false-trigger on ordinary app launch. `restoreSessionFromPrefsIfAvailable()`
+   reconnects using the exact same `SharedPreferences` keys
+   `SettingsViewModel` already persists — but ONLY if a new
+   `session_was_active` boolean (set `true` in `connect()`, `false` in
+   `disconnect()`) says a session was genuinely live when the process died;
+   without this flag, a user who explicitly disconnected would get silently
+   reconnected the next time the OS happened to kill+restart the otherwise-
+   idle Service, which is not what they asked for.
+4. **Response-drain race (the tail-end echo of Gemini's own reply)** — partly
+   the same root cause as #1 (now covered by AEC + the output-aware
+   threshold raise while `isAwaitingResponse`), partly a timing margin issue:
+   `DRAIN_MARGIN_MS` bumped 200ms → 350ms as extra cushion. Explicitly
+   documented as no longer load-bearing on its own now that real AEC is the
+   primary defense.
+5. **Interrupted sentence-level reading could desync from a real race** —
+   `ToolDispatcher.interruptReadingForUserTurn()` used to `readingJob
+   ?.cancel()` then immediately call `flushPlayback()`. Coroutine
+   cancellation is cooperative (`speakSentences()`'s loop only checks
+   `ensureActive()` once per chunk, not mid-chunk) — cancelling and flushing
+   without waiting let an already-in-flight `playPcm()` call for the
+   about-to-be-abandoned sentence land in the AudioTrack buffer AFTER the
+   flush, which could both audibly overlap the start of Gemini's response
+   and leave `pendingReadingContinuation`'s resume cursor pointing at the
+   wrong sentence. Fixed by blocking on `runBlocking { job.join() }` between
+   `cancel()` and `flushPlayback()` — safe here specifically because this
+   function is always invoked from `ContinuousVadRecorder`'s own dedicated
+   background thread (never the main thread), so the brief block (at most
+   one chunk's worth of synthesis/playback, typically well under 100ms)
+   doesn't stall the UI, only that thread's next mic-chunk read.
+
+**Not verified end-to-end on a real device from this environment** — same
+standing caveat as the rest of this feature. Specifically unverified:
+whether platform AEC is actually effective against the HRTF beacon's
+synthesized tone and TTS speech on a real device (AEC implementations vary
+by OEM and are tuned for voice-call content, not arbitrary media), and
+whether `OUTPUT_ACTIVE_THRESHOLD_MULTIPLIER`'s 3.0x is the right value in
+practice (a real-device tuning knob if false triggers or missed barge-in
+turn out to be common).
+
+### Voice-message-sent confirmation cue
+
+Requested directly by the user: a gentle audible confirmation every time
+the client successfully hands a recorded utterance off to Gemini Live —
+so the user gets non-visual feedback that their voice message actually
+went out, not just that the mic stopped recording.
+
+`GeminiLiveClient.send()` (private) now returns `Boolean` — whichever
+`OkHttp WebSocket.send()` itself reports (`false` if there's no open
+socket) — instead of discarding it. `sendAudioStreamEnd()` (the call that
+marks the end of one recorded utterance, i.e. one "voice message") is the
+only caller whose result is used: it now returns that `Boolean` up to
+`LiveAssistantService`. The other `send()` callers
+(`sendAudioChunk`/`sendVideoFrame`/`sendSystemNote`/`sendToolResponse`)
+are unaffected — still `Unit`-returning, discarding the result as before.
+
+**Fires once per utterance, not per audio chunk.** The natural place to
+hook this is `LiveAssistantService`'s existing
+`vadRecorder.onSpeechEnd` handler (see "Continuous VAD-gated listening"
+above) — chunks stream continuously at ~512-sample granularity while
+SPEAKING (`onChunkReady`), so a cue per chunk would be near-constant
+noise; "a voice message" is the whole registered utterance, which is
+exactly what `onSpeechEnd`/`sendAudioStreamEnd()` represents. `onSpeechEnd`
+now checks `sendAudioStreamEnd()`'s return value and only plays the cue
+when it's `true` — a dropped send (e.g. socket closed mid-utterance)
+correctly stays silent rather than confirming something that didn't
+actually happen.
+
+`LiveAssistantService.playVoiceSentCue()` — a synthesized
+`ToneGenerator` tone (`TONE_PROP_BEEP2`, ~50ms, 40% of `MAX_VOLUME`), same
+"no bundled audio asset needed" precedent `ToolDispatcher.
+playDeadEndAlert()` already established for the dead-end tone. Deliberately
+**not** added to `ContinuousVadRecorder`'s `isOutputActive()` output-aware
+VAD gating (unlike `streamingPlayer`/`hrtfBeacon`/`PlaybackService`/the
+YouTube overlay, see "Self-echo / output-aware VAD gating" above) — it's a
+single ~50ms blip immediately after the mic has already transitioned back
+to IDLE, not a sustained output plausibly mistaken for new speech; adding
+it to that gate was considered unnecessary complexity for a real risk this
+small. `voiceSentToneGenerator` is released in `onDestroy()` alongside the
+Service's other cleanup.
+
+### News / Radio tools (Vietnam only, hardcoded)
+
+Requested directly by the user: `get_top_news`/`search_news`/`play_radio`/
+`stop_radio` tools, scoped specifically to Vietnam/Vietnamese — no
+`country`/`language` parameters are exposed to Gemini at all (hardcoded
+internally), so there's nothing for the model to get wrong there.
+
+- **`NewsClient.kt`** (new) — direct 3rd-party call to Google News' public
+  RSS feed (`news.google.com/rss` / `.../rss/search`, `hl=vi&gl=VN&
+  ceid=VN:vi` hardcoded), same "no server proxy" pattern as
+  `OcrClient.kt`/`YouTubeSearchClient.kt` — no API key, no quota to run
+  out of, no Settings field needed at all. Parses the RSS `<item>` entries
+  (title/source/pubDate/link) via Android's built-in `android.util.Xml`
+  `XmlPullParser` rather than adding a new XML dependency for a handful of
+  fields.
+- **`RadioClient.kt`** (new) — direct 3rd-party call to the free, keyless
+  Radio-Browser API (`radio-browser.info`), searching `country=Vietnam`
+  stations by name, sorted by votes. Resolves a station to its
+  `url_resolved` stream URL only — it never plays anything itself.
+  `play_radio`'s tool handler (`ToolDispatcher.toolPlayRadio()`) hands that
+  URL to the SAME `play_video`/`PlaybackService` (ExoPlayer) path YouTube's
+  resolved-stream fallback already uses — a live radio stream is just
+  another stream URL, so no separate radio player class was written.
+- **`stop_radio`** is declared as its own tool (matching what Gemini is
+  told it can call) but routes straight to the existing `toolStopMusic()`
+  — same handler `stop_music` already uses, which already stops
+  whichever playback surface is actually active. No separate stop logic
+  was written; the two tool names are aliases from the dispatcher's point
+  of view.
+- Both clients are constructed unconditionally as private fields inside
+  `ToolDispatcher` (`newsClient`/`radioClient`) — unlike
+  `youtubeSearchClient` (which needs a Settings-provided API key and is
+  therefore nullable/constructor-injected), neither news nor radio needs
+  any configuration, so there's no equivalent "not configured" degrade
+  path for either.
+- **Known, accepted limitations**: Google News RSS and Radio-Browser are
+  both public, unauthenticated, best-effort services with no SLA — a
+  future outage or shape change in either feed degrades to the existing
+  "empty results" convention (`found: false` / "station not found"), not a
+  crash. Not verified end-to-end on a real device from this environment —
+  compile-verified only, same standing caveat as the rest of this file's
+  Android work.
+
+### Radio/YouTube real-device bugs (crash, silent tool failures, VAD over-triggering)
+
+Three distinct bugs found from real-device logcat the user provided, after
+the News/Radio tools above landed — all now fixed.
+
+**1. `play_radio` crashed the whole app.** Real stack trace:
+`IllegalStateException: No suitable media source factory found for content
+type: 2` (content type 2 = HLS/`.m3u8`) thrown synchronously from
+`PlaybackService.onStartCommand()`'s `setMediaItem()`/`prepare()` — many
+internet radio stations serve HLS, but the app only depended on
+`media3-exoplayer` core, with no HLS extension module registered, and an
+uncaught exception inside a Service's `onStartCommand` kills the whole
+process, not just that Service. Fixed two ways: added
+`androidx.media3:media3-exoplayer-hls` (`build.gradle.kts`), and wrapped
+`setMediaItem`/`prepare`/`play` in try/catch in `PlaybackService.kt` — an
+unsupported stream format now logs and stops cleanly (`stopSelf()`)
+instead of crashing, since `Player.Listener.onPlayerError` (already
+present) only ever catches ASYNC playback errors, not this synchronous
+factory-lookup exception.
+
+**2. `search_youtube` worked but `play_youtube_video` silently failed —
+root-caused via decompiling the `android-youtube-player` library itself**
+(no source available locally, so `javap -c` against the AAR's `classes.jar`
+was used to read `YouTubePlayerBridge.parsePlayerError`): it only maps the
+5 officially-documented YouTube IFrame API error codes (`2`/`5`/`100`/
+`101`/`150`) to a named `PlayerConstants.PlayerError` — any other raw code
+falls through to `UNKNOWN`. A real logcat capture showed `onError: UNKNOWN`
+for a normal, playable video, meaning the WebView received a genuinely
+non-standard error — consistent with a missing IFrame `origin` parameter
+(a known class of issue for WebView-embedded YouTube players). The library
+supports `IFramePlayerOptions.Builder().origin(...)`, but this app's
+`YouTubePlayerOverlay` (`MainScreen.kt`) never set one, relying on
+automatic initialization with none configured.
+
+**Round 1 (wrong origin value): `origin("https://www.youtube.com")`.**
+Real-device testing showed this made things WORSE, not better — the error
+(now confirmed as "152-4") started firing IMMEDIATELY on load, before any
+playback attempt, instead of during buffering as before. Root cause of
+the regression: `origin` must identify the EMBEDDING app/page, not claim
+to BE youtube.com itself — using YouTube's own domain as the origin is
+semantically backwards and plausibly reads as spoofing to Google's
+anti-bot/referrer verification (which actively rejects a WebView with no
+valid Referer/origin OR a suspicious one — confirmed against user-supplied
+documentation of this exact error code's cause).
+
+**Round 2 (current): `origin("https://www.youtube-nocookie.com")`** — the
+value YouTube's own documented workaround for WebView/native-app embeds
+uses. Automatic initialization (origin left fully unset, the library's
+default) is the WORST case for this specific error, not a safe default, so
+`enableAutomaticInitialization = false` + explicit `initialize()` stays.
+**Not confirmed fixed on-device from this environment** — same standing
+caveat as round 1; if 152-4 still recurs, the next thing to check is
+whether this library's `loadDataWithBaseURL()`-based HTML injection (no
+custom HTTP headers possible through its public API) is fundamentally
+incompatible with YouTube's verification, which would require bypassing
+the library for a raw WebView + `loadUrl(url, extraHeaders)` with an
+explicit `Referer` header — a much larger change, not attempted here.
+
+Also fixed in the same pass (found while adding the `onError`/
+`onStateChange` debug logging that surfaced bug #2): `YouTubePlayerOverlay`'s
+listener object is created once inside `AndroidView`'s `factory` lambda
+(which only runs once per view instance), so its log lines were closing
+over the FIRST composition's `videoId` parameter value, not whatever video
+was actually loaded later — every log line displayed a stale, wrong
+video id. Fixed via `rememberUpdatedState(videoId)` (a `State` object
+whose identity is stable across recompositions but whose `.value` always
+reflects the latest one), read inside the listener instead of the raw
+parameter.
+
+**3. VAD required shouting to trigger — real bug, not just a threshold
+tuning issue.** `ContinuousVadRecorder`'s output-aware gating (see
+"Self-echo / output-aware VAD gating" above) multiplies the start
+threshold by `OUTPUT_ACTIVE_THRESHOLD_MULTIPLIER` (3x) whenever it
+believes audio is currently playing, to avoid the mic mistaking echo for
+speech. The YouTube signal feeding that check was `_pendingYoutubeVideoId
+!= null` — "a video is loaded" — which stays true for as long as the
+on-screen player exists, INCLUDING while it's paused (e.g. ducked during
+`isAwaitingResponse`, or manually paused via the on-screen controls) —
+permanently engaging the 3x multiplier with nothing actually audible.
+Given this session's heavy YouTube testing right before the report, this
+was almost certainly the cause. Fixed by threading the IFrame player's
+REAL `PlayerConstants.PlayerState` through to the Service instead of
+proxying on "is a video loaded":
+`YouTubePlayerOverlay`'s `onStateChange` now calls a new
+`onPlaybackStateChanged: (Boolean) -> Unit` param (true only for
+`PlayerState.PLAYING`) → `MainScreen.kt` wires it to
+`MainViewModel.reportYoutubePlaybackState()` (new) →
+`LiveAssistantService.reportYoutubePlaybackState()` (new) sets a new
+`_isYoutubePlaying` flag, which replaces `_pendingYoutubeVideoId != null`
+in the `isOutputActive()` lambda. `_isYoutubePlaying` is also reset to
+`false` alongside every existing `_pendingYoutubeVideoId = null` site
+(`onStopYoutubeVideo`, `disconnect()`, `dismissYoutubeVideo()`) for
+consistency, though `onStateChange` reporting a non-PLAYING state on
+stop/dismiss already covers it in practice.
+
+**Debug logging added in the same investigation** (still in place,
+useful for confirming any of the above on a real run):
+`GeminiLiveClient.handleServerMessage()` previously had no handling at all
+for a top-level `"error"` key from Gemini's WebSocket — a rejected/
+malformed session setup was silently dropped with zero log output,
+indistinguishable from "the model just didn't call any tool." Now logs
+(`GeminiLiveClient` tag) any `error` object in full, any `goAway` message,
+and — as a catch-all — the top-level keys of any server message that
+doesn't match a known shape.
+
+### Reading-mode crash on read_aloud (uncaught exception in the lookahead prefetch coroutine)
+
+Real, reproducible crash reported by the user: scan/OCR/Q&A all worked,
+but `read_aloud` crashed every time — the one pipeline those don't share
+is `ToolDispatcher.speakSentences()`'s sentence-level lookahead reading
+(see "Reading-mode OCR correction + fuzzy stitching" above). Root cause:
+`speakSentences()`'s launched coroutine used `async` for prefetching the
+NEXT sentence's TTS synthesis, with only a `catch (CancellationException)`
+around the whole body — no catch-all for real exceptions. Kotlin
+structured concurrency propagates a failing `async` child's exception to
+its parent Job EAGERLY, even before the child is ever `.await()`ed — so a
+real failure (a `Synthesize` gRPC hiccup, an `AudioTrack` error) could
+escape the per-sentence `try { prefetch.await() } catch` entirely, and
+since this coroutine ran on a scope with no `CoroutineExceptionHandler`
+installed, an uncaught exception on what is effectively a root coroutine
+crashes the whole process — not just this feature.
+
+Fixed with three layers, in `speakSentences()`/`StreamingAudioPlayer.kt`:
+- A `CoroutineExceptionHandler` added directly to `speakSentences()`'s
+  `scope.launch(...)` call — the actual crash-preventing fix, logging
+  `[reading] speakSentences failed: ...` under the `ToolDispatcher` tag
+  instead of taking down the app.
+- Each `playPcm(c)` call inside the loop is now individually try/caught —
+  one bad audio chunk no longer aborts the rest of the page.
+- `StreamingAudioPlayer.writeChunk()` (raw `AudioTrack.write()`, no
+  try/catch previously — unlike its sibling `stopAndFlush()`, which
+  already guards its own `AudioTrack` calls) now catches and logs instead
+  of throwing, covering a concurrent stop/release racing an in-flight
+  chunk write.
+
+Not verified end-to-end against the user's specific original crash from
+this environment (no device/stack trace was available to confirm the
+exact exception) — this closes the one structural gap in the pipeline
+capable of crashing the whole app regardless of the underlying cause, and
+adds the logging needed to identify that cause precisely if it recurs.
+
+### Visual re-ID for object memory (get_object_from_memory / is_this_object)
+
+`get_object_from_memory`/`remember_object` were previously TEXT-ONLY — no
+image or visual embedding was ever stored, only a text description
+embedded via MiniLM (`PerceptionService.Embed`) for semantic search. This
+is now extended with a second, separate visual index, so "where's my
+keys"-style recall can also visually confirm a candidate object currently
+in view rather than trusting the text match alone.
+
+- **`LocalMemoryStore.kt`** — new per-label visual-embedding store,
+  `<label>.objemb.json` (parallel to, and deliberately separate from, the
+  existing `<label>.vec.json` TEXT embedding index — different embedding
+  space entirely: DINOv2 ViT-S/14 384-dim visual re-ID vectors vs. MiniLM
+  text vectors). New methods: `addObjectEmbedding(label, vector)` appends
+  one visual embedding (a label can accumulate several across multiple
+  `remember_object` calls — different angles/lighting of the same physical
+  item); `getObjectEmbeddings(label)`; `hasObjectEmbeddings(label)`;
+  `bestObjectSimilarity(label, vector)` — max cosine similarity against
+  every stored embedding for that label (`-1f` if none stored).
+- **`ToolDispatcher.kt`** — two new shared helpers: `detectAll(prompt,
+  frame)` runs `PerceptionService.AnalyzeFrame(DETECT)` (GroundingDINO
+  open-vocab, same RPC `toolRunDetection` already uses) and returns every
+  detection, not just the best one; `embedBox(box, frame)` runs
+  `AnalyzeFrame(EMBED)` for a DINOv2 visual embedding of one box (reuses
+  the same underlying model `TrackingService.GetEmbedding`/
+  `server/tools/embedder.py`'s `DINOv2Embedder` already provide, just via
+  the `AnalyzeFrame` path). No new gRPC RPCs or proto changes were needed
+  — both helpers route through the existing `AnalyzeFrame` RPC's `DETECT`/
+  `EMBED` ops, just combined into a detect-then-embed-each-candidate
+  pipeline instead of being exercised individually.
+- **`remember_object(label, description)`** now also attempts a visual
+  capture: if the current camera frame is available, it runs
+  `detectAll(description, frame)`, takes the highest-scoring detection,
+  embeds it via `embedBox`, and stores the vector via
+  `addObjectEmbedding`. Best-effort — a failed/no detection still saves
+  the text description alone (`visual_captured: false` in that case).
+- **`get_object_from_memory(query)`** rewritten: still resolves the query
+  via the existing text semantic search first (MiniLM cosine, unchanged)
+  to get a candidate label+description. If a frame is available AND that
+  label has stored visual embeddings, it additionally visually verifies:
+  runs `detectAll(description, frame)` to find every matching box
+  currently in view, embeds each via `embedBox`, and scores each against
+  the label's stored embeddings via `bestObjectSimilarity`. Requires
+  similarity `>= OBJECT_MATCH_MIN_SIM` (0.55) to count as a visual match.
+  Deliberately does NOT guess between near-tied candidates (e.g. two
+  similar bottles in view) — if the top two candidates' scores are within
+  `AMBIGUITY_MARGIN` (0.05) of each other, returns `ambiguous: true` with
+  a message instructing Gemini to ask the user to clarify (point more
+  directly, describe left/right/color) instead of silently picking one
+  and mis-tracking. Falls back to the old text-only result when there's no
+  frame or no stored visual reference for that label (`visual_confirmed`
+  omitted in that case; `visual_confirmed: false` when a frame+embeddings
+  existed but no confident visual match was found).
+- **New tool `is_this_object(label)`** (`ToolDeclarations.kt`/
+  `ToolDispatcher.kt`) — answers "is this my X?" / "is this the X I
+  remembered?": requires the label to already have a stored visual
+  reference (errors otherwise, telling the caller it needs to have been
+  visible during a prior `remember_object` call). Runs
+  `detectAll(description, frame)` against the label's stored TEXT
+  description as the GroundingDINO prompt, then picks the LARGEST
+  bounding box by area among the detections (not the highest-scoring one
+  — deliberately "whatever the user is most likely pointing the camera
+  at"), embeds it, and compares against the label's stored embeddings.
+  Uses a stricter threshold, `IS_THIS_OBJECT_MIN_SIM` (0.65), than
+  `get_object_from_memory`'s disambiguation threshold, since this is a
+  direct binary confirmation rather than a best-of-several pick. Returns
+  `{is_match, similarity, label, box_xyxy}` (or a `reason` field:
+  `no_matching_object_in_view` / `embedding_failed` when `is_match` is
+  false due to a hard stop rather than a low score).
+- Thresholds live in `ToolDispatcher.kt`'s companion object:
+  `OBJECT_MATCH_MIN_SIM=0.55f`, `AMBIGUITY_MARGIN=0.05f`,
+  `IS_THIS_OBJECT_MIN_SIM=0.65f` — chosen distinct from
+  `server/tools/embedder.py`'s `DINOv2Embedder` docstring's own general
+  "cosine >= 0.75 = same target" guidance for continuous ORB-tracking
+  re-ID, since these are different tasks (best-of-several-candidates pick
+  vs. a stricter yes/no confirm) with different appropriate bars.
+
+Verified via `./gradlew :app:compileDebugKotlin` — BUILD SUCCESSFUL, no
+new warnings introduced by this change. Not verified end-to-end on a real
+device — same standing caveat as the rest of this file's Android work.
+
+### Voice-message-sent cue volume + Gemini Live persona/voice ("Pixie")
+
+Two direct user requests, addressed together since both touch
+`GeminiLiveClient`'s session setup:
+
+- **Cue volume** — "Voice-message-sent confirmation cue" (above) was too
+  quiet to reliably notice; `LiveAssistantService.playVoiceSentCue()`'s
+  `ToneGenerator` volume bumped from 40% to 100% of `ToneGenerator.
+  MAX_VOLUME`.
+- **Persona + voice** — `GeminiLiveClient` gained a `voiceName: String =
+  "Leda"` constructor param, sent as `generationConfig.speechConfig.
+  voiceConfig.prebuiltVoiceConfig.voiceName` in the setup message (Gemini
+  Live API's documented schema for selecting a prebuilt TTS voice — "Puck"/
+  "Zephyr" are alternates). A voice alone only changes the TTS timbre, not
+  how the model behaves, so `ToolDeclarations.SYSTEM_PROMPT` also gained a
+  `PERSONA — Pixie` section (a tiny, energetic, high-pitched, whimsical
+  fairy) ahead of `CORE RULES` — explicitly scoped as a STYLE layer only:
+  brevity, hazard warnings, and `[SYSTEM]` events still always take
+  priority over character flavor, since parts of this app are safety-
+  critical (step-down/obstacle warnings, incoming-call alerts) and must
+  stay fast and clear regardless of persona.
+
+### Reading-mode TTS moved on-device (`ReadingTtsPlayer.kt`) — no longer needs the gRPC server
+
+Requested directly by the user, after a real logcat capture (during this
+same session) traced every `read_aloud`/live-reading TTS failure back to
+`ECONNREFUSED` connecting to the gRPC server's `PerceptionService.
+Synthesize` RPC (KokoroTTS) — scan/OCR/Q&A all kept working throughout,
+since OCR.space and Gemini Live's own voice never touch that server at
+all; only reading-mode TTS specifically depended on it being reachable.
+Reading mode now uses Android's own on-device `android.speech.tts.
+TextToSpeech` instead — no server round trip, no network dependency, for
+this path at all.
+
+- **`ReadingTtsPlayer.kt`** (new, `com.tracking.client.audio`) — wraps
+  `TextToSpeech`. Android's own engine already plays queued utterances
+  back-to-back on its own (`speak(text, QUEUE_ADD, ...)`), so no manual
+  "wait for the previous one, then start the next" logic is needed for
+  gapless playback itself. What this class adds, per direct user request:
+  a bounded lookahead of at most `MAX_QUEUED_AHEAD` (3) sentences handed to
+  the OS queue at any one time, refilled one at a time (via
+  `UtteranceProgressListener.onDone()`) as each finishes — rather than
+  dumping an entire, possibly still-growing (live reading) buffer into the
+  OS queue up front. `speakFrom(globalStartIndex, sentences,
+  onSentenceDone, onAllDone)` — `onSentenceDone(newCursor)` fires after
+  EACH sentence finishes (new cursor = one past it), so the caller's
+  persistent position stays accurate throughout, not just at the end.
+  `stop()` clears the OS queue immediately (synchronous, no coroutine
+  cancellation/join race to manage, unlike the old design below).
+- **`ToolDispatcher.kt`** — `synthesizeSentence()`/the old async-prefetch-
+  of-1 loop in `speakSentencesFrom()` are gone; it now just calls
+  `readingTts.speakFrom(...)`, with `onSentenceDone` writing straight into
+  `state.readingCursorSentenceIndex` (unchanged field/semantics — see
+  "Reading mode redesign" below for that cursor's own design).
+  `interruptReadingForUserTurn()` simplified from a
+  cancel-then-`runBlocking`-join-then-flush dance to a single
+  `readingTts.stop()` call — TextToSpeech.stop() is synchronous and halts
+  immediately, so there's no cancellation race left to guard against.
+  `playPcm`/`flushPlayback` constructor params are removed outright (no
+  remaining caller — reading no longer shares `StreamingAudioPlayer`'s
+  `AudioTrack`/callback with Gemini's own voice at all).
+- **`StreamingAudioPlayer.stopAndFlush()`** deleted outright (its only
+  caller was the removed `flushPlayback` callback) — `StreamingAudioPlayer`
+  now exclusively handles Gemini's own spoken voice.
+- **`LiveAssistantService.kt`** — new `readingTts by lazy { ReadingTtsPlayer
+  (this) }`, Service-scoped like `hrtfBeacon`/`streamingPlayer` (reused
+  across reconnects, not recreated per `connect()` the way `ToolDispatcher`
+  itself is) — `ToolDispatcher.shutdown()` only `stop()`s it per
+  connection; only `onDestroy()` actually `release()`s the underlying
+  `TextToSpeech` engine.
+- **`AndroidManifest.xml`** — new `<queries>` block declaring
+  `android.intent.action.TTS_SERVICE`, required on Android 11+ (API 30+)
+  for the app to see the device's installed TTS engine at all under
+  package-visibility rules — without it, `TextToSpeech`'s init callback
+  would report failure on those OS versions.
+- **Known, accepted tradeoff**: reading-mode audio no longer reaches
+  `LocalEdgeDevice`/`edgeDevice.emitAudio()` — that forwarding came from
+  the old `playPcm` callback, which fed both `streamingPlayer.writeChunk()`
+  AND the edge device from the same PCM chunks. Native `TextToSpeech` plays
+  directly through the OS's own audio pipeline with no raw-PCM interception
+  point exposed by this design, so only Gemini's own spoken voice (still
+  wired directly in `LiveAssistantService`'s `LiveServerEvent.Audio`
+  handler) reaches the edge device now. Revisiting this would mean either
+  `synthesizeToFile()` to a temp WAV and re-decoding it for forwarding, or
+  a custom `AudioTrack`-based TTS bridge — a real added-complexity/latency
+  tradeoff, not attempted here since it wasn't asked for.
+- Not verified end-to-end on a real device from this environment —
+  compile-verified only, same standing caveat as the rest of this file's
+  Android work.
+
+### Pixie + Angle modules — discrete 4-point HRTF cue, shared heading tracking (tracking mode + guiding/walking)
+
+Requested directly by the user: bring the design validated in
+`test_module/pixie_hrtf_app/` (see "Pixie HRTF Test Harness" below) into the
+production app, replacing `HrtfBeaconPlayer`'s continuous-panning beacon in
+BOTH places that used it — tracking mode (guide a hand to an object) and
+guiding/walking mode (guide the user's facing/steering direction) — with
+two new, explicitly-named, reusable modules. Confirmed with the user along
+the way: tracking's "up/down" is screen-space (the target's vertical
+position in the camera frame), NOT depth/distance; volume convention is
+"quiet when correctly positioned, louder when off" for both callers; the
+production Pixie **teleports** between 4 fixed points (no gradual/sine-eased
+flight like the test harness's autonomous `PixieMotion` — that was a
+test-only validation loop, the real Pixie is 100% caller-commanded so
+there's nothing to animate between).
+
+- **`PixieController`** (`client/android/app/src/main/java/com/tracking/client/audio/PixieController.kt`,
+  new) — a deliberately DUMB 4-point HRTF cue player, no angle/deviation
+  logic baked in at all (different callers compute point/volume from
+  completely different signals — see below — so that mapping stays with
+  the caller). `enum class PixiePoint { LEFT, RIGHT, UP, DOWN, CENTER }`
+  (CENTER = silent placeholder); `start()`/`stop()`/`move(point)`
+  (teleport — just switches which cached HRTF filter index is used, no
+  gradual flight)/`setVolume(gain: Float)` (0f..1f, smoothed internally via
+  `GAIN_SMOOTHING` to avoid clicks)/`mute() = setVolume(0f)`. 4 fixed
+  cardinal filter pairs — `LEFT` (azimuth -90°), `RIGHT` (+90°), `UP`
+  (elevation +45°), `DOWN` (elevation -45°) — resolved via
+  `HrtfConvolver.nearestIndex()` ONCE at `start()`, never re-searched per
+  chunk (contrast `HrtfBeaconPlayer.updateDirection()`'s continuous
+  brute-force scan over all 710 HRIR directions). `cueVolume` (new,
+  mirrors `HrtfBeaconPlayer.cueVolume`) — the Settings "Cue Volume" master
+  multiplier, applied on top of whatever gain a caller's own deviation
+  mapping computes via `setVolume()`. `isEmitting` (new, mirrors
+  `HrtfBeaconPlayer.isEmitting`) — `currentGain > 0.02f`, wired into
+  `ContinuousVadRecorder`'s output-aware VAD gating the same way
+  `hrtfBeacon.isEmitting` used to be. Reuses `HrtfConvolver` (unchanged,
+  real HRTF) and the same `assets/fluttering.mp3` loop `HrtfBeaconPlayer`
+  already decodes (`decodeAssetToMonoPcm`/`clipToShort`/`resampleLinear`
+  widened from `private` to `internal` in `HrtfBeaconPlayer.kt` so
+  `PixieController` can reuse them without duplicating ~90 lines of
+  MediaCodec decode boilerplate). **`HrtfBeaconPlayer`/`HrtfConvolver`
+  themselves stay in the codebase — `HrtfConvolver` becomes a shared
+  dependency, `HrtfBeaconPlayer` itself is left unreferenced** (tracking/
+  guiding/walking all now call `PixieController` instead) — same "kept in
+  case revisited" precedent this codebase already uses elsewhere (e.g.
+  `beacon_preview.py`, `gemma_vlm.py`).
+- **`AngleTracker`** (`client/android/app/src/main/java/com/tracking/client/live/AngleTracker.kt`,
+  new) — a drop-in replacement for `RotationTracker` (same
+  `accumulatedRotation()`/`resetAccumulator()`/`reset()` shapes, so
+  `ToolDispatcher`'s existing pose-extrapolation math — the mapping-stream
+  collector's latency compensation, `buildMappingChunk()`,
+  `stopActiveModes()` — barely changed, just the injected type/name), on
+  top of which it adds:
+  - **Luma-direct input** — `processLumaFrame(luma, width, height,
+    rowStride, rotationDegrees)` takes the camera's raw Y-plane directly
+    (see `CameraManager.kt`'s new `lumaFlow` below) instead of
+    `RotationTracker.processFrame(frameJpeg: ByteArray)`'s
+    `BitmapFactory.decodeByteArray` → `ARGB_8888` → `cvtColor` round trip —
+    ported from the same lag investigation that motivated
+    `pixie_hrtf_app`'s own luma-direct camera source.
+  - **Configurable resolution/feature count**, defaulting to **1000
+    features / 480px** for this app — heavier than the test harness's own
+    300/320 defaults, a deliberate separate choice for production. This
+    tracker's own working image is intentionally independent of (much
+    smaller than) whatever `CameraManager` sends to `MappingService`/
+    RTAB-Map over the network (`frameIntervalMs`/`walkingIntervalMs`, 640px
+    cap) — that JPEG mapping pipeline is completely unaffected.
+  - `currentHeadingDeg()`/`driftedAngleDeg()` (new) — clean accessors
+    other modules can read, exposing what used to only be computed ad hoc
+    inline in `ToolDispatcher`'s mapping-stream collector.
+  - `setAuthoritativeHeadingDeg(headingDeg)` (new) — the "update direction
+    when direction info sent from RTAB-Map through the server" half:
+    called once per accepted `MappingService` pose fix (via the new
+    `HrtfBeacon.worldHeadingDeg(pose)` helper), remembers the new baseline
+    AND resets the accumulator in one call — replaces the bare
+    `resetAccumulator()` call that used to sit at that point in the
+    mapping-stream collector.
+  - Still deliberately rotation-only (Essential-matrix decomposition, no
+    scale ambiguity) — same "NOT verified against a live device, first
+    thing to check if a head turn sounds mirrored" caveat `RotationTracker`
+    always carried, since the composition convention is unchanged.
+  - **`RotationTracker.kt` itself stays in the codebase, unreferenced**
+    (same precedent as `HrtfBeaconPlayer.kt` above).
+- **`CameraManager.kt`** — additive-only `lumaFlow: SharedFlow<LumaFrame>`
+  (capacity 4, `DROP_OLDEST`) alongside the existing JPEG `frameFlow`:
+  `processFrame(imageProxy)` pulls `imageProxy.planes[0]` (Y-plane) and
+  emits it whenever `mappingMode` is `"guiding"` or `"walking"` — no
+  changes to any existing emission/gating logic. **Known, accepted
+  limitation, same as the existing JPEG path**: this reuses whatever
+  resolution the shared `ImageAnalysis` use case is bound at
+  (`HIGHEST_AVAILABLE_STRATEGY`, often full sensor resolution) — not a
+  newly-introduced cost, and not fixed in this pass (changing the shared
+  resolution strategy would affect every other consumer, out of scope).
+- **`HrtfBeacon.worldHeadingDeg(pose): Float`** (new, `HrtfBeacon.kt`) —
+  rotates the camera-local forward vector `(0,0,1)` by `pose`'s quaternion
+  and reads `atan2(x, z)`, same convention as `AngleTracker`'s own
+  `headingDegOf()` and `mapping_servicer.py`'s `_pose_heading_rad()`. Feeds
+  `angleTracker.setAuthoritativeHeadingDeg()` on every accepted server fix.
+- **Tracking mode → Pixie (`ToolDispatcher.updateTrackingPixie()`,
+  replaces `updateTrackingBeacon()`)** — reuses
+  `HrtfBeacon.directionFromBox()` **unchanged** (already gives screen-space
+  azimuth/elevation from the tracked box's center — exactly the "y axis of
+  the frame" signal confirmed with the user, no depth/size heuristic
+  needed). A **2-phase state machine** per the user's explicit spec,
+  `private enum class TrackingAxis { HORIZONTAL, VERTICAL }`: phase
+  HORIZONTAL (left/right) runs first; once the target is centered
+  horizontally (within `TRACKING_H_DEADZONE_DEG`), phase VERTICAL (up/down)
+  takes over; if the target then drifts back out past that SAME horizontal
+  deadzone while in VERTICAL, phase drops back to HORIZONTAL first —
+  re-centering always takes priority over the forward/back cue. Reset to
+  HORIZONTAL in `toolStartTracking()`/`stopActiveModes()`.
+  `TRACKING_H_DEADZONE_DEG`/`TRACKING_V_DEADZONE_DEG` = 5°;
+  `TRACKING_H_RAMP_END_DEG`/`TRACKING_V_RAMP_END_DEG` = 25° — chosen
+  distinctly from navigation's own 180° ramp end (below), since
+  `directionFromBox()`'s screen-space azimuth/elevation only ranges to
+  roughly the frame's own half-FOV (~25-32° at the frame edge, given that
+  function's `fx=fy=0.8*max(w,h)` pinhole assumption) — reusing a
+  180°-scale ramp here would mean volume rarely nearing full even at the
+  frame edge.
+- **Guiding/walking → Pixie (`ToolDispatcher.steerBeaconAlongPath()`)** —
+  the existing bearing computation (`PathPursuit` + `HrtfBeacon.
+  directionTo(pose, tx, tz)`) is **completely unchanged** (it already
+  correctly reflects `AngleTracker`-bridged heading, since it's derived
+  from the already-extrapolated `pose`) — only the output step changed:
+  `pixieController.move(LEFT/RIGHT by azimuth sign)` +
+  `pixieController.setVolume(gainForDeviation(bearing.azimuthDeg,
+  NAV_DEADZONE_DEG=5, NAV_RAMP_END_DEG=180))`, silent within ±5°, full
+  volume by ±180° (no pinning at a lower cutoff, per the user's explicit
+  spec) — replacing the old fixed-radius `hrtfBeacon.updateDirection(...,
+  goalDistanceM)` call (distance-based loudness is gone; Pixie's 4-point
+  design has no continuous distance concept). Mute path (no path at all)
+  and `reportBeaconDirection()` calls are otherwise unchanged.
+- **`gainForDeviation(deg, deadZoneDeg, rampEndDeg): Float`** (new,
+  `ToolDispatcher`'s companion object) — the shared deviation-to-volume
+  helper both callers above use: silent within `deadZoneDeg`, linear ramp
+  to 1.0 by `rampEndDeg`, pinned at 1.0 beyond — same shape validated in
+  `pixie_hrtf_app`'s own `gainForDeviation`.
+- **Wiring**: `ToolDispatcher`'s constructor — `hrtfBeacon: HrtfBeaconPlayer`
+  → `pixieController: PixieController`; `rotationTracker: RotationTracker`
+  → `angleTracker: AngleTracker`; `beaconElevationDeg`/`beaconRadiusM`
+  params dropped entirely (no equivalent in Pixie's fixed-4-point design).
+  `LiveAssistantService.kt` constructs `PixieController`/`AngleTracker(
+  maxFeatures=1000, processResolution=480)` in place of
+  `HrtfBeaconPlayer`/`RotationTracker` (same Service-scoped lifetime,
+  reused across reconnects); its `connect()` still ACCEPTS
+  `beaconElevationDeg`/`beaconRadiusM` params (kept only so
+  `MainActivity`/`MainViewModel`/`SettingsScreen`'s existing call
+  signature + persisted prefs don't need touching) but no longer forwards
+  them anywhere — a real, deliberately-accepted dead parameter, same
+  "leave unused but Settings-exposed rather than rip out the UI" precedent
+  this codebase already uses for these exact two fields. A new
+  `angleLumaJob` collects `cameraManager.lumaFlow` into
+  `toolDispatcher.feedAngleLumaFrame(...)` (replacing the old
+  `feedRotationFrame(jpegBytes)` call), alongside the existing
+  `localProcessingJob`'s `frameFlow` collector — both cancelled together in
+  `disconnect()`/`onDestroy()`.
+- Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, only
+  the expected `beaconElevationDeg`/`beaconRadiusM` "never used" warnings
+  plus pre-existing unrelated warnings) — **not verified end-to-end on a
+  real device from this environment**, same standing caveat as the rest of
+  this file's Android work; specifically unverified: whether Pixie's 4
+  fixed HRTF points read as clearly distinct left/right/up/down in
+  practice, and whether the tracking-mode 2-phase handoff feels natural
+  rather than jumpy.
+
+### Memory/tracking fixes: description-as-detection-prompt bug, clear_memory, dedicated vision captioning
+
+Three issues reported directly by the user from a real device session
+(`save_memory`ing a plush toy, then trying to track it): descriptions
+Gemini Live composed for `remember_object()` were too long/scene-y
+("A small, white, fluffy, short-haired dog with pointy ears, sitting
+patiently." — pose/setting detail nobody asked for); tracking a
+previously-remembered object logged `DetectObject`/`GetEmbedding` with the
+literal saved LABEL as the GroundingDINO prompt (e.g. `prompt='Cutie
+Patootie'`) instead of the richer stored description, which is a poor
+open-vocabulary detection prompt for a proper-noun/toy name; and there was
+no way to delete a mislabeled/duplicate memory once saved.
+
+- **Real bug, found by reading the code: `start_tracking`'s `description`
+  parameter was declared on the tool schema but never actually read.**
+  `ToolDispatcher.dispatch()`'s `"start_tracking"` case only ever forwarded
+  `args.optString("target", "")` — even when Gemini correctly followed the
+  TRACKING system-prompt instructions and called `start_tracking(target=
+  label, description=description)` after a `get_object_from_memory()` hit,
+  the description was silently dropped and `target` (the bare label) was
+  used as `TrackingBackend.initialize()`'s DetectObject prompt regardless.
+  Fixed: `toolStartTracking(target, description = "")` now computes
+  `detectionPrompt = description.ifBlank { target }` and threads it through
+  a new `onTrackingStateChanged(active, target, detectionPrompt)` callback
+  (was `(active, target)`) to `LiveAssistantService.startLocalTracking(
+  label, detectionPrompt = label)`, which passes `detectionPrompt` — not
+  `label` — into `trackingBackend.initialize(frame, detectionPrompt)`.
+  `target`/`state.trackingTarget`/`reportMode()` still use the plain label
+  throughout, unaffected — only the actual detection prompt changed.
+- **`clear_memory(label)`** (new tool) — `LocalMemoryStore.delete(label)`
+  removes all three of a label's files (doc/text-embedding/visual-
+  embedding indexes, whichever exist) and returns whether anything was
+  actually deleted. The user-facing fix for exactly the kind of duplicate/
+  mislabeled save that caused this investigation (a physical object saved
+  under two slightly different names, e.g. "Cutie Pie" vs "Cutie
+  Patootie") — SYSTEM_PROMPT's MEMORY section now also tells Gemini to
+  always reuse the exact same label for the same object and to check
+  `list_memory_labels()`/`query_memory()` first if unsure, rather than
+  saving a fresh near-duplicate.
+- **`GeminiObjectDescriptionClient`** (new, `client/android/app/src/main/
+  java/com/tracking/client/live/`) — a dedicated one-shot vision call to
+  `gemini-3.1-flash-lite`'s `generateContent` endpoint (same plain-OkHttp-
+  REST pattern as `GeminiCorrectionClient.kt`, not the Live WebSocket
+  protocol, not a Google SDK), sending the current frame as inline base64
+  JPEG + a system prompt constraining the output to ONE short phrase
+  (5-10 words: color, shape/size, entity type, at most one or two other
+  clearly-visible distinguishing features) — explicitly excluding pose,
+  background/setting, and sentence-level narration. `ToolDispatcher.
+  toolRememberObject()` now calls this (when configured and a frame is
+  available) to REGENERATE the description from the actual image, storing/
+  embedding/using-as-detection-prompt that result instead of whatever free-
+  form text Gemini Live's own conversational turn originally composed —
+  the `description` argument Gemini passes in is now only a fallback,
+  used as-is if the vision client is unset or the call fails (network
+  error, blank API key). Constructed in `LiveAssistantService.connect()`
+  alongside `geminiCorrectionClient`, same null-when-no-key convention (no
+  separate Settings field — reuses `geminiApiKey`). `remember_object`'s own
+  tool-schema description text was updated to say so explicitly, so Gemini
+  doesn't spend effort composing a long description that's likely to be
+  discarded anyway.
+- Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no
+  new warnings) — not verified end-to-end on a real device from this
+  environment, same standing caveat as the rest of this file's Android
+  work; specifically unverified: whether `gemini-3.1-flash-lite`'s actual
+  output reliably stays within the requested short-phrase format across
+  real objects.
+
+**Unrelated server-side fix from the same investigation**: `server/tools/
+detector.py`'s `GroundingDINODetector.detect_all()` crashed with
+`KeyError: 'text_labels'` — `_post_process_grounded()` already layers a
+call-signature fallback for the `transformers` `box_threshold`→`threshold`
+kwarg rename (<=4.46.x vs >=5.x), but the RETURN dict's label key was
+renamed in the same version bump (`"labels"` → `"text_labels"`) and only
+the kwarg side was actually handled. Fixed with the same fallback pattern:
+`labels = results.get("text_labels", results.get("labels"))`. `detect()`
+(used by `TrackingBackend`'s local-ORB-tracking init loop, not
+`detect_all()`) never read labels at all and was unaffected.
+
+### remember_object's own crop-then-embed pipeline (confirms, not new)
+
+Worth spelling out explicitly since it came up directly from the user:
+`toolRememberObject()` already does exactly "get the description, run
+GroundingDINO with it to find the object's box, then embed a CROP of that
+box" — not the whole frame. `detectAll(finalDescription, frame)` runs
+GroundingDINO over the full frame with the (now short, vision-generated —
+see "Memory/tracking fixes" above) description as the open-vocab prompt,
+picks the highest-scoring box, then `embedBox(box, frame)` sends that box
+to `PerceptionService.AnalyzeFrame(EMBED)` — server-side,
+`DINOv2Embedder.get_embedding()` (`server/tools/embedder.py`) does the
+actual `crop = frame[y1:y2, x1:x2]` before running DINOv2, so the stored
+visual embedding is already of the cropped object region, never the whole
+scene. This was already true before this round of fixes — what changed is
+only that the DETECTION PROMPT is now a short, dedicated-vision-generated
+phrase instead of whatever long sentence Gemini Live composed, which is a
+better GroundingDINO prompt and should improve box quality too.
+
+### Reading-mode fixes: scanned frame fed to Gemini Live, short/long-text gate, scan-complete cue, session-ready greeting
+
+Four more direct user requests from the same round:
+
+- **Scanned frames now reach Gemini Live as visual context.** Previously,
+  reading mode's OCR path (`toolScanCurrentView()`/live reading) never sent
+  the camera frame to Gemini at all — only the extracted TEXT went to
+  Gemini (indirectly, via `read_aloud`'s spoken TTS or `get_reading_section`
+  results); Gemini itself never actually SAW what was scanned. Both
+  `toolScanCurrentView()` and the live-reading OCR worker now call
+  `sendVideoFrame(frame)` right after acquiring a sharp frame — plain
+  `realtimeInput` video (no `turnComplete`, same contract
+  `sendWalkingAmbientFrame()`/the hazard-warning frame send already use),
+  so it never forces a response on its own, just gives Gemini buffered
+  visual context for whenever it next speaks (e.g. the user follows up with
+  "what does this say"/"what am I looking at"). **Follow-up, requested
+  directly by the user: "clear [this context] on end reading session, if
+  possible."** Checked against this project's own Gemini Live API
+  reference — the `BidiGenerateContent` protocol has no operation to
+  selectively purge already-sent `realtimeInput` video frames from a live
+  session's context (only automatic context-window compression and full
+  session resumption, neither a targeted "forget these specific frames").
+  The "if possible" is realized as a soft, prompted clear instead:
+  `toolExitReadingMode()` (`ToolDispatcher.kt`) now sends a `[SYSTEM]` note
+  telling Gemini to disregard the reading session's visual context now
+  that its buffer was discarded — same convention this codebase already
+  uses for every other behavior signal Gemini needs to react to — gated on
+  there having been anything to clear (`chars_discarded > 0`) so an
+  already-empty reading session doesn't send a pointless note.
+  `toolStopLiveReading()` is unaffected — it only PAUSES capture and
+  explicitly keeps the buffer, so there's nothing to tell Gemini to
+  forget there.
+- **`read_aloud()` no longer always speaks the whole capture immediately.**
+  Requested directly: a short capture (a label, a sign — under
+  `READ_ALOUD_IMMEDIATE_MAX_WORDS`=40 words) is still read straight away,
+  same as before; a LONGER capture (a full page) is now saved to the
+  reading session instead — `toolReadAloud()` reads `toolScanCurrentView()`'s
+  own `new_text` result (previously discarded/unused), word-counts it, and
+  if it's at/above the threshold, returns `status: "stored_long_text"`
+  WITHOUT calling `speakSentencesFrom()` — SYSTEM_PROMPT's READING MODE
+  section now tells Gemini to offer to read it (`continue_reading()`) or
+  pull a specific part (`get_reading_section()`) instead of narrating it
+  itself. The gate only looks at THIS scan's own new material, not the
+  whole historical buffer — a scan that found nothing new (a duplicate
+  reread) still falls through to the pre-existing "speak whatever's unread
+  so far" behavior, preserving the fix `read_aloud()` already had for
+  "scope='new' silently did nothing on a reread."
+- **A "pop" confirmation tone once a scan's full pipeline is actually
+  done.** `playScanCompleteCue()` (new, `ToneGenerator.TONE_PROP_ACK`,
+  80ms — reuses the same shared `toneGenerator` instance `playDeadEndAlert()`
+  already manages, no bundled audio asset) — since these users can't see
+  the screen, an audio cue that OCR+correction+storage has genuinely
+  finished (not just that a frame was grabbed) is real feedback.
+  `CorrectionJob` gained an `onComplete: (() -> Unit)?` field, invoked in
+  the correction worker's `finally` block (fires on success OR failure —
+  staying silent forever after a correction error would be worse than
+  confirming a possibly-uncorrected completion) — this is the actual
+  "correct, store done" signal when a correction is queued.
+  `toolScanCurrentView()` passes `onComplete = { playScanCompleteCue() }`
+  when a correction job gets queued, and calls `playScanCompleteCue()`
+  immediately otherwise (correction disabled, or nothing new to correct —
+  no later completion event will ever arrive for those cases), and pops on
+  every explicit user-triggered scan regardless of outcome (new/stitched/
+  updated/duplicate — the user explicitly acted and deserves feedback every
+  time). The live-reading OCR worker uses the same mechanism but gates the
+  pop to `block != null && kind != "duplicate"` only — that loop runs
+  UNATTENDED every `LIVE_READING_INTERVAL_MS` and would otherwise pop
+  constantly while the camera just holds steady on an already-seen page.
+- **Gemini Live now announces itself ready.** `LiveAssistantService`'s
+  `LiveServerEvent.SetupComplete` handler now calls `client.sendSystemNote(
+  "[SYSTEM] The session just connected and is ready. Briefly say you're
+  ready to help...")` right after logging/appending the connected message —
+  same `[SYSTEM]`-event convention (CORE RULES: respond to these
+  immediately) already used for incoming-call/SMS notes;
+  `sendSystemNote()`'s `turnComplete=true` forces an actual spoken turn
+  rather than sitting buffered, so the user gets an audible "ready" cue
+  instead of silence until they happen to speak first.
+- Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no
+  new warnings) — not verified end-to-end on a real device from this
+  environment, same standing caveat as the rest of this file's Android
+  work.
+
+### `test_module/edge_mock_app/` — added Mode 2: test a REAL edge device, acting as client/android would
+
+First investigated (see the standing findings below, still accurate),
+then corrected per direct clarification from the user once the
+investigation surfaced a role confusion: `edge_mock_app` originally only
+implemented `EdgeMockZmqServer.kt`, which plays the role of a MOCK EDGE
+DEVICE (binds ports, generates fake mic/camera data) — useful for testing
+`client/android`'s own `EdgeZmqTestClient` without real Pi hardware, but
+the OPPOSITE of what the user actually needed: they already have REAL
+edge hardware (mic + camera + speaker), and want a lightweight stand-in
+for `client/android`'s side of the conversation to validate that hardware
+BEFORE wiring it into the full, heavy tracking app.
+
+**New Mode 2, added alongside the original (now "Mode 1") — a CLIENT that
+connects OUT to a real edge device's bound ports and runs a short
+concurrent load test:**
+
+- **`EdgeDeviceClient.kt`** (new) — direct duplicate of `client/android`'s
+  own `EdgeZmqTestClient.kt` (separate standalone app/process, same
+  "duplicate rather than share a module" precedent this codebase already
+  uses elsewhere) — connects to `mic_out`/`frame_out` (PULL) and
+  `audio_in` (PUSH) on a given host at the SAME ports/wire framing
+  (`[8-byte seq][8-byte timestamp]` header + raw payload, two ZMQ message
+  parts) already established by `EdgeMockZmqServer.kt`/`mock_edge_server.py`
+  — this is the real, already-agreed protocol a physical edge device
+  speaks, not something invented for this pass.
+- **`LoadTestRunner.kt`** (new) — runs all THREE channels concurrently for
+  a configurable duration (default 4s, per direct spec): continuously
+  PUSHes mock "audio to render" to the edge (mono 24kHz PCM16, 512-sample
+  chunks) while concurrently consuming whatever `mic_out`/`frame_out` the
+  real edge device sends back, then reports counts/bytes/measured rates
+  plus structural type-validation (mic: even-length PCM16 bytes; frame:
+  real JPEG SOI/EOI magic-byte framing). **Deliberately does NOT assert a
+  fixed target fps/sample-rate** — confirmed directly with the user that
+  the real edge device's own camera resolution/rate isn't known ahead of
+  time, so this measures and reports whatever the hardware actually does
+  rather than failing against a guessed number.
+- **Audio-out format is a deliberate, documented choice, not a guess**:
+  mono 24kHz PCM16 was picked because it's the ONE audio format that's
+  ACTUALLY wired in `client/android` today (`LiveAssistantService.
+  emitAudio()` forwards Gemini's own raw voice PCM to `EdgeDevice.
+  audioFlow`) — the HRTF/Pixie steering cue (stereo, 44.1kHz) does NOT
+  reach the edge device in production at all yet (see the standing
+  findings below), so simulating that format here would test against a
+  contract that doesn't exist. If/when HRTF output does get wired to the
+  edge device, this generator (and the real `EdgeDevice.audioFlow`
+  contract itself) will need revisiting — mixing a mono 24kHz stream and a
+  stereo 44.1kHz stream into one raw-bytes channel isn't a well-defined
+  operation on its own; that would need either two separate channels or a
+  documented mixed/resampled format, a real open design question not
+  decided in this pass.
+- **UI** (`activity_main.xml`/`MainActivity.kt`): a second section below
+  the existing Mode 1 controls — edge device IP input, duration input
+  (seconds, default "4"), a Start/Stop button, and a live-updating (300ms
+  poll, same cadence Mode 1's stats poller already uses) status view that
+  becomes the final report once the duration elapses.
+- Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL) —
+  not verified against real edge hardware from this environment (none
+  available here), same standing "not device-verified" caveat as the rest
+  of this project's Android work.
+
+**Standing findings from the original investigation (still accurate,
+describes why Mode 2 was needed and what it does/doesn't fix)**:
+
+- `LocalEdgeDevice.kt` (`client/android/app/src/main/java/com/tracking/
+  client/edge/`) is still an in-process, no-op stub — `connect()`/
+  `disconnect()` are literally empty; `client/android` has no real remote
+  transport of its own yet (Mode 2 tests the FUTURE real hardware
+  standalone, it doesn't wire it into `client/android` itself).
+- Real data shapes, for reference: camera frames are JPEG quality 50,
+  downscaled to a 640px long edge, emitted at a MODE-DEPENDENT variable
+  rate (`frameIntervalMs`/`scanIntervalMs`/`walkingIntervalMs`, or once per
+  `recentBufferMs` tick otherwise) — not a fixed fps. Mic input has no
+  edge-device path at all in `client/android` today — capture is local
+  (`ContinuousVadRecorder.kt`, 16kHz mono) straight to Gemini;
+  `EdgeDevice`'s interface has no mic-input flow at all (a real gap if a
+  physical edge device's mic is ever meant to replace the phone's own).
+- **Still open, not addressed by Mode 2** (Mode 2 only tests the edge
+  device in isolation): actually wiring a real edge device into
+  `client/android` needs (1) a real `EdgeDevice` implementation with an
+  actual network transport (`LocalEdgeDevice` is the only implementation
+  today, and it's in-process), (2) a mic-input flow added to the
+  `EdgeDevice` interface (doesn't exist), and (3) a decision on how
+  Gemini's voice PCM and the HRTF/Pixie cue both reach the edge device's
+  speaker — two different formats today, no combined contract defined.
+
+### Memory label-name lookup bug + tracking-mode hand-guidance bugs (two real reported bugs, both fixed)
+
+Two distinct real bugs, both reported directly by the user from a live
+device session and root-caused by reading the code (not guessed at).
+
+**1. Memory lookup missed the "query IS the label" case entirely.**
+Reported: right after `remember_object(label="Cutie Patootie",
+description=...)` saved successfully, saying "track Cutie Patootie"
+immediately got "can't be found." Root cause, confirmed via the server's
+own `Embed` call logs: `get_object_from_memory(query)`/`query_memory(
+question)` only ever did SEMANTIC vector search — embed the query text via
+MiniLM, cosine-compare against each label's stored DESCRIPTION text. A
+proper-noun label like "Cutie Patootie" has near-zero semantic similarity
+to its own stored description ("small yellow plush bird...") — they share
+no lexical/semantic content at all, even though the label IS literally
+what's being asked about, so this class of query was essentially
+unfindable by design. A second, compounding bug found in the same
+investigation: `LocalMemoryStore.listLabels()` derived label names from
+the sanitized FILENAME (`safeName()` maps "Cutie Patootie" → file
+`Cutie_Patootie.json`, spaces→underscores) instead of reading each doc's
+own stored `"label"` field — so even a smarter lookup comparing against
+`listLabels()` would have compared against the wrong (underscore-joined)
+string.
+
+- **`LocalMemoryStore.listLabels()`** now reads each doc's own `doc.
+  optString("label", ...)` instead of stripping `.json` off the filename —
+  falls back to the filename only if a doc fails to parse. **A third bug,
+  found from a follow-up report, was in this same function's file
+  FILTER**: it only excluded `*.vec.json` (the text-embedding sidecar
+  index), not `*.objemb.json` (the visual-embedding sidecar `remember_
+  object()` creates whenever it captures a DINOv2 reference) — so saving
+  one object with a visual capture (e.g. label "cutie") produced TWO
+  entries in `listLabels()`: the real "cutie" doc, and a bogus
+  filename-derived entry from `cutie.objemb.json` slipping through the
+  filter. New private `isDocFile(fileName)` excludes both sidecar suffixes
+  explicitly.
+- **`LocalMemoryStore.findLabelsMatching(query)`** (new) — case-insensitive
+  substring match (either direction) of the query against every real
+  label. `toolGetObjectFromMemory()` now tries this FIRST: a single match
+  short-circuits straight to that label (skipping the Embed round trip
+  entirely — also fixes the double `Embed` call seen in the reported logs,
+  since Gemini's own `get_object_from_memory` call no longer needs one at
+  all for this case); multiple matches return `ambiguous: true` instead of
+  guessing; zero matches fall through to the original semantic search,
+  unchanged. `toolQueryMemory()` got the same treatment, additively —
+  label hits are prepended to (and deduped against) the semantic results,
+  since a question naming a saved label deserves that memory even if its
+  wording doesn't semantically resemble the stored text.
+
+**2. Tracking mode's hand-guidance was broken two separate ways.**
+
+- **Spoke nonsense with no hand in view.** `ToolDispatcher` had its OWN
+  periodic (every `TRACKING_GUIDANCE_INTERVAL_MS`=8s) spoken-guidance
+  trigger (`runPeriodicTrackingGuidance()`) that sent the current frame +
+  a "guide their hand" instruction to Gemini UNCONDITIONALLY — no check
+  for whether a hand was actually visible anywhere in frame. This
+  duplicated a SECOND, already-correct mechanism in
+  `LiveAssistantService.kt`'s own frame collector
+  (`trackingGuidanceLastAtMs`/`trackingGuidanceIntervalMs`=5s), which only
+  fires once BOTH the target object AND a MediaPipe-detected hand box are
+  visible together, sending real box coordinates instead of a raw frame
+  (cheaper, and gives Gemini exact spatial data instead of asking it to
+  eyeball an image). The `ToolDispatcher` copy was deleted outright — not
+  fixed in place — since the correct version already existed: removed
+  `trackingGuidanceJob`/`lastTrackingGuidanceAtMs`/
+  `startTrackingGuidanceTicks()`/`stopTrackingGuidanceTicks()`/
+  `runPeriodicTrackingGuidance()`/`TRACKING_GUIDANCE_INTERVAL_MS`/
+  `TRACKING_GUIDANCE_POLL_MS` and their call sites in `toolStartTracking()`/
+  `toolStopTracking()`/`stopActiveModes()`.
+- **The Pixie audio cue guided VIEW direction, not the hand, despite the
+  whole point of tracking mode being hand guidance.** `updateTrackingPixie()`
+  computed the tracked object's position relative to the FRAME CENTER
+  (`HrtfBeacon.directionFromBox()`) — i.e. "which way to turn/look to
+  center the object in view," not "which way to move your hand toward
+  it." The hand's own position was never part of the computation at all.
+  Fixed: **`HrtfBeacon.directionBetweenPoints(targetX, targetY, refX,
+  refY, frameWidth, frameHeight)`** (new) generalizes the same pinhole-FOV
+  azimuth/elevation approximation to an ARBITRARY reference point, not
+  just frame center — `directionFromBox()` is now defined as the special
+  case `directionBetweenPoints(centerX, centerY, frameWidth/2,
+  frameHeight/2, ...)`, kept for any future caller that genuinely wants
+  view-direction-relative-to-center (tracking mode no longer uses it).
+  `updateTrackingPixie()`'s signature changed to `(objectVisible,
+  objectCenterX, objectCenterY, handVisible, handCenterX, handCenterY,
+  frameWidth, frameHeight)` and now calls `directionBetweenPoints(object,
+  HAND)` — muting whenever EITHER the object or a hand isn't currently
+  visible (there's nothing meaningful to steer without both). `LiveAssistantService.kt`'s
+  frame collector was reordered so hand detection (MediaPipe `HandTracker`)
+  runs BEFORE the tracking-object update block instead of after — pure
+  computation only hoisted (the `_uiState` merge that publishes hand data
+  to the UI stays in its original position, unchanged, to avoid a
+  `guidanceData.copy()` ordering hazard where the object-track branch's
+  own `it.copy(guidanceData = guidance)` would otherwise clobber
+  hand fields set moments earlier) — so the same frame's hand center is
+  available in time to feed `updateTrackingPixie()`.
+
+Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no new
+warnings) — not verified end-to-end on a real device from this
+environment, same standing caveat as the rest of this project's Android
+work.
+
+### Renewal target-switch bug — the hand-overlap skip above wasn't enough
+
+Real bug, reported directly by the user with a live dashboard screenshot:
+right as their hand reached the tracked object, the tracking box jumped to
+a completely different toy elsewhere in frame, while the real target sat
+untouched under their hand. The skip-while-occluded fix above only guards
+SCHEDULING a new `renewal()` call — it does nothing about a renewal that
+was ALREADY launched (async, a full gRPC round trip) just before the hand
+started overlapping, nor did `renewal()` ever check whether the detection
+it got back was even spatially consistent with the object already being
+tracked. `renewal()`'s only acceptance checks were a detection-score floor
+(0.2) and a fairly loose (0.4) cosine-similarity check against the stored
+embedding — nothing stopped a visually-similar-but-different object
+elsewhere in frame from passing both, especially once the real target's
+own embedding read poorly because a hand was starting to cover it.
+
+Two guards added to `renewal()` (`TrackingBackend.kt`):
+
+1. **Spatial consistency, the primary fix**: the new detection's raw box
+   must `boxesOverlap()` (existing AABB helper) with `lastBox` (the
+   CURRENT tracked position) before anything else is even considered — a
+   genuine re-identify of the SAME physical object should never jump to
+   an unrelated part of the frame, regardless of how the prompt/embedding
+   checks scored it. Rejects and logs, doesn't touch the reference.
+2. **A second, later hand-overlap check**: new `@Volatile lastHandBoxXyxy`
+   field, overwritten every `update()` call (which runs every frame) —
+   right before `renewal()` actually commits the reference swap, it
+   re-checks the new box against this LATEST hand position (not the hand
+   box from when the renewal was originally scheduled), closing the race
+   where the hand starts covering the target while an already-in-flight
+   renewal is still out to the server.
+
+Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no new
+warnings — only the same pre-existing warning list, including the
+already-known `GlobalScope` "delicate API" one at `renewal()`'s own launch
+site) — not verified end-to-end on a real device from this environment,
+same standing caveat as the rest of this project's Android work.
+
+### Tracking-init confidence gate + left/middle/right initial position, no clock positions
+
+Three more direct user requests/reports from the same round:
+
+- **`TrackingBackend.initialize()` accepted almost any detection.**
+  Real bug, confirmed via a live log: `DetectObject` returned score=0.383
+  for a wrong/weak match and it was accepted as the tracking target
+  outright — the check was only `detection.score <= 0f`, i.e. rejected
+  literally nothing except a hard zero. Fixed with a real threshold,
+  `INIT_CONFIDENCE_MIN = 0.45f` — deliberately only for this ONE-TIME
+  "is this even the right object" gate, not `update()`'s/renewal's own
+  ongoing thresholds (10 matches / 0.2 score), which stay lenient on
+  purpose so an ALREADY-confirmed target isn't lost over one weak frame.
+- **One-time left/middle/right position, replacing clock positions for
+  tracking guidance entirely.** Previously there was no initial
+  announcement at all once tracking found the object but before a hand
+  appeared — the first spoken guidance only ever came from the hand+object
+  periodic mechanism (see "Memory label-name lookup bug + tracking-mode
+  hand-guidance bugs" above), so with no hand in view yet, the user got
+  silence. Now, the FIRST time the object becomes visible each tracking
+  session, `LiveAssistantService`'s frame collector checks: if no hand is
+  in frame yet, it sends ONE `[SYSTEM]` note with the object's rough
+  position (`left`/`middle`/`right`, from which third of the frame
+  `track.centerX` falls in) and instructs Gemini to say it plainly, once.
+  A new one-shot flag, `trackingInitialPositionAnnounced` (reset in
+  `startLocalTracking()`), guarantees this fires at most once per session
+  — marked "announced" on the object's first sighting regardless of
+  whether a hand was already visible at that exact moment (so it can never
+  fire again later just because a hand happened to be briefly absent on
+  the very first frame). The ongoing hand+object directional guidance
+  system note (unchanged mechanism, still every ~5s) was reworded to
+  explicitly require plain words ("move left", "a bit right", "up",
+  "down", "closer") and explicitly forbid clock positions — the general
+  VOCAL STYLE section of SYSTEM_PROMPT recommends clock positions for
+  spatial answers elsewhere, and without an explicit override Gemini was
+  applying that here too, which the user didn't want for hand-guidance
+  specifically. SYSTEM_PROMPT's TRACKING section documents both behaviors
+  (the one-shot position note and the "never clock positions here" rule)
+  directly.
+
+Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no new
+warnings) — not verified end-to-end on a real device from this
+environment, same standing caveat as the rest of this project's Android
+work.
+
+### Tracking guidance kept saying "move" with the hand already on target — root cause + fix
+
+Real bug, reported directly by the user: the periodic hand+object spoken
+guidance kept telling the user to "move" even once their hand was already
+on the target. Root cause, found by rereading the actual system note text
+sent to Gemini Live: it handed Gemini the RAW box coordinates for both the
+target and the hand (`"Target box=[...], hand box=[...]. Give brief
+directional guidance..."`) and asked GEMINI to work out arrival/direction
+itself from those two number lists — LLMs are unreliable at that kind of
+precise box-overlap arithmetic purely from raw coordinates in a text
+prompt, especially under a "keep it brief" constraint, so it would often
+guess "move" regardless of the real geometry.
+
+**Fixed by computing the judgment client-side instead of asking Gemini to
+derive it** — the same approach Pixie's own audio cue already uses
+(`HrtfBeacon.directionBetweenPoints`), just for the spoken channel too.
+`LiveAssistantService.kt`'s periodic guidance block now: (1) checks AABB
+overlap between the hand and target boxes directly (`obj[0] < handBox[2]
+&& ...`) — real overlap, not just "centers are close"; (2) if not
+overlapping, computes `dx`/`dy` between box centers, classifies each axis
+against a deadzone (5% of frame dimension) and a "a lot" vs "a bit"
+magnitude threshold (25% of frame dimension), and builds a short direction
+description (e.g. `"left (a bit) and up (a lot)"`); (3) sends Gemini a
+`[SYSTEM]` note stating the ALREADY-COMPUTED verdict directly — either
+`"ARRIVED — say a short confirmation"` or `"move <computed direction> —
+do not recompute from coordinates"` — never raw box numbers. This removes
+the geometric-reasoning burden from the LLM turn entirely; Gemini's only
+job is to phrase the already-known answer briefly.
+
+Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no new
+warnings) — not verified end-to-end on a real device from this
+environment, same standing caveat as the rest of this project's Android
+work.
+
+### Tracking re-identify cadence + skip-while-occluded-by-hand
+
+Two direct user requests:
+
+- **Re-identify interval 1s → 4s.** `TrackingBackend`'s `renewalIntervalMs`
+  constructor default changed from `1000L` to `4000L` (no explicit
+  override at its one construction site, `LiveAssistantService.kt`'s
+  `trackingBackend by lazy { TrackingBackend(grpcManager) }`, so this is
+  the effective live value).
+- **Skip the renewal `DetectObject` call while the hand overlaps the
+  target.** A hand reaching for/holding the object typically occludes it,
+  so re-identifying right then is likely to see a wrong/blocked view —
+  wasted server round trip, and a real risk of the renewal's own
+  visual-similarity check (`isSimilar()`) rejecting a good reference based
+  on a bad, hand-obscured frame. `TrackingBackend.update()` gained a
+  `handBoxXyxy: List<Float> = emptyList()` param (from MediaPipe hand
+  detection — `LiveAssistantService.kt`'s frame collector, same hoisted
+  `handBox` `updateTrackingPixie()` already consumes) and a new private
+  `boxesOverlap(a: FloatArray, b: List<Float>)` AABB check — any portion
+  of overlap counts, not a minimum-fraction threshold. The renewal-trigger
+  condition became `elapsed > renewalIntervalMs && !boxesOverlap(box,
+  handBoxXyxy)`. Deliberately does NOT advance `lastRenewalMs` when
+  skipped this way, so renewal fires as soon as the hand moves off the
+  target and the interval has already elapsed, rather than waiting a full
+  extra interval on top.
+
+Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no new
+warnings) — not verified end-to-end on a real device from this
+environment, same standing caveat as the rest of this project's Android
+work.
+
+### SCAN mode: real queued ingestion (not drop-to-latest) + WALKING cold-start warm-up gate
+
+Two related but independent fixes, both requested directly by the user
+after asking how SCAN mode actually works.
+
+**1. SCAN now queues every frame instead of dropping stale ones.** Root
+cause of "the server doesn't seem to keep processing after I stop
+scanning, and semantic mapping barely finds anything": `UpdateMapping`'s
+drop-to-latest mailbox (`_latest_only_chunks()`, see that section above)
+and `ToolDispatcher`'s `Channel.CONFLATED` outbound channel both silently
+discard any frame arriving while the previous one is still being
+processed — correct for WALKING/GUIDING (fresh pose beats a complete
+backlog for real-time steering), but exactly backwards for SCAN, which
+wants EVERY frame processed, in order, buffering while busy and continuing
+to drain after the user stops — not silently losing most of what was
+captured. With most frames dropped, there was rarely a real backlog left
+to drain by the time the client disconnected (finalize looked instant),
+and semantic tagging (`SemanticMapper`/`FrameTagger` — already live
+per-frame during scan, see "Semantic mapper adapted to..." above, this was
+NOT missing code, just rarely fed enough frames to do anything visible)
+had far fewer frames to work with than the user's actual camera sweep.
+- **Client (`ToolDispatcher.kt`)** — `startMappingStream()`'s outbound
+  channel is now `Channel.UNLIMITED` specifically when `state.mode ==
+  "scanning"`, `Channel.CONFLATED` otherwise (unchanged for WALKING/
+  GUIDING).
+- **Server (`mapping_servicer.py`)** — `UpdateMapping` peels off the
+  request stream's first chunk directly (never dropped either way) to
+  learn `session_mode` before choosing how to consume the rest:
+  `SessionMode.SCAN` bypasses `_latest_only_chunks()` entirely, riding
+  gRPC's own internal request-iterator queue instead (already documented,
+  in `_latest_only_chunks()`'s own docstring, as providing exactly this
+  "buffer and work through the backlog in arrival order" behavior) —
+  WALKING/GUIDING keep the existing mailbox unchanged. No new queue
+  primitive was needed — this is purely "stop throwing away what gRPC
+  already buffered for us," for SCAN only.
+- **Practical effect**: `stopMappingStreamAndAwait()` (already called by
+  `toolStopScan()`, already documented as "waits through the server's
+  finalize") now actually has a real backlog to wait through when one
+  exists — this mechanism already existed, it just had nothing meaningful
+  to wait for before, since both ends had already thrown the backlog away
+  by the time the client disconnected.
+- **Not addressed in this pass**: whether `GEMINI_API_KEY` is actually set
+  in the user's server environment — `grpc_server.py` silently disables
+  the whole `SemanticMapper`/landmark-extraction path (logs "Mapping
+  SemanticMapper init failed" or never logs "ready" at all) if it isn't,
+  which would ALSO explain "I don't see semantic mapping happening"
+  independent of the queueing bug above. Worth checking server startup
+  logs for `[SERVER] Mapping SemanticMapper ready` before assuming the
+  queueing fix alone resolves it.
+
+**2. WALKING mode's cold-start lag — a warm-up gate, reintroduced in a
+different form.** A similar mechanism existed once before (see "Server-
+planned walking path"'s "Client-side warm-up" note) and was deliberately
+removed as unneeded complexity — the user's real-device report now
+confirms it WAS needed: `toolStartWalking()` used to activate everything
+(local avoidance ticks, Pixie, PDR, the "walking started" report)
+IMMEDIATELY, before the server had processed a single frame — so a real
+device would sit in a "walking mode active" state with a stale/absent
+route and a beacon that had nothing to steer by, for however long the
+server's first RTAB-Map + occupancy round trip actually took (worse
+straight after a cold GPU/model start).
+
+- **`feedMappingFrame()`** now gates on a new `walkingReady`/
+  `walkingFirstFrameSent` pair: while walking and not yet ready, it sends
+  EXACTLY ONE frame (the first one offered) and silently drops every
+  subsequent one — no point spending camera/encode work or server GPU
+  time on more frames while the server is still busy on that first
+  round trip. Unaffected for WALKING once ready, and unaffected for
+  GUIDING/SCANNING entirely (this gate is walking-only).
+- **`toolStartWalking()`** now only opens the mapping stream and returns a
+  `"walking_starting"` status — none of ticks/Pixie/PDR/the "walking
+  started" report happen here any more.
+- **`activateWalkingOnceReady()`** (new) — fired from the mapping-stream
+  collector the instant the FIRST real `MappingUpdate` for the session
+  arrives (i.e., the server has now genuinely processed at least one
+  frame end-to-end and has a real pose/grid). Only NOW does it start
+  `startLocalAvoidanceTicks()`/`pixieController.start()`/
+  `pdrStepEstimator.start()`, call `onGuidanceUpdate("walking", ...)`/
+  `reportMode("walking")`, and — the actual "notify the user" step,
+  matching CORE RULES' "[SYSTEM] events respond immediately" convention
+  — send a `[SYSTEM]` note telling Gemini walking is now genuinely active,
+  so the spoken "walking mode started" the user hears is honest, not
+  premature. `walkingReady`/`walkingFirstFrameSent` are reset in
+  `toolStartWalking()`, `toolStopWalking()`, and `stopActiveModes()` (the
+  last one covers switching away from walking mid-warm-up before it ever
+  became ready).
+- Deliberately reuses the SAME persistent `startMappingStream()`/
+  `feedMappingFrame()` path WALKING already shares with GUIDING/SCANNING —
+  unlike the old (removed) design, there's no separate throwaway/discard
+  stream for the warm-up frame; the first frame IS the first frame of the
+  real session.
+
+Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL) and
+`python3 -m py_compile server/services/mapping_servicer.py` — not verified
+end-to-end on a real device/live server from this environment, same
+standing caveat as the rest of this project's work. Specifically
+unverified: real achieved server-side fps for a queued scan (the user's
+own "8fps" figure is the CLIENT's configured Scan FPS send rate — see
+"Client-side frame selection"'s `scanIntervalMs`/Settings "Scan FPS"
+field — not something newly enforced server-side by this change; the
+server just no longer discards whatever arrives faster than it can keep
+up with).
+
+### Mode-specific tracking-loss reset thresholds + WALKING route-change hysteresis
+
+Two more direct user requests, server-side (`scan_session.py`/
+`mapping_servicer.py`).
+
+**1. GUIDING now gets its own (much longer) tracking-loss reset.**
+Previously the consecutive-RTAB-Map-tracking-loss reset (`_reset_cloud_
+locked()` — RTAB-Map + local grid wiped, `reset_occurred` sent to the
+client) only ever applied to `pure_walking` (`SessionMode.WALKING`
+specifically) — GUIDING had no reset check at all, gated out by the code
+checking `if pure_walking:` rather than the broader `walking_lite` (true
+for both WALKING and GUIDING). Now both get it, at different thresholds:
+`PURE_WALKING_LOST_RESET_S` (0.5s, unchanged) for WALKING, new
+`GUIDING_LOST_RESET_S` (2.0s) for GUIDING — resetting an in-progress route
+over a brief tracking hiccup is far more disruptive than resetting
+walking's short-lived, cheap-to-rebuild local grid, so GUIDING gets more
+patience before giving up and starting over. SCAN (`walking_lite=False`)
+still never resets on tracking loss at all — its reconstruction is too
+valuable to nuke over a brief hiccup. `mapping_servicer.py`'s `reset_
+occurred`-forwarding branch was widened from `pure_walking and session.
+last_reset_occurred` to `walking_lite and session.last_reset_occurred` to
+match, so GUIDING's client-side route/beacon invalidation on reset (the
+same handling WALKING already had) now actually fires.
+
+**2. WALKING's planned route no longer changes on every single update
+(SUPERSEDED — see "Main-path/sub-path joint navigation" below).** Reverted
+per direct user feedback in the very next round of this feature: "not that
+we retain the whole path for 6s but we retain the joints on the path" —
+the 6s server-side dwell/hysteresis this point describes locked the
+ENTIRE route in place for a fixed duration, which wasn't the right
+granularity; joint-level retention became the client's job instead (see
+below). `mapping_servicer.py`'s WALKING branch is back to calling
+`find_natural_path()` fresh on every update, no dwell state at all —
+`_WALKING_HEADING_REEVALUATE_DEG`/`_WALKING_HEADING_DWELL_S`/
+`_WALKING_REPLAN_NEAR_END_M`/`_angle_diff_rad()`/the three
+`_walking_lock_heading_rad`/`_walking_diverge_since_wall`/
+`_walking_last_path` dicts were all removed outright (not kept
+unreferenced — this was reverted within the same short span of work, not
+a design left behind for possible future reuse). Kept here for history —
+the underlying jitter problem this originally addressed is now solved
+differently (see below), not reintroduced.
+
+Previously `find_natural_path()` was called fresh every update using
+whatever the CURRENT heading happened to be — a brief, incidental head
+turn (checking a doorway, glancing at a noise) could reroute the beacon
+mid-stride, per a direct user report. Fixed with a dwell-hysteresis gate
+in `mapping_servicer.py`, keyed by `location_id` (`_walking_lock_heading_
+rad`/`_walking_diverge_since_wall`/`_walking_last_path`, all cleared at
+stream-open and on `reset_occurred`, same precedent as `_last_full_
+bounds`): the route only actually changes once the CURRENT heading has
+diverged from the heading the EXISTING route was planned toward by more
+than `_WALKING_HEADING_REEVALUATE_DEG` (30°), continuously, for at least
+`_WALKING_HEADING_DWELL_S` (6s) — a glance back within that window cancels
+the divergence timer and the existing route is kept untouched. Below the
+30° deadzone, the timer is reset outright (not just paused) — matching the
+same "a glance back cancels it" behavior the older, reverted corridor-lock
+design used for its own dwell timer. Reusing an old-but-still-valid route
+is safe because `PathPursuit` (client-side) already projects the CURRENT
+position onto whatever path it's given and advances a look-ahead from
+there — a route computed several seconds and a few steps ago is still
+perfectly walkable, not stale in any way that matters. Two additional
+forced-replan triggers, both independent of heading: no route exists yet
+for this session (first update, or the last attempt found no path at all
+— always worth retrying immediately rather than waiting out a dwell period
+to even check for an opening), and the user is nearly at the end of the
+currently-locked route (`_WALKING_REPLAN_NEAR_END_M`, 1.0m) — otherwise
+someone walking straight exactly as directed (never diverging in heading)
+would eventually run out of route with nothing left to trigger an
+extension. New `_angle_diff_rad()` helper computes the shortest signed
+angular difference, wrapped to `(-π, π]` — verified in isolation against
+the wraparound case specifically (170° vs. -170° must read as a 20°
+difference, not 340°), since a naive subtraction gets this wrong exactly
+at the ±180° boundary.
+
+Verified via `python3 -m py_compile scan_server/scan_session.py server/
+services/mapping_servicer.py` and an isolated check of `_angle_diff_rad`'s
+wraparound correctness — not verified end-to-end against a live server/
+device from this environment, same standing caveat as the rest of this
+project's work. Specifically unverified: whether 30°/6s/1.0m are the right
+real-world tuning values, or whether the hysteresis feels natural in
+practice rather than sluggish (a route stuck 6s behind a genuine, decisive
+turn) or still-jittery (if 30° turns out too tight for normal walking-gait
+head/camera wobble).
+
+### Settings volume sliders — Gemini Live voice / other sound
+
+Requested directly by the user: Gemini Live's own spoken voice played
+noticeably louder than Pixie's cue, with only Pixie's own "Cue Volume"
+slider to balance against. Two new independent master-volume sliders,
+same 0–1f / 9-step convention as the existing Cue Volume slider:
+
+- **`StreamingAudioPlayer.setVolume(gain)`** (new) — plain `AudioTrack.
+  setVolume()`, applied both on `start()` and retroactively via
+  `setVolume()` so a mid-session Settings change takes effect on the next
+  `connect()` without needing a fresh `AudioTrack`. Covers Gemini's own
+  spoken reply only.
+- **`ReadingTtsPlayer.setVolume(gain)`** (new) — passed as a `Bundle`
+  (`TextToSpeech.Engine.KEY_PARAM_VOLUME`) to every `engine.speak(...)`
+  call in `fillQueue()`, instead of `null`. Covers reading-mode TTS.
+- **`PlaybackService`** — reads `other_sound_volume_bits` directly from
+  `getSharedPreferences("tracking_prefs", ...)` at the top of
+  `onStartCommand()` (this Service has no other channel to receive a
+  live value through — it's launched via plain Intent, not bound) and
+  applies it via `newPlayer.volume = volume` before
+  `setMediaItem`/`prepare`/`play`. Covers music/radio/resolved-YouTube-
+  stream playback (ExoPlayer). Does **not** cover the embedded YouTube
+  IFrame player itself — a WebView with its own independent volume, not
+  reachable from here.
+- **`SettingsViewModel`/`SettingsScreen`** — new `geminiVoiceVolume`/
+  `otherSoundVolume` fields (`gemini_voice_volume_bits`/
+  `other_sound_volume_bits` in `tracking_prefs`, default 1f each), two new
+  sliders right after the existing Cue Volume slider. `MainActivity.kt`'s
+  `onConnect` lambda and `MainViewModel.connect()`/
+  `LiveAssistantService.connect()` all extended with the two new trailing
+  `Float` params, applied via `streamingPlayer.setVolume(geminiVoiceVolume)`/
+  `readingTts.setVolume(otherSoundVolume)` right after `pixieController.
+  cueVolume = cueVolume.coerceIn(0f, 1f)`.
+- **Bonus fix found while touching this code**:
+  `LiveAssistantService.restoreSessionFromPrefsIfAvailable()` (the
+  process-restart auto-reconnect path — see "Self-echo / output-aware VAD
+  gating..." above) never restored `cueVolume` from prefs at all — always
+  defaulted to `1f` after a process restart regardless of the user's
+  actual Settings value. Fixed alongside the two new fields, all three now
+  restored the same way.
+
+Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no new
+warnings) — not verified end-to-end on a real device from this
+environment, same standing caveat as the rest of this file's Android work.
+
+### Main-path/sub-path joint navigation + flapping-sound drift cue + clock-direction turns (supersedes WALKING route-change hysteresis)
+
+Requested directly by the user, via a fully-specified redesign, after
+finding the 6s whole-path dwell-hysteresis above didn't match what was
+actually wanted: **"its not that we retain the whole path for 6s but we
+retain the joints on the path."** `mapping_servicer.py`'s WALKING branch
+reverted to calling `find_natural_path()` fresh every update (see the
+"SUPERSEDED" note on that section above) — retaining progress moved
+entirely to the CLIENT, at the granularity of individual path JOINTS, not
+the whole route.
+
+**Two-layer navigation, both modes now share the same mechanism**
+(`ToolDispatcher.kt`):
+
+- **Main path** (`state.plannedPath`, `state.mainPathIdx`) — the
+  server-planned route's own joints, adopted FRESH from every
+  `MappingUpdate` (no more pose-prepending — that was only ever needed
+  for `PathPursuit`'s whole-path arc-length projection, which this design
+  no longer uses; `PathPursuit.kt` is superseded, left in place
+  unreferenced). `mainPathIdx` resets to 0 whenever a fresh main path
+  arrives (the server always plans FROM the current pose forward, so a
+  fresh path's own joint 0 is already the correct next target) — the only
+  thing that actually ADVANCES `mainPathIdx` is a genuine local arrival
+  event, between server updates, never the mere arrival of a new server
+  path. This is what "retaining the joints" means in practice: the
+  route's IDENTITY can shift slightly between ~1Hz server updates without
+  the user's in-progress navigation toward the current joint being
+  disrupted.
+- **Sub-path** (`computeSubPath()`, `steerAlongMainPath()`) — recomputed
+  fresh every avoidance tick (`avoidanceIntervalMs`, ~2x/sec at its
+  default), from the CURRENT (latency-bridged, see `HrtfBeacon.
+  extrapolate()`) pose toward `state.plannedPath[state.mainPathIdx]`. A
+  fresh `AnalyzeFrame(TRAVERSABILITY)` fan each tick (re-added — see
+  "Local reactive HRTF obstacle-dodge" for the original design this
+  revives a much-narrowed version of) is consulted only to check whether
+  the DIRECT line to the current main joint is blocked closer than the
+  joint itself; if so, a single dodge point is placed at the nearest open
+  bearing in the fan (VFH-style: smallest deviation from the direct
+  bearing among bins clearing `SUBPATH_SAFE_CLEARANCE_M`), `SUBPATH_
+  DODGE_MARGIN_M` short of that bearing's own measured clearance, capped
+  at `SUBPATH_DODGE_MAX_M`. The beacon always steers toward the sub-path's
+  own first point (`subPath.first()`) — a dodge point when one exists,
+  the main joint directly otherwise.
+- **Arrival ("close enough, no other joint still in between")** — since
+  the sub-path is recomputed fresh every tick from the CURRENT pose, this
+  reduces to one check: once a tick's freshly-computed sub-path is down
+  to just the main joint itself (`subPath.size == 1`, i.e. no dodge point
+  currently pending) AND the user has arrived within
+  `JOINT_ARRIVAL_RADIUS_M` of it, `advanceMainPathJoint()` fires —
+  `mainPathIdx++`, then announces the new joint's clock direction (see
+  below). A dodge point never needs its own explicit "arrived, remove it"
+  step: the very next tick's fresh recompute already reflects having
+  passed it (or not) from the new pose, with no separate state to track.
+
+**Drift-to-volume mapping, changed per the user's explicit spec**: `NAV_
+DEADZONE_DEG`/`NAV_RAMP_END_DEG` changed from 5°/180° to **3°/100°** —
+silent for a drift of 0–3°, ramps to full volume across 3–100°, pinned at
+full beyond 100° (narrower than the old ±180° full-range mapping — the
+cue now reads as "off" much sooner once roughly facing the right way).
+"Drift" is the egocentric bearing (`HrtfBeacon.directionTo(pose,
+steerTarget)`) between the user's current facing direction and the
+sub-path's own steering target — exactly what `gainForDeviation()`
+already computed, just re-parameterized and re-targeted (sub-path point,
+not a `PathPursuit` look-ahead point).
+
+**Clock-direction turn announcements** (`announceClockDirection()`,
+`clockPositionFor()`) — requested directly by the user: "at start and
+each time moving to the next main path joint, give instruction in clock
+direction (like 3 o'clock)." Fires exactly twice per navigational event,
+never on a bare server update: once, one-shot per session
+(`mainJointAnnounced`, reset in `stopActiveModes()`), the first time a
+real main path arrives after `start_walking()`/`start_guiding()`; and
+once per `advanceMainPathJoint()` call, for the NEW joint just become
+current. `clockPositionFor()` maps the egocentric azimuth to the nearest
+1–12 clock number (12 = straight ahead, 3 = directly right, 6 = behind, 9
+= directly left) — deliberately the OPPOSITE of tracking mode's own
+"never clock positions" rule (see "Tracking-init confidence gate..."
+above): that rule is specific to hand-guidance's plain-words convention,
+while navigation's own turn cues are exactly the case clock positions
+exist for.
+
+**Also updated (`ToolDeclarations.kt`)**: the WALKING section now tells
+Gemini the cue is a continuous "flapping sound" (quiet when correctly
+facing, louder the more off) and to call it that — never "beep" — if the
+user asks what the ongoing sound is, and to respond immediately to the
+clock-direction `[SYSTEM]` cues from both `start_walking()`/
+`start_guiding()`.
+
+`HrtfBeacon.worldPointFrom(pose, azimuthDeg, distanceM)` was re-added
+(the exact inverse of `directionTo()` — same math a now-superseded
+"Server-planned walking path" design once had under this name, deleted
+when that design moved on) specifically to turn a sub-path dodge bearing
+into a real world waypoint.
+
+**Known, accepted limitations** (not yet verified live):
+- `computeSubPath()`'s dodge search is a single-point VFH-style pick, much
+  smaller in scope than the old (removed) `TraversabilityScorer` — since
+  the MAIN route is already obstacle-aware, this only ever needs to
+  smooth out something that appeared since the main path was last
+  planned, not do the primary obstacle avoidance itself.
+- Not verified end-to-end on a real device/live server from this
+  environment — compile-verified only (`./gradlew :app:compileDebugKotlin`,
+  `python3 -m py_compile`), same standing caveat as every round of this
+  feature's development. Specifically unverified: whether
+  `JOINT_ARRIVAL_RADIUS_M`/`SUBPATH_SAFE_CLEARANCE_M`/the dodge-distance
+  bounds need real-world tuning, and whether the 2x/sec sub-path
+  recompute cadence (the existing, user-configurable `avoidanceIntervalMs`
+  "Avoidance FPS" setting, left at its existing default rather than
+  hardcoded to exactly 500ms) reads as smooth in practice.
+
+### Novelty-gated vision-check alert (replaces flat-interval cadence)
+
+Requested directly by the user: WALKING/GUIDING's periodic Gemini
+vision-check (`runPeriodicVisionCheck()`) used to fire on a flat timer
+regardless of whether the scene had actually changed. Now gated by a
+client-side ORB-feature novelty signal — "if we have a 70% new orb
+features (can take from yuv for fast processing and use existing orb ft
+if has) compare to the previous clear frame (40 blur threshold), then
+consider calling the gemini live api for alert if any (but still 3sec
+cooldown)."
+
+`AngleTracker` (already running continuously on every luma frame during
+WALKING/GUIDING for rotation tracking — see "Pixie + Angle modules")
+gained the gate directly, reusing the SAME just-computed ORB keypoints/
+descriptors each luma frame already produces — no second detection pass:
+`evaluateNovelty()` computes a Laplacian-variance sharpness score (same
+formula `CameraManager.computeSharpness()` uses) and, only on a "clear"
+frame (`NOVELTY_BLUR_THRESHOLD = 40.0`), matches its descriptors against
+the last stored clear-frame reference. `NOVELTY_NEW_FRACTION` (0.70) of
+the current frame's own keypoints having no acceptable match
+(`NOVELTY_MATCH_DISTANCE_MAX`, a Hamming-distance cutoff) in the
+reference triggers `noveltyTriggered`, and that frame becomes the new
+reference. A deliberately simplified, SINGLE-reference version of
+`orb_novelty_gate.py`'s server-side design (which matches against every
+prior accepted frame, not just the latest) — good enough for "did the
+view meaningfully change since we last looked," not a scan-quality gate.
+`consumeNoveltyTrigger()` — pull-and-clear, called once per avoidance
+tick (`runUnifiedAvoidanceTick()`): only when it returns true does
+`runPeriodicVisionCheck(frame)` get called at all, which still enforces
+its own `PERIODIC_ALERT_INTERVAL_MS` cooldown internally — changed from
+6000L to **3000L** (the "still 3sec cooldown" the user explicitly kept as
+a floor even with novelty gating in place, protecting against a rapidly-
+flickering novelty signal). `reset()` clears the novelty reference/flag
+alongside the rest of `AngleTracker`'s state on mode exit.
+
+Not verified end-to-end on a real device from this environment —
+specifically unverified: whether `NOVELTY_NEW_FRACTION`/
+`NOVELTY_MATCH_DISTANCE_MAX` need real-world tuning against actual indoor
+scenes (chosen from this codebase's existing ORB-matching conventions,
+not measured against real novelty-gate data the way the server-side
+`orb_novelty_gate.py` thresholds originally were).
+
+### Interrupting [SYSTEM] sends
+
+Requested directly by the user: "every single gemini live api call with
+[SYSTEM] tag should be a interrupting call, override current call if
+overlap." Previously there was no mechanism at all for interrupting
+Gemini's own in-progress spoken reply client-side (`LiveServerEvent.
+Interrupted` was — and still is — a no-op; see "Continuous VAD-gated
+listening"'s own known-limitations note, which explicitly called this
+out as unimplemented).
+
+- **`GeminiLiveClient.onInterrupt: (() -> Unit)?`** (new) — invoked at the
+  top of `sendSystemNote()`, BEFORE the note is actually sent. Every
+  `[SYSTEM]`-tagged send in this codebase already funnels through this
+  one function (both `ToolDispatcher`'s `sendSystemNote` constructor
+  lambda and `LiveAssistantService`'s own direct calls — incoming-call/
+  SMS notes, the session-ready greeting, hazard/vision-check alerts, the
+  new clock-direction turn cues above), so wiring the interrupt here
+  covers all of them from one place, matching the user's "every single"
+  requirement with no per-call-site changes needed elsewhere.
+- **`StreamingAudioPlayer.interrupt()`** (new) — `pause(); flush();
+  play()` on the existing `AudioTrack`, WITHOUT tearing it down (unlike
+  `stop()`) — discards whatever's still queued (the stale tail of an
+  in-progress response) so the new turn's chunks play immediately, clean,
+  rather than being appended after the old ones. Safe to call on an
+  idle/paused track (guarded the same way `stop()` already guards its own
+  `AudioTrack` calls).
+- **`LiveAssistantService.doLiveSession()`** wires `client.onInterrupt =
+  { streamingPlayer.interrupt() }` right after constructing each
+  `GeminiLiveClient`.
+
+Whether the Gemini Live API's own `clientContent` protocol additionally
+treats an incoming turn as barge-in against a response it's still
+generating (separate from this client-side audio flush) is unconfirmed
+from this environment — the API's documented behavior for `clientContent`
+sent mid-generation wasn't independently verified here; the client-side
+flush above is the one guaranteed, controllable half of "interrupting,"
+regardless.
+
+Verified via `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no new
+warnings) — not verified end-to-end on a real device from this
+environment, same standing caveat as the rest of this file's Android work.
+
+### Map persistence removed entirely — always a fresh map
+
+Requested directly by the user: "remove the map storing entirely, just
+new map every scan, guide." Superseded "Occupancy-grid persistence across
+sessions (coarse re-seed)" above (`occupancy_snapshot.json`), which
+re-seeded a revisited `location_id`'s fresh `OccupancyMap` from a coarse
+disk summary saved at the end of a prior SCAN.
+
+**Note this was already the behavior for a session's in-memory
+state regardless of disk persistence** — `StreamingScanSession.__init__`
+already unconditionally calls `self.session.reset_cloud()`, which wipes
+the occupancy grid AND `_raw_landmarks` on every new stream for a given
+`location_id` (see `scan_session.py`'s own comment on why: "a live camera
+source has no leftover state"). So this change is purely "stop writing/
+reading the disk copy" — it doesn't change what a session starts with,
+which was already a blank map every time.
+
+- **`server/services/mapping_servicer.py`** — `_snapshot_path()`/
+  `_load_snapshot()`/`_save_snapshot()` deleted outright, along with the
+  `SNAPSHOT_FILENAME` constant and the now-unused `json`/`os` imports.
+  `MappingServiceServicer.__init__` dropped its `maps_root_dir` param
+  entirely (nothing left to use it for) — `grpc_server.py`'s construction
+  call and its own now-unused `maps_root_dir` module variable updated to
+  match. `UpdateMapping`'s stream-open `seed_from_summary()` call and the
+  `finally` block's `_save_snapshot()` call are both gone — the `finally`
+  block still calls `stream.session.finalize_landmarks_flat()` for a
+  genuine SCAN (still worth it: flushes any last partial VLM-tag batch +
+  runs final dedup clustering into `_raw_landmarks`, in memory, since a
+  `FindLandmark` call against this SAME in-memory `ScanSession` can still
+  land between this stream closing and a later one resetting it), just
+  doesn't persist the result anywhere.
+- **`GetMapSnapshot`/`ListMappedLocations` RPCs deleted outright** from
+  the servicer (not just disabled) — confirmed neither had any real
+  caller (`client/android` never called either; nothing else in this repo
+  did). Left undefined on the subclass rather than stubbed: gRPC's
+  generated base servicer already returns `UNIMPLEMENTED` for any method
+  a subclass doesn't override, the honest answer for an RPC that no
+  longer does anything. The RPCs/messages themselves are left in
+  `tracking.proto` (unused) rather than renumbered — no wire-compat
+  benefit to reclaiming the values, same precedent this codebase already
+  uses for other retired-but-not-renumbered proto entries (e.g.
+  `AnalysisOp.CORRIDOR`).
+- **`FindLandmark`** — the persisted-snapshot fallback (`_find_in_snapshot()`)
+  is gone; only `session.resolve_landmark()` against the live, in-memory
+  `ScanSession` is left. **Real, accepted consequence**: a walking/guiding
+  session (which never runs semantic tagging itself — see "Session-mode
+  pipeline split" above) can now only resolve a destination that a live
+  SCAN of this SAME `location_id`, within the SAME server-process
+  lifetime, already found. Previously, an earlier SCAN's landmarks
+  survived a server restart via the disk snapshot; now they don't survive
+  even past the `ScanSession` being reset (e.g. by a later stream for the
+  same `location_id`), let alone a server restart.
+- **`OccupancyMap.seed_from_summary()`** (`occupancy_map.py`) is left in
+  place, unreferenced — same "kept in case revisited" precedent this
+  codebase uses elsewhere (`HrtfBeaconPlayer.kt`, `gemma_vlm.py`,
+  `beacon_preview.py`) — nothing calls it any more.
+- **`server/data/maps/`** is no longer written to or read from at all by
+  the live path. Any pre-existing `occupancy_snapshot.json`/legacy
+  zone-based `map_geometry.ply`/`map_labels.json` files there are simply
+  dead data now — not deleted by this change, just unread.
+
+Verified via a real import + construction of `MappingServiceServicer`
+(confirms `GetMapSnapshot`/`ListMappedLocations` still resolve as
+inherited no-op stubs, not missing attributes) and
+`python3 -m py_compile server/services/mapping_servicer.py
+server/grpc_server.py` — not verified end-to-end against a live server
+from this environment, same standing caveat as the rest of this project's
+work.
+
+### Path stability — reuse the previous route unless blocked near-term; low-step-over now blocked; joint lead time increased
+
+Three related requests from the same round, all aimed at reducing route
+jitter for a blind user following the beacon.
+
+**1. Route reuse + previous-path attraction, both WALKING and GUIDING
+(`scan_server/live_path_planner.py`, `server/services/mapping_servicer.py`).**
+Previously `UpdateMapping` called `find_natural_path()`/`find_path()` FRESH
+on every single update (~1Hz), with progress retained only client-side by
+joint index (see "Main-path/sub-path joint navigation" above) — but the
+route ITSELF (not just which joint the client is tracking) could still
+shift a little every update even when nothing material changed, since
+`find_natural_path()` searches fresh off the live (slightly noisy) heading
+every time. Fixed with a per-`location_id` cache
+(`MappingServiceServicer._prev_path`/`_prev_goal_xz`, popped at stream-open
+and on a total-tracking-loss reset, same precedent `_last_full_bounds`
+already uses):
+
+- **Reuse gate — `LiveGridPathPlanner.path_blocked_ahead(path_xz, pose_xz)`
+  (new)**: projects the current pose onto the previously-served route
+  (prepending it as the path's own implicit start, same fix
+  `beacon_target_point()` already needed — the served waypoints never
+  include the start) to find which segment the user's progress currently
+  falls within (local joint advancement is client-side only, so the
+  server has no other way to know how far along an old route the user's
+  actually gotten), then checks ONLY that one segment
+  (`segment_blocked()`, a straight-line cell-walk via the existing
+  `_line_cost()`) against the CURRENT grid. Deliberately narrow, per
+  direct user request ("only when the path is now blocked early... if
+  only a distant end is blocked a bit then no worry") — a blockage
+  further along doesn't matter yet; it's re-checked (and, if still
+  blocked once actually close to it, triggers a real replan then) on a
+  later update as the user gets nearer. If the segment isn't blocked, the
+  old route is resent completely unchanged — no new search at all.
+- **When a replan IS needed, bias it toward the old route rather than
+  starting over from scratch** — the mechanism differs by mode since
+  their cost models differ:
+  - **WALKING**: `find_natural_path()`'s "keep going this way" reference
+    direction becomes the bearing from the current pose toward the OLD
+    route's own first joint (`_bearing_rad()`, new), falling back to the
+    user's real live heading only when there's no previous route to
+    reference at all. Since the whole cost model already rewards
+    continuing straight in its reference direction over turning, this
+    alone reproduces a highly similar route whenever nothing material
+    changed — no separate distance-to-old-path cost term needed for this
+    mode.
+  - **GUIDING**: `find_path()` gained an optional `previous_path_xz`
+    param — every candidate cell's A* edge cost gets an additional
+    bounded penalty (`_prev_path_bias()`, new constants
+    `PREV_PATH_PENALTY_SCALE`/`PREV_PATH_PROXIMITY_DECAY_RATE`)
+    proportional to its distance from the old route, itself decayed by
+    how far the cell is from the CURRENT pose — so the bias matters most
+    near the user and fades further out ("especially the first joint
+    closest to the user," per the user's own framing). Needed here
+    specifically because `find_path()`'s A* has no heading concept to
+    redirect the way WALKING's search does. A genuine destination change
+    (`current_goal_xz` differs from `_prev_goal_xz[location_id]`) always
+    forces a fresh, unbiased plan regardless — the old route was toward a
+    different point entirely, reusing/biasing toward it would be wrong,
+    not just "less stable."
+- **Client-side consequence, a real fix required by this change
+  (`ToolDispatcher.kt`)**: the mapping-stream collector used to reset
+  `state.mainPathIdx = 0` on EVERY incoming path unconditionally, correct
+  only because the server used to always replan fresh from the current
+  pose. Now that the server can resend the exact same route many updates
+  in a row, resetting to 0 every time would have silently discarded the
+  client's own local joint-arrival progress on every ~1Hz update — fixed
+  via `pathsRoughlyEqual()` (new): the index only resets when the
+  incoming path's content actually differs from what's already tracked.
+
+**2. `CLASS_LOW_STEP_OVER` is now hard-blocked in path planning, not just
+costlier (`scan_server/live_path_planner.py`)** — `_passable()`/`_cost()`
+now treat it exactly like `CLASS_OBSTACLE` (previously a 3.0x cost
+multiplier, still passable as a last resort). Requested directly by the
+user: this is an assistive system for a blind user, and a low step/curb is
+exactly the kind of thing that's dangerous specifically because it can't
+be seen coming — never worth routing over regardless of the alternative's
+cost. `_COST_BY_CLASS` no longer carries an entry for it (moot — a blocked
+class never reaches that lookup from `_cost()`/`_passable()`, and
+`_natural_step_cost()`'s `length_cost` term only ever runs for cells that
+already passed the passability check). `occupancy_map.py`'s own
+classification/rendering is untouched — the dashboard still shows
+low-step-over as its own distinct tier, only the path search now refuses
+to cross it. Accepted consequence: `find_path()`/`find_natural_path()`'s
+closest-approach fallback and dead-end/cone-escalation paths will trigger
+somewhat more often in areas with a lot of low obstacles — intentional,
+not a regression.
+
+**3. Joint arrival radius 0.6m -> 1.5m (`ToolDispatcher.kt`)** —
+`JOINT_ARRIVAL_RADIUS_M` (main-path joint advancement + its clock-direction
+announcement, see "Main-path/sub-path joint navigation" above) bumped per
+direct user request for more lead time before a turn is actually needed.
+The mechanism itself (advance before literal arrival, announce the new
+joint's clock direction relative to the user's CURRENT facing — 12 o'clock
+is always straight ahead, via `HrtfBeacon.directionTo()`'s existing
+egocentric convention) was already correct and needed no other change.
+
+Not verified end-to-end on a real device/live server from this
+environment — compile-verified only (`./gradlew :app:compileDebugKotlin`,
+`python3 -m py_compile`), same standing caveat as every other round of
+this project's work. Specifically unverified: whether
+`PREV_PATH_PENALTY_SCALE`/`PREV_PATH_PROXIMITY_DECAY_RATE` need real-world
+tuning, and whether reusing a stable route for many consecutive updates
+ever feels "stale" in practice despite the near-term blocked-check.
+
+### search_objects — informational Q&A over saved object memory (`ToolDispatcher.kt`, `ToolDeclarations.kt`)
+
+New tool, requested directly by the user: `search_objects(targets?)`
+answers an INFORMATIONAL question about previously-saved (labeled)
+objects currently in view — e.g. "which one is my AC remote and which is
+my fan remote" or "what's on the table, any of my belongings" — distinct
+from `start_tracking`/`get_object_from_memory` (an explicit "find me.../
+get me to.../look for..." request that initiates hand-guidance tracking
+mode) and from generic, unlabeled objects (water, a pen, etc.), which this
+tool never handles at all.
+
+- **With `targets` given** — each target string is resolved to saved
+  memory label(s) via the existing `LocalMemoryStore.findLabelsMatching()`
+  (case-insensitive substring, either direction); a target matching no
+  saved label is reported separately (`not_in_memory`), not silently
+  dropped. Each matched label gets its OWN dedicated
+  `PerceptionService.AnalyzeFrame(DETECT)` call against its own stored
+  description — simple, no ambiguity about which detection belongs to
+  which label, and cheap enough for the handful of targets a real
+  question names.
+- **With `targets` omitted/empty** — every saved label that has a stored
+  DINOv2 visual reference (`hasObjectEmbeddings()`) is checked via ONE
+  combined multi-phrase GroundingDINO call (every candidate's own stored
+  description joined by `" . "` — the same phrase-grounding convention
+  `frame_extractor/tagging.py`'s multi-tag prompting already established)
+  rather than one call per label — efficient regardless of how many
+  objects have been saved. Each returned detection is attributed back to
+  whichever candidate label's own description contains (or is contained
+  by) its decoded label text — safe because GroundingDINO only ever
+  decodes a literal span of whichever prompt phrase it matched.
+- **Per-candidate verdict, thresholds specified directly by the user** —
+  for whichever detection scores highest via `bestObjectSimilarity()`
+  against that label's own stored embedding(s): `>= SEARCH_OBJECTS_
+  CONFIRM_SIM` (0.5) -> `"found"` (box included); `>= SEARCH_OBJECTS_
+  RESEMBLE_SIM` (0.3) only -> `"resembles"` (a possible, not confident,
+  match — the SYSTEM_PROMPT tells Gemini to say so honestly, not claim
+  certainty); below that (or no detection at all) -> omitted from the
+  response entirely, rather than reported as a firm miss (a long
+  "not found" list for an all-labels query would be noise, not help).
+  Server-side `detect_all()`'s own default `box_threshold=0.35` (unchanged)
+  is what filters candidate detections before this similarity step —
+  matches the user's own ">0.35 GroundingDINO" spec exactly, no additional
+  client-side re-filtering needed.
+- `ToolDeclarations.kt`'s TRACKING section gained a bullet distinguishing
+  this tool from `start_tracking`/`get_object_from_memory` by intent
+  (informational question vs. an explicit find/track request), matching
+  the distinction requested directly by the user.
+
+Not verified end-to-end on a real device from this environment — compile-
+verified only (`./gradlew :app:compileDebugKotlin`), same standing caveat
+as the rest of this file's Android work.
 
 ---
 
@@ -1378,8 +5494,9 @@ a replayed dataset (`scan_session.py`/`occupancy_map.py` themselves barely
 changed). `server/tools/route_planner.py`, `grid_path_planner.py`, and
 `localization.py` (referenced several times below as the zone-based
 navigation path) were also deleted — that whole path-planning/localization
-job now happens via `MappingService` + Android's `LocalPathPlanner.kt`/
-`HrtfBeacon.kt` instead, per the new architecture.
+job now happens via `MappingService` (server-side `LiveGridPathPlanner`,
+see "Server-planned walking path + client-side latency bridging") +
+Android's `HrtfBeacon.kt`/`PathPursuit.kt` instead, per the new architecture.
 
 ```
 Android ScanScreen records a dataset/ folder simultaneously:
@@ -2318,35 +6435,52 @@ server/
                                    StatusServiceServicer, always registered — unlike MappingService
                                    it needs no RTABMAP_ADDR/model deps) and into server_gui.create_ui().
   server_gui.py                  Gradio dashboard (port 7860), rewritten around ActivityMonitor —
-                                   3 tabs (Tracking/Perception/Mapping), each showing the last frame
-                                   + result for that RPC category, plus a rolling Activity Log tab.
+                                   4 tabs (Tracking / Perception / "Mapping + Beacon" / Activity Log),
+                                   each showing the last frame + result for that RPC category.
                                    Tab auto-selection prefers ActivityMonitor.client_mode
                                    (StatusService.ReportMode, authoritative) over inferring from
                                    whichever RPC category most recently updated (fallback for older
-                                   clients) — "walking" now maps to tab_perception, not tab_mapping,
-                                   since walking no longer touches MappingService at all (see "Local
-                                   reactive HRTF obstacle-dodge"). Mapping tab shows the last frame and
+                                   clients) — "walking" maps to tab_mapping now, same as guiding/
+                                   scanning (was tab_perception for a while, back when walking didn't
+                                   touch MappingService at all — see "Local reactive HRTF
+                                   obstacle-dodge" — fixed once walking rejoined it, see "Grid-planned
+                                   walking route"). Mapping tab shows the last frame and
                                    occupancy_map.py's own render_plotly() SIDE BY SIDE in one row,
                                    against the LIVE OccupancyMap reference ActivityMonitor's mapping
-                                   bucket holds — occupancy-grid-only (routing use only now, see
-                                   below), deliberately no point-cloud/voxel/confidence view (those stay
-                                   scan_gui.py's separate, heavier offline debug tool — render_confidence_
-                                   plotly() was shown here too originally, dropped as unnecessary for this
-                                   at-a-glance live dashboard); wrapped in try/except since that reference
-                                   is mutated concurrently by the gRPC streaming thread while this renders
-                                   on the Gradio polling thread — a race should skip a tick, not crash the
-                                   dashboard. RTAB-Map pose-lost is now surfaced directly (not just
-                                   console): a red "RTAB-Map TRACKING LOST (N/M)" burned into the
+                                   bucket holds — deliberately no point-cloud/voxel/confidence view (those
+                                   stay scan_gui.py's separate, heavier offline debug tool —
+                                   render_confidence_plotly() was shown here too originally, dropped as
+                                   unnecessary for this at-a-glance live dashboard); wrapped in try/except
+                                   since that reference is mutated concurrently by the gRPC streaming
+                                   thread while this renders on the Gradio polling thread — a race should
+                                   skip a tick, not crash the dashboard. render_plotly() is now called
+                                   with route=[pose]+planned_path/route_confirmed=path_confirmed (see
+                                   "Server-planned walking path") — the same route/route_confirmed params
+                                   scan_gui.py's Live Navigation Preview already exercises, reused
+                                   directly. _annotate_mapping() ALSO projects that same planned_path onto
+                                   the raw frame now (new _project_world_to_pixel() helper, world→camera
+                                   pinhole projection using pose_proto+ground_y, same "no real
+                                   calibration, guess a pinhole K" convention as scan_session.py's
+                                   _estimate_K) — drawn as a cyan polyline, distinct from the green pose
+                                   text / red tracking-lost warning already on that overlay. RTAB-Map
+                                   pose-lost is now surfaced directly (not just console): a red "RTAB-Map
+                                   TRACKING LOST (N/M)" burned into the
                                    annotated frame (frame_rgb is RGB order, red=(255,0,0)) plus a line in
                                    the Detail textbox, both driven by ActivityMonitor's rtabmap_lost/
                                    rtabmap_total fields (mapping_servicer.py) — see "Blur filtering
-                                   removed for scan/walking" above. Perception tab gained a beacon-
-                                   direction panel — _render_beacon_polar()/_beacon_status(), a Plotly
-                                   polar chart of the last AnalyzeFrame(TRAVERSABILITY) fan plus a
+                                   removed for scan/walking" above. The Mapping tab also carries the
+                                   beacon-direction panel — _render_beacon_polar()/_beacon_status(), a
+                                   Plotly polar chart of the last AnalyzeFrame(TRAVERSABILITY) fan plus a
                                    marker at the client-reported final azimuth (ActivityMonitor.
                                    beacon_azimuth_deg/beacon_muted, fed by StatusService.
-                                   ReportBeaconDirection) — see "Local reactive HRTF obstacle-dodge".
-                                   The old magenta beacon-position circles on the Mapping tab's frame/
+                                   ReportBeaconDirection) — moved here from a standalone Perception tab
+                                   once walking's steering itself moved to the occupancy grid (see
+                                   "Grid-planned walking route"): GUIDING's marker is scored straight off
+                                   the plotted fan, WALKING's marker instead comes from its grid-planned
+                                   waypoint bearing (the fan shown for WALKING is only its separate
+                                   step-down/drop-off hazard check). The Perception tab itself still
+                                   exists, narrowed to ad-hoc run_detection/check_obstacle debug traffic
+                                   only. The old magenta beacon-position circles on the Mapping tab's frame/
                                    occupancy-map views are REMOVED (beacon_preview.py, below, is
                                    deleted — the beacon is a pure steering angle now, not a world
                                    position, so there's nothing left to project onto those views). No
@@ -2379,9 +6513,11 @@ server/
                                    obstacle/traversability for AnalyzeFrame, text for Synthesize/
                                    Embed). Handles the TRAVERSABILITY op via depth_detector.
                                    estimate_traversability() — see "Local reactive HRTF obstacle-dodge".
-    mapping_servicer.py          MappingServiceServicer — UpdateMapping/GetMapSnapshot/
-                                   ListMappedLocations/FindLandmark. Records into ActivityMonitor's
-                                   mapping bucket on every yielded MappingUpdate (frame, pose,
+    mapping_servicer.py          MappingServiceServicer — UpdateMapping/FindLandmark. No disk
+                                   persistence at all (see "Map persistence removed entirely" —
+                                   GetMapSnapshot/ListMappedLocations were deleted outright, not
+                                   just disabled; every session starts from a blank map). Records
+                                   into ActivityMonitor's mapping bucket on every yielded MappingUpdate (frame, pose,
                                    grid_updated, confidence, and a LIVE reference to
                                    session.occupancy_map for server_gui.py to render on demand — not a
                                    snapshot, see activity_monitor.py's merge-not-clear note) and every
@@ -2393,9 +6529,14 @@ server/
                                    reactive HRTF obstacle-dodge"; the beacon's actual direction is now
                                    reported directly by the client via StatusService.
                                    ReportBeaconDirection instead of reconstructed server-side).
-                                   UpdateMapping reads `for chunk in request_iterator:` directly (the full
-                                   queue, no dropping) — a drop-to-latest mailbox was tried and reverted,
-                                   see "Drop-to-latest mapping-chunk ingestion" below for why.
+                                   UpdateMapping reads `for chunk in _latest_only_chunks(request_iterator):`
+                                   — re-adopted drop-to-latest (tried, reverted, then re-adopted; see
+                                   "Drop-to-latest mapping-chunk ingestion" below for the full history and
+                                   the known risk this accepts). record_mapping() also now passes
+                                   pose_proto (the full Pose, not just pose_x/pose_z), planned_path
+                                   (world x/z points), path_confirmed, and ground_y — so server_gui.py can
+                                   draw the server-planned route on both the occupancy map and the raw
+                                   frame (see "Server-planned walking path").
                                    No configure_novelty_gate() call any more — blur filtering was tried
                                    (SCAN_MIN_SHARPNESS/WALKING_MIN_SHARPNESS) then removed entirely per
                                    "Blur filtering removed for scan/walking" above; self._min_sharpness
@@ -2403,6 +6544,48 @@ server/
                                    now also passes rtabmap_lost/rtabmap_total (from session.last_rtabmap_
                                    lost/last_rtabmap_total) so server_gui.py can show RTAB-Map pose-lost
                                    status directly instead of only in console output.
+                                   pure_walking (SessionMode.WALKING) flows through the SAME grid/delta/
+                                   full_resync logic GUIDING does now — see "Grid-planned walking route"
+                                   (an earlier, now-superseded corridor-lock design special-cased
+                                   pure_walking into a pose-only branch here; that branch is gone). The
+                                   only pure_walking-specific behavior left in UpdateMapping: a
+                                   session.last_reset_occurred check (before the normal "no pose yet"
+                                   gate, so a just-fired reset's one signal update isn't silently
+                                   swallowed) that also pops self._last_full_bounds[location_id] to force
+                                   the next real update to a full resync; and skipping
+                                   finalize_landmarks_flat()/snapshot-save in the finally block (nothing
+                                   meaningful ever accumulates for a never-persisted walking session).
+                                   server_gui.py's _TAB_BY_CLIENT_MODE["walking"] now points at
+                                   tab_mapping to match (was a known gap, pointing at tab_perception —
+                                   see "Grid-planned walking route"'s dashboard-fix note).
+                                   UpdateMapping now also builds a LiveGridPathPlanner (live_path_planner.py,
+                                   below) — a SEPARATE instance per mode, not shared — from
+                                   extract_full_grid() every update and computes a PlannedPath
+                                   (find_natural_path() for WALKING, find_path() toward chunk.goal_x/z
+                                   for GUIDING) — path PLANNING is server-side now, not just the grid —
+                                   see "Server-planned walking path + client-side latency bridging" and
+                                   "Natural path planner". A per-location_id _prev_path/_prev_goal_xz
+                                   cache now gates whether either planner is even called this update —
+                                   see "Path stability" above: the old route is reused unchanged unless
+                                   planner.path_blocked_ahead() says its immediate next segment is now
+                                   blocked, and a genuine replan biases toward the old route rather than
+                                   starting over (WALKING: reference heading = bearing toward the old
+                                   route's own first joint; GUIDING: find_path()'s new
+                                   previous_path_xz param). WALKING's planner is now constructed plain
+                                   (LiveGridPathPlanner(grid_for_planning), no min_path_clearance_m —
+                                   find_natural_path() has its own independent safe_clearance_m concept
+                                   instead, _WALKING_SAFE_CLEARANCE_M=0.5, repurposed from the old
+                                   _WALKING_MIN_PATH_CLEARANCE_M constant), called with max_distance_m=
+                                   _WALKING_MAX_PLANNING_DISTANCE_M (5.0, new — replaces the old
+                                   _WALKING_MAX_TURN_RAD). GUIDING's planner is unaffected — still
+                                   LiveGridPathPlanner(grid_for_planning) + find_path(pose_xz,
+                                   current_goal_xz). heading_rad (_pose_heading_rad()) is now computed
+                                   UNCONDITIONALLY every update (previously WALKING-branch-only) so
+                                   server_gui.py can draw it for both modes — see "Facing-direction GUI
+                                   indicator". New _planned_path_to_proto() helper (unchanged).
+                                   grid/grid_delta are still computed and sent unchanged even though the
+                                   client no longer reads them for planning (deliberately deferred cleanup,
+                                   see that section's own limitations note).
     status_servicer.py           StatusServiceServicer — ReportMode + ReportBeaconDirection (new).
                                    Neither carries data any other service needs; both record straight
                                    into ActivityMonitor (record_client_mode()/record_beacon_direction()).
@@ -2426,10 +6609,13 @@ server/
                                    StereoDepthDetector (plane sweep MVS) were removed — this is now
                                    the only depth path for PerceptionService.AnalyzeFrame's DEPTH op,
                                    so DEPTH_MODEL is no longer read. Refactored to share one
-                                   _depth_map() DA3 call between check_obstacle() and the new
+                                   _depth_map() DA3 call between check_obstacle() and
                                    estimate_traversability() (delegates to traversability.py, below) —
-                                   see "Local reactive HRTF obstacle-dodge".
-    traversability.py            (new) estimate_traversability(depth_map, num_bins, max_range_m) —
+                                   see "Local reactive HRTF obstacle-dodge" (GUIDING) / "Hazard warnings"
+                                   (both modes' step-down check). find_corridor() — added for the
+                                   corridor-lock design, then deleted outright once that design was
+                                   superseded by "Grid-planned walking route" — see that section.
+    traversability.py            estimate_traversability(depth_map, num_bins, max_range_m) —
                                    stateless, single-frame polar obstacle-clearance fan: back-project via
                                    the same pinhole-K fallback used throughout this codebase, RANSAC-fit
                                    a ground plane from the frame's bottom ~40%, classify obstacle vs.
@@ -2439,7 +6625,19 @@ server/
                                    real bugs found via synthetic ground-truth testing before this
                                    shipped (sign-flip using the wrong reference point; a frontal
                                    obstacle filling the frame getting accepted as "the floor") — see
-                                   "Local reactive HRTF obstacle-dodge" for both.
+                                   "Local reactive HRTF obstacle-dodge" for both (GUIDING still uses
+                                   this function directly, unchanged). Its ground-fit + azimuth-binning
+                                   body lives in _clearance_fan_from_depth() (no logic change from the
+                                   original inline version), which also computes dropoff_m (on
+                                   TraversabilityResult) — nearest BELOW-ground-plane distance per bin,
+                                   the step-down/stairs counterpart to clearance_m's above-plane
+                                   obstacles — see "Hazard warnings — step-down frames fed to Gemini
+                                   Live", still current and unaffected by find_corridor()'s removal
+                                   (below). find_corridor()/CorridorResult — added to let WALKING select
+                                   a single "widest open arc" corridor target for the world-anchored-lock
+                                   design, deleted outright once that design was superseded by
+                                   "Grid-planned walking route" (walking's beacon comes from an actual
+                                   occupancy-grid path now, not a per-frame corridor pick).
     rag_store.py                 Sentence-transformer text embeddings (embed_text(), backs PerceptionService.Embed);
                                    storage/search methods (add_text/query_global) are now unused server-side —
                                    storage lives on Android (LocalMemoryStore.kt) — kept for reference/DummyRagStore
@@ -2447,18 +6645,28 @@ server/
     tts.py                       KokoroTTS.synthesize_pcm_chunks() — backs PerceptionService.Synthesize
   _archived/                     Old orchestrator/, agents/, cloud_vlm, intent_parser (reference only)
   data/
-    maps/{location_id}/          occupancy_snapshot.json (MappingService) — see "Client-Orchestrated
-                                   Live Session"; the legacy map_geometry.ply/map_labels.json zone-based
-                                   export still exists per-location from before this migration
+    maps/{location_id}/          No longer written/read by the live path at all — MappingService
+                                   has no disk persistence any more (see "Map persistence removed
+                                   entirely"). Any occupancy_snapshot.json/legacy map_geometry.ply/
+                                   map_labels.json files here from before that change are dead data,
+                                   not deleted by it
 
 scan_server/
-  scan_server.py                 Entry point; FastAPI + Gradio UI, port 7861
-                                   POST /api/upload — receives dataset.zip (images/+imu.csv+camera.csv)
-                                   from Android, extracts to uploads/<scan_id>/dataset/
-                                   GET  /api/uploads — lists available upload scan IDs
+  scan_server.py                 Entry point; plain Gradio launch (no HTTP API — see "Server-side
+                                   scan_server.py" above), port 7861. _build_ui() loads the DA3
+                                   estimator/GroundingDINO/Gemma/RTAB-Map client and returns
+                                   create_scan_ui(...); __main__ just demo.launch(...).
   scan_gui.py                    Gradio UI — dataset folder path + segment table → export.
-                                   create_scan_ui(scan_manager, upload_dir) — "Load from Android Upload" accordion
-                                   pre-fills the dataset folder path; _handle_dataset_change()/
+                                   create_scan_ui(scan_manager, upload_dir) — "Load from Video" accordion
+                                   (was "Load from Android Upload"): gr.Video upload + "Extract Frames"
+                                   button, _extract_video() decodes it via cv2.VideoCapture into
+                                   uploads/<scan_id>/dataset/ (images/+camera.csv, no imu.csv — see
+                                   "Server-side scan_server.py" above) and writes the result straight
+                                   into dataset_path_input, same as "Load Selected" already did for a
+                                   past upload; _upload_dir defaults to a local scan_server/uploads/
+                                   folder when upload_dir isn't passed in. dataset_path_input then
+                                   pre-fills the dataset folder path for everything below;
+                                   _handle_dataset_change()/
                                    _read_camera_index() read camera.csv for real per-frame timestamps
                                    (no assumed constant FPS); IMU Orientation dropdown (portrait/
                                    landscape-left/landscape-right) passed to session.set_imu_file() —
@@ -2560,6 +6768,25 @@ scan_server/
                                    scan_session.py already imports FROM) can use it too without a
                                    circular import
   scan_session.py                ScanSession + ScanSessionManager (per-location state)
+                                   process_frames_batch()'s pure_walking param (SessionMode.WALKING
+                                   specifically, not GUIDING) enables a consecutive-tracking-loss
+                                   reset check (PURE_WALKING_LOST_RESET_S=1.0s unbroken RTAB-Map pose
+                                   loss — deliberately short, see "Grid-planned walking route"; bumped
+                                   from 0.5s alongside re-adopting the drop-to-latest mailbox, see
+                                   "Drop-to-latest mapping-chunk ingestion"). Step 4's
+                                   occupancy_map.update()/_merge_voxels() is NO LONGER skipped for
+                                   pure_walking (an earlier corridor-lock-era design skipped it; the
+                                   current design needs the live grid for WALKING's server-planned
+                                   route same as GUIDING — see "Server-planned walking path"). The
+                                   confidence WEIGHT passed to occupancy_map.update() is forced to 1.0
+                                   for pure_walking specifically (was the real computed
+                                   batch_confidence, same as GUIDING/SCAN still use) — see "RTAB-Map
+                                   confidence weighting skipped for WALKING". last_batch_confidence
+                                   itself still reflects the real computed value regardless of mode
+                                   (dashboard-diagnostic use only). reset_cloud() was split into a lock-free
+                                   _reset_cloud_locked() body + thin wrapper so the reset check (already
+                                   inside process_frames_batch's own self._lock) can call it without
+                                   deadlocking (threading.Lock isn't reentrant).
                                    set_imu_file() loads imu.csv (ImuIntegrator); compute_segment_poses(frame_timestamps_ns)
                                    pre-computes per-frame IMU poses from camera.csv's actual timestamps;
                                    process_frames_batch()'s Step 0 (new) runs a blur pre-check —
@@ -2649,11 +6876,13 @@ scan_server/
                                    Also owns: self.novelty_gate (OrbNoveltyGate) + self._min_sharpness/
                                    _min_new_fraction/_min_new_count/_min_rotation_deg (configure_
                                    novelty_gate()/ScanSessionManager.configure_novelty_gate_defaults(),
-                                   same live-tunable pattern as occupancy above); self._frame_store/
-                                   _tag_pending (List[StoredFrame], session-scoped, cleared by
-                                   reset_cloud()); resolve_landmark()/_resolve_all_frame_store_
-                                   landmarks() (deferred GroundingDINO lookup) — see "Novelty+blur frame
-                                   gating and deferred landmark resolution" above for the full design.
+                                   same live-tunable pattern as occupancy above); self._tag_pending
+                                   (List[_PendingTagFrame], short-lived batching buffer, cleared by
+                                   reset_cloud()); resolve_landmark()/_finalize_raw_landmarks() (name
+                                   search + final cluster over self._raw_landmarks, populated live by
+                                   every flushed tag+detect batch) — see "Semantic mapper adapted to
+                                   frame_extractor's Gemini -> GroundingDINO-tiny pipeline" above for the
+                                   full design.
   orb_novelty_gate.py             OrbNoveltyGate — ORB match + Essential-Matrix-RANSAC frame novelty
                                    gate + _sharpness_score() blur-reject, duplicated (not imported) from
                                    frame_extractor/extractor.py — see "Novelty+blur frame gating and
@@ -2670,6 +6899,9 @@ scan_server/
                                    history); scan_gui.py's own call sites always pass an explicit mini_batch
                                    from their GUI slider, so only mapping_servicer.py's live path (which
                                    relies on the constructor default) picked up any of these changes.
+                                   pure_walking constructor param threaded straight through to every
+                                   process_frames_batch() call — see scan_session.py's entry and
+                                   "Grid-planned walking route".
                                    start_zone()/end_zone() are the live replacement for a
                                    Segment Table row (zone AABB computed from positions seen between the
                                    two calls). Only 2 pose sources supported — resolve_pose_flags(pose_src,
@@ -2818,20 +7050,95 @@ scan_server/
                                    Scanning Pipeline's "Closest-approach navigation + minimum path
                                    width" note. Duplicating rather than importing GridPathPlanner is
                                    intentional (server/scan_server process boundary, see "Live
-                                   Navigation Preview" note)
-  semantic_mapper.py             SemanticMapper — VLM landmark TAGGING (name-only, no GroundingDINO/
-                                   coordinates) + deferred backprojection — see "Novelty+blur frame
-                                   gating and deferred landmark resolution" above. tag_landmarks_batch
-                                   (frames) -> List[List[str]]: ONE VLM call across up to
-                                   IMAGES_PER_PROMPT=5 frames, N lines of comma-separated names, one
-                                   per image — stateless, ScanSession owns the buffering now (no more
-                                   internal _pending/window state, no more consider_frame()/
-                                   extract_landmarks()/flush()). _detect_and_backproject() (GroundingDINO
-                                   + depth-median-sample + 4-corner backprojection) is UNCHANGED but
-                                   only called from ScanSession.resolve_landmark() now, never
-                                   proactively. Landmark dataclass; cluster_landmarks() unchanged.
+                                   Navigation Preview" note).
+                                   Now also imported by server/services/mapping_servicer.py — no longer
+                                   scan_gui.py-only — for the live WALKING/GUIDING path (see
+                                   "Server-planned walking path" above).
+                                   CLASS_LOW_STEP_OVER is now hard-blocked in _passable()/_cost(), same
+                                   as CLASS_OBSTACLE (was a 3.0x cost multiplier, still passable) — see
+                                   "Path stability" above. find_path() gained an optional
+                                   previous_path_xz param (_prev_path_bias(), new PREV_PATH_PENALTY_SCALE/
+                                   PREV_PATH_PROXIMITY_DECAY_RATE constants) — an additional A* edge-cost
+                                   term biasing toward a previously-served route, decayed by distance from
+                                   the CURRENT pose so it matters most near-term. New segment_blocked()/
+                                   path_blocked_ahead() methods — the reuse-vs-replan gate
+                                   mapping_servicer.py's UpdateMapping now checks every update before
+                                   calling either planner method at all (see "Path stability" above).
+                                   _simplify() gained SIMPLIFY_COST_SLACK_FRAC (0.08) — drops a waypoint
+                                   whose straight-line shortcut costs up to 8% more than the original
+                                   route through that stretch, not just no-more, trading negligible
+                                   efficiency for fewer joints for a blind user to follow — shared by
+                                   both find_path() and find_natural_path() below.
+                                   find_path()'s old confirmed_only param (+ the _truncate_to_confirmed()
+                                   helper backing it) was REMOVED outright — it existed only for the
+                                   now-deleted find_farthest_open_path(); GUIDING's own find_path() call
+                                   (toward a real destination) never used it, deliberately flooding into
+                                   unexplored territory when that's the only way to reach the destination.
+                                   find_natural_path() (new LiveGridPathPlanner method) — WALKING's
+                                   target/route strategy, replacing find_farthest_open_path() entirely —
+                                   see CLAUDE.md's "Natural path planner" note for the full design. A
+                                   direction-augmented Dijkstra (state = cell + incoming direction, not
+                                   just cell, via the new module-level _DIRECTIONS table/_wrap_angle()) —
+                                   each edge's cost is an additive weighted sum (_natural_step_cost():
+                                   W_HEADING=10 * quadratic heading_error, W_OBSTACLE=8 * clearance-based
+                                   proximity (0 once safe_clearance_m is met — also what pulls the route
+                                   toward corridor centers, no separate centering logic needed),
+                                   W_TURN_COUNT=7 flat + W_TURN_ANGLE=5 * angle whenever direction
+                                   changes, W_LENGTH=2 * class-tiered real distance). Expansion is pruned
+                                   to a spatial cone (bearing FROM START, not a per-step turn limit)
+                                   escalating 45deg -> 90deg -> 180deg (_search_natural(),
+                                   cone_stages_deg param) whenever a narrower stage finds nothing OR only
+                                   a sliver of forward progress (min_progress_frac, 0.3, of
+                                   max_distance_m) — the "only escalate on zero progress" version was a
+                                   real bug found via testing (a corridor with a metre of open floor
+                                   before a full wall "succeeded" at 45deg and never looked for a real
+                                   opening off to the side). Never expands into CLASS_UNKNOWN (same
+                                   confirmed-territory principle the old confirmed_only used to enforce,
+                                   now pruned directly during expansion instead of post-hoc truncated).
+                                   Target selection: among every cell reached within max_distance_m, pick
+                                   whichever has the greatest _directional_distance() progress along
+                                   heading_rad — not farthest by raw distance, not cheapest by cost alone
+                                   (still reused from the deleted find_farthest_open_path() era —
+                                   the only piece of that function's own machinery kept). Verified via
+                                   synthetic grids (open field -> straight; small obstacle -> morphs
+                                   around, stays forward; wall with a far-off opening -> escalates cone
+                                   and turns into it; a too-close wall -> drifts to the open side for
+                                   comfortable clearance; boxed-in start -> None).
+                                   _natural_step_cost()'s obstacle_proximity gained a SECOND, no-cutoff
+                                   "soft" term (SOFT_CLEARANCE_DECAY_RATE=1.5) alongside the original
+                                   hard-cutoff "steep" one — the steep-only version let two cells that
+                                   both already cleared safe_clearance_m score identically regardless of
+                                   how much MORE open one was, which is what let a route hug one obstacle
+                                   despite far more open space elsewhere; see the follow-up round in
+                                   "Natural path planner" above.
+                                   nearest_point_on_path()/advance_along_path()/beacon_target_point() (new)
+                                   — direct Python port of PathPursuit.kt, server-side only for
+                                   server_gui.py's dashboard marker — see "Server-side HRTF beacon
+                                   placement mirror". mapping_servicer.py now prepends pose_xz to the
+                                   path before calling beacon_target_point() — see the "HRTF beacon
+                                   placement bug" follow-up note in "Natural path planner" above (a real
+                                   navigation bug, not just this dashboard mirror — PathPursuit.kt got the
+                                   equivalent client-side fix).
+  semantic_mapper.py             SemanticMapper — wraps a FrameTagger (frame_extractor/tagging.py's
+                                   Gemini -> GroundingDINO-tiny pipeline) and runs it IMMEDIATELY,
+                                   batched, per accepted frame — see "Semantic mapper adapted to
+                                   frame_extractor's Gemini -> GroundingDINO-tiny pipeline" above
+                                   (supersedes the old Gemma-VLM-tag-then-defer-GroundingDINO design).
+                                   tag_and_backproject_batch(frames_bgr, depth_maps, world_poses, Ks,
+                                   frame_idxs) -> List[List[Landmark]]: one batched FrameTagger.
+                                   tag_and_detect_batch() call across up to IMAGES_PER_PROMPT=5 frames,
+                                   immediately followed by per-frame backprojection (depth-median-sample
+                                   + 4-corner unprojection) of every detected box — stateless,
+                                   ScanSession owns the buffering (_PendingTagFrame/_tag_pending).
+                                   Landmark dataclass; cluster_landmarks() merges same-label
+                                   detections that are close OR overlapping (MERGE_DISTANCE_M /
+                                   OVERLAP_MERGE_RATIO), position = highest-confidence member's own
+                                   (x, z), no averaging — see "Distance-based landmark merging
+                                   (confidence picks the winner)" above.
   gemma_vlm.py                    GemmaVLMClient — Gemma 4 31B via Gemini API (GEMINI_API_KEY),
-                                   multi-image query(prompt, images=[...]) for semantic mapping
+                                   multi-image query(prompt, images=[...]). No longer used by any live
+                                   path (semantic_mapper.py switched to RAM++ + GroundingDINO-tiny, see
+                                   above) — left in place, unreferenced, not deleted.
   qwen_vlm.py                     Qwen3VLClient — local vLLM-backed Qwen3-VL, single-image only.
                                    Disabled (not imported by scan_server.py) — its 2B model was prone
                                    to greedy-decoding repetition loops (temperature=0, no repetition
@@ -2929,7 +7236,10 @@ server/
 client/
   android/                         The only client — Android Jetpack Compose (Kotlin); Gradle root: client/android/
     audio/
-      PushToTalkRecorder.kt        PTT recording; onChunkReady emits raw PCM chunks during hold
+      ContinuousVadRecorder.kt     Replaces PushToTalkRecorder.kt (deleted) — always-on mic capture gated
+                                     by a client-side amplitude VAD (onSpeechStart/onSpeechEnd), not a
+                                     tap-and-hold gesture. See CLAUDE.md's "Continuous VAD-gated listening"
+                                     section.
       StreamingAudioPlayer.kt      Incremental raw PCM playback (24 kHz) for VoiceChatStream response
       TtsPlayer.kt                 WAV playback (24 kHz) for unary VoiceChat / StreamFrame audio
     camera/
@@ -2942,74 +7252,177 @@ client/
                                      gate.py's _sharpness_score() uses server-side) — moved here from the
                                      server, see "Client-side frame selection" note for the full rationale.
                                      TWO independent selection policies, chosen per-frame via mappingMode
-                                     (String — "", "guiding", "scanning" — set every processed frame by
-                                     MainViewModel.kt's frame collector, forwarded verbatim from
-                                     sessionState.mode; walking is deliberately NOT in this set any more —
-                                     it dropped MappingService entirely, see "Local reactive HRTF
-                                     obstacle-dodge"): (1) mapping modes (guiding/scanning) — NO
-                                     blur/clarity filtering (removed, confirmed with the user — see "Blur
-                                     filtering removed for scan/walking"): whichever frame arrives once
-                                     frameIntervalMs (ms, guiding) or scanIntervalMs (ms, scanning) has
-                                     elapsed since the last send is forwarded directly — no window, no
-                                     candidate comparison. Both stay ms internally; SettingsScreen exposes
-                                     them as FPS number inputs, not sliders ("Mapping FPS" 0.2..10 default
-                                     1.0, "Scan FPS" 2..20 default 10.0), converting fps->ms only at
-                                     doConnect() time. activeMappingSubmode tracks which one is in effect and
-                                     resets the send-gate on any submode change (a stale timestamp from a
-                                     different mode/interval shouldn't suppress the new mode's first send); (2)
-                                     recentBufferMs (SettingsScreen slider, 0..1000ms, 50ms steps, default
-                                     100) — every other mode (tracking/reading/Q&A/idle/walking) — a small
-                                     rolling buffer of the last recentBufferMs of frames, no window/gap logic;
-                                     clearestRecentFrame() pulls the sharpest buffered frame on demand (used
-                                     by ToolDispatcher.kt's latestFrame() closure — OCR/run_detection/
-                                     tracking-init calls, AND now walking/guiding's own local-avoidance tick,
-                                     see "Local reactive HRTF obstacle-dodge" — all want "the current frame"
-                                     right now), while handleRecentEmit() emits that same clearest-so-far
-                                     frame into frameFlow at most once per recentBufferMs for continuous
-                                     per-frame consumers (hand tracking, local ORB tracking, UI overlay).
+                                     (String — "", "guiding", "walking", or "scanning" — set every
+                                     processed frame by MainViewModel.kt's frame collector, forwarded
+                                     verbatim from sessionState.mode; walking rejoined this set once its
+                                     beacon moved back to a grid-planned route, see "Grid-planned walking
+                                     route" — it had been carved out into policy 2 below for a while, in
+                                     between, see "Local reactive HRTF obstacle-dodge"): (1) mapping modes
+                                     (guiding/walking/scanning) — NO blur/clarity filtering (removed,
+                                     confirmed with the user — see "Blur filtering removed for
+                                     scan/walking"): whichever frame arrives once frameIntervalMs (ms,
+                                     guiding), walkingIntervalMs (ms, walking), or scanIntervalMs (ms,
+                                     scanning) has elapsed since the last send is forwarded directly — no
+                                     window, no candidate comparison. All three stay ms internally;
+                                     SettingsScreen exposes frameIntervalMs/scanIntervalMs as FPS number
+                                     inputs, not sliders ("Mapping FPS" 0.2..10 default 1.0, "Scan FPS"
+                                     2..20 default 10.0), converting fps->ms only at doConnect() time;
+                                     walkingIntervalMs instead reuses avoidanceIntervalMs directly (set
+                                     from MainViewModel.connect(), no separate UI control) since it needs
+                                     to stay fast/responsive like the local-avoidance tick, not slow like
+                                     guiding's default. activeMappingSubmode tracks which one is in effect
+                                     and resets the send-gate on any submode change (a stale timestamp
+                                     from a different mode/interval shouldn't suppress the new mode's
+                                     first send); (2) recentBufferMs (SettingsScreen slider, 0..1000ms,
+                                     50ms steps, default 100) — every other mode (tracking/reading/Q&A/
+                                     idle) — a small rolling buffer of the last recentBufferMs of frames,
+                                     no window/gap logic; clearestRecentFrame() pulls the sharpest
+                                     buffered frame on demand (used by ToolDispatcher.kt's latestFrame()
+                                     closure — OCR/run_detection/tracking-init calls, AND walking's own
+                                     step-down hazard-check tick, see "Hazard warnings" — all want "the
+                                     current frame" right now), while handleRecentEmit() emits that same
+                                     clearest-so-far frame into frameFlow at most once per recentBufferMs
+                                     for continuous per-frame consumers (hand tracking, local ORB
+                                     tracking, UI overlay). Note: recentBuffer is populated unconditionally
+                                     on every processed frame regardless of mappingMode, so
+                                     clearestRecentFrame() keeps working for walking's hazard tick even
+                                     while walking is also in the mapping-mode bucket above — only the
+                                     continuous frameFlow emission (policy 2's own emit, not the buffer
+                                     itself) is skipped during mapping mode.
+                                     clearestRecentFrameWithSharpness() (NEW) — same pull, also returns
+                                     the sharpness score, for ToolDispatcher's reading-mode blur
+                                     skip/retry (acquireSharpFrame()) — see "Reading-mode OCR" above.
     sensors/
       ImuSensor.kt                 SensorManager wrapper; emits ImuReading Flow at SENSOR_DELAY_FASTEST
       ImuRecorder.kt               Writes imu.csv (header: timestamp_ns,ax,ay,az,gx,gy,gz) alongside images/
     device/
       DeviceToolHandler.kt         Interface for executing device-native tool calls (phone/alarm/calendar)
-      AndroidDeviceToolHandler.kt  Implementation: Intent.ACTION_CALL, AlarmClock, CalendarContract
+      AndroidDeviceToolHandler.kt  Implementation: Intent.ACTION_CALL, AlarmClock, CalendarContract, plus
+                                     answerPhoneCall() (TelecomManager.acceptRingingCall(), see "Foreground-
+                                     service migration + calls/SMS/YouTube" for the accepted dialer-role
+                                     risk), sendSms()/checkUnreadSms() (SmsManager/Telephony.Sms.Inbox)
+    receivers/                     NEW package — the app's first BroadcastReceivers
+      CallBackgroundReceiver.kt     PHONE_STATE -> resolves caller via ContactsContract.PhoneLookup ->
+                                     starts LiveAssistantService with ACTION_INCOMING_CALL
+      SmsBackgroundReceiver.kt      SMS_RECEIVED -> starts LiveAssistantService with ACTION_SMS_RECEIVED
     live/                          Client-orchestrated Gemini Live session — see CLAUDE.md's
                                      "Client-Orchestrated Live Session" section for the full picture
+      LiveAssistantService.kt       NEW — foreground + bound LifecycleService now owning the entire session
+                                     graph (gRPC/camera/mic/tool dispatch/uiState) that used to live in
+                                     MainViewModel's viewModelScope — see "Foreground-service migration +
+                                     calls/SMS/YouTube" for the full design. MainViewModel is now a thin
+                                     bound-client facade over this.
       GeminiLiveClient.kt           Raw WebSocket client for Gemini Live's BidiGenerateContent protocol
       ToolDeclarations.kt           SYSTEM_PROMPT + FunctionDeclaration JSON, ported from tool_declarations.py
-      LiveSessionState.kt           Port of server/live_session.py's LiveSessionState. smoothedBeaconAzimuthDeg
-                                     (new) — the HRTF beacon's EMA-smoothed azimuth, carried across local-
-                                     avoidance ticks (see ToolDispatcher.kt below).
+      YouTubeSearchClient.kt        NEW — direct OkHttp calls to YouTube Data API v3 (search_youtube/
+                                     get_video_info); playback itself is the official IFrame player
+                                     (play_youtube_video), not a stream URL from this client
+      NewsClient.kt                 NEW — direct, keyless Google News RSS calls (get_top_news/search_news),
+                                     hardcoded to Vietnam/Vietnamese — see "News / Radio tools" above
+      RadioClient.kt                NEW — direct, keyless Radio-Browser API station search (play_radio),
+                                     hardcoded to country=Vietnam; resolves a stream URL only, playback
+                                     reuses play_video/PlaybackService — see "News / Radio tools" above
+      LiveSessionState.kt           Port of server/live_session.py's LiveSessionState. Path PLANNING moved
+                                     server-side (see "Server-planned walking path + client-side latency
+                                     bridging") — plannedPath/pathConfirmed hold the server-planned route
+                                     directly (no more client-side grid/A* state: navWaypoints/
+                                     navWaypointIdx/lastMappingGrid/mutableGrid/smoothedBeaconAzimuthDeg
+                                     are all gone). guidingGoalXz — GUIDING's FindLandmark-resolved
+                                     destination, sent back to the server as the planning goal.
+                                     lastMappingPose — the last AUTHORITATIVE server pose (NOT the
+                                     current best-estimate, which is derived on demand via
+                                     HrtfBeacon.extrapolate()). poseSendHistory (PoseSendSnapshot) — the
+                                     send-time accumulator-snapshot buffer latency compensation reads
+                                     from, see that section for the full design.
       ToolDispatcher.kt             Port of _dispatch_tool + live_tools/*.py — remote/3rd-party/local/device.
                                      stopActiveModes() — called first by every mode-entry tool, enforces
-                                     state.mode exclusivity (see "Mode exclusivity" note above). reportMode()
-                                     — fire-and-forget StatusService.ReportMode call on every mode transition.
-                                     startLocalAvoidanceTicks()/runAvoidanceTick() (new) — the local reactive
-                                     HRTF obstacle-dodge loop for walking AND guiding, see "Local reactive
-                                     HRTF obstacle-dodge" above; replaced updateHrtfBeacon() (removed).
-      OcrClient.kt                  Direct 3rd-party HTTP client to paddle_ocr_server
+                                     state.mode exclusivity (see "Mode exclusivity" note above); also stops/
+                                     resets angleTracker/pdrStepEstimator and pixieController now, plus the
+                                     tracking-mode trackingAxis state machine (see "Pixie + Angle modules").
+                                     reportMode() — fire-and-forget StatusService.ReportMode call on every
+                                     mode transition. startMappingStream()/feedMappingFrame() are shared by
+                                     GUIDING, WALKING, and SCANNING alike. buildMappingChunk() attaches
+                                     has_goal/goal_x/goal_z for GUIDING once resolveGuidingGoalIfNeeded()
+                                     resolves a destination, and snapshots the local estimators'
+                                     accumulators into state.poseSendHistory keyed by the chunk's own
+                                     timestamp. The mapping-stream collector no longer runs any path search
+                                     at all (recomputeRoute() is gone) — it reconciles the server's
+                                     (already slightly stale) pose against the local rotation/PDR
+                                     accumulators via HrtfBeacon.extrapolate() (also folding each accepted
+                                     fix into angleTracker.setAuthoritativeHeadingDeg() via the new
+                                     HrtfBeacon.worldHeadingDeg()), sets state.plannedPath straight from
+                                     MappingUpdate.planned_path, fires playDeadEndAlert() on an empty
+                                     WALKING path, and checkGuidingArrival() for GUIDING. Steering is
+                                     unified for both modes now: runUnifiedAvoidanceTick() (replaces
+                                     runAvoidanceTick()/runWalkingAvoidanceTick()) runs the step-down/
+                                     drop-off/obstacle hazard check (checkAndWarnHazard() — now also
+                                     checks clearance_m, grouped with dropoff_m into one hedged system-note
+                                     prompt per tick, see "Hazard warnings" above) then calls
+                                     steerBeaconAlongPath() (replaces recomputeRoute()/steerWalkingBeacon()/
+                                     checkWaypointProgress()), which projects the extrapolated pose onto
+                                     state.plannedPath via PathPursuit and steers Pixie (LEFT/RIGHT +
+                                     gainForDeviation-driven volume, see "Pixie + Angle modules") toward a
+                                     look-ahead point on it — see "Server-planned walking path" for the
+                                     path-pursuit design and what got deleted (LocalPathPlanner.kt,
+                                     MutableOccupancyGrid.kt, TraversabilityScorer.kt, all outright), and
+                                     "Pixie + Angle modules" for the current beacon-output mechanism.
+                                     updateTrackingPixie() (replaces updateTrackingBeacon()) drives
+                                     tracking mode's own 2-phase HORIZONTAL/VERTICAL Pixie cue — see that
+                                     same section.
+      OcrClient.kt                  Direct 3rd-party HTTP client to OCR.space — analyze() chains
+                                     filterLinesByRotation() -> filterLinesByNoise() ->
+                                     filterLinesByBlur() (TextBlockFilters.kt) before joining survivors
+                                     into reading-order text — see "Reading-mode OCR" above.
+      TextBlockFilters.kt            OcrLine/OcrWord + OcrBlockFilters: blockSimilarity()/ReadingBlock/
+                                     integrateRawBlock() (raw-first fuzzy dedup + boundary stitching +
+                                     mid-text realign merge, a Kotlin port of Python difflib's
+                                     Ratcliff/Obershelp matching-blocks algorithm at both word and
+                                     character granularity) and the rotation/noise/blur line filters
+                                     OcrClient.kt calls — see "Reading-mode OCR correction + fuzzy
+                                     stitching" above for the full design + thresholds. integrateBlock()
+                                     (the old MutableList<String>-based dedup) is deleted outright — no
+                                     remaining caller.
+      GeminiCorrectionClient.kt      NEW — OCR-error correction (+ translation for non-English text) via
+                                     a plain REST call to Gemini's generateContent endpoint
+                                     (gemini-3.1-flash-lite), reusing the same geminiApiKey already used
+                                     for Gemini Live. Driven by ToolDispatcher's correction queue (one
+                                     background coroutine, strictly sequential) — see "Reading-mode OCR
+                                     correction + fuzzy stitching" above.
+      DebugFrameStore.kt             NEW — annotateOcrFrame(): debug-only, draws each OCR line's
+                                     kept/dropped box on a frame copy (see "Reading-mode OCR" above).
+                                     Off by default; MainViewModel only wires ToolDispatcher's
+                                     saveDebugFrame callback when SettingsScreen's toggle is on.
       LocalMemoryStore.kt           On-device JSON memory store + embedding index + cosine search
-      LocalPathPlanner.kt           Kotlin port of live_path_planner.py's A* (clearance-aware, closest-approach)
-                                     for guiding's global route only now — findMostOpenDirection()/
-                                     castOpenRay() (walking's old grid-raycast steering) were removed
-                                     outright, see "Local reactive HRTF obstacle-dodge" above.
-      TraversabilityScorer.kt       (new) pickSteeringAngle() — Vector-Field-Histogram-style local
-                                     obstacle-dodge scoring against a per-frame TraversabilityInfo fan:
-                                     corridor-windowed clearance minus goal-bearing penalty (guiding only)
-                                     minus steering-effort penalty, peak-picked; smoothAzimuth() — EMA
-                                     toward the picked angle. See "Local reactive HRTF obstacle-dodge".
-      HrtfBeacon.kt                 directionTo() — egocentric waypoint azimuth/elevation from the
-                                     current Pose (guiding's goal-bias input only now — its own
-                                     elevation/distance are no longer used to place the beacon directly);
+      AngleTracker.kt                NEW — replaces RotationTracker.kt (left in place, unreferenced) as the
+                                     shared heading/rotation module — see CLAUDE.md's "Pixie + Angle
+                                     modules" note. Same accumulatedRotation()/resetAccumulator()/reset()
+                                     shapes (drop-in for ToolDispatcher's existing pose-extrapolation math)
+                                     plus new luma-direct processLumaFrame() (1000 features/480px default,
+                                     fed by CameraManager's new lumaFlow instead of a JPEG round trip),
+                                     currentHeadingDeg()/driftedAngleDeg(), and
+                                     setAuthoritativeHeadingDeg() (folds in each accepted MappingService
+                                     pose fix via the new HrtfBeacon.worldHeadingDeg()). Still rotation-only
+                                     (Essential-matrix decomposition) — same NOT-device-verified
+                                     composition-convention caveat RotationTracker always carried.
+      PdrStepEstimator.kt            NEW — Sensor.TYPE_STEP_DETECTOR + a fixed stride length, bridging the
+                                     same gap for walked distance. distanceSinceReset()/resetAccumulator().
+                                     Deliberately not ImuSensor.kt/ImuRecorder.kt (confirmed dead code).
+      PathPursuit.kt                 NEW — stateless polyline geometry replacing LocalPathPlanner.kt's role:
+                                     nearestPointOnPath() (project current position onto the server-planned
+                                     path) + advanceAlongPath() (walk forward by a look-ahead distance). No
+                                     search — the server already searched; this only follows.
+      HrtfBeacon.kt                 directionTo() — egocentric azimuth/elevation from the current Pose to a
+                                     world (x, z) target — now used for BOTH modes' unified path-pursuit
+                                     steering target (see PathPursuit.kt/ToolDispatcher.steerBeaconAlongPath()).
                                      directionFromBox() — pixel-offset azimuth/elevation from a 2D ORB
-                                     tracking box (tracking mode, no pose/depth available). worldYawRad()
-                                     was removed outright (its only caller, findMostOpenDirection(), is
-                                     gone — see "Local reactive HRTF obstacle-dodge").
-      MutableOccupancyGrid.kt       (new) Persistent, patchable occupancy grid — fromFull()/applyDelta()/
-                                     toProto(). Backs LiveSessionState.mutableGrid; ToolDispatcher's
-                                     mapping-stream collect loop (guiding/scanning only now) patches it
-                                     from MappingUpdate.grid_delta instead of replacing lastMappingGrid
-                                     wholesale every update — see "Occupancy grid delta sync" above.
+                                     tracking box (tracking mode, no pose/depth available). extrapolate()
+                                     (new) — combines an authoritative server Pose with RotationTracker's/
+                                     PdrStepEstimator's accumulated deltas into a current best-estimate
+                                     Pose; quatMultiply() (new, non-private) — Hamilton product, reused by
+                                     ToolDispatcher's latency-compensation math. worldPointFrom()/
+                                     worldYawRad() are both removed outright now (dead once server-side
+                                     planning took over target selection — see "Server-planned walking
+                                     path").
     ui/
       MainViewModel.kt             connect(host, port, fps, avoidanceIntervalMs, vadThreshold,
                                      startThreshold, geminiApiKey, ocrServerUrl, locationId) —
@@ -3017,24 +7430,15 @@ client/
                                      server-relayed VoiceChatStream for this client) and drives
                                      ToolDispatcher.dispatch() for every Gemini function call;
                                      feedMappingFrame() called from the camera-frame collector while
-                                     mode is guiding/scanning only now (walking dropped MappingService
-                                     entirely — see "Local reactive HRTF obstacle-dodge" above).
-
-paddle_ocr_server/               Standalone OCR microservice (port 8100), called directly by Android now
-  server.py                       FastAPI /ocr endpoint — decode -> _preprocess (grayscale/upscale/
-                                    denoise/adaptive-threshold) -> PaddleOCR.predict -> raw per-line
-                                    text blocks -> _merge_into_paragraphs. Records every stage into
-                                    ocr_monitor (module-level OcrMonitor) for ocr_gui.py to display.
-                                    Mounts the Gradio debug UI onto this same FastAPI app via
-                                    gr.mount_gradio_app(app, ..., path="/gui") — uvicorn server:app
-                                    stays the single entrypoint, dashboard at :8100/gui.
-  ocr_monitor.py                  OcrMonitor — thread-safe single-slot ("last request only") snapshot
-                                    of every pipeline stage's image/blocks, same pattern as server/
-                                    services/activity_monitor.py.
-  ocr_gui.py                      Gradio dashboard — 5 panels: received, preprocessed, raw text
-                                    blocks (boxed on the orientation-corrected image PaddleOCR itself
-                                    used), merged paragraphs (boxed), final text only. Timer-polls
-                                    OcrMonitor every 0.5s, same live-monitor pattern as server_gui.py.
+                                     mode is guiding/walking/scanning; also sets
+                                     cameraManager.walkingIntervalMs = avoidanceIntervalMs so walking's
+                                     mapping-stream send rate stays fast/responsive, not guiding's
+                                     slower default. feedRotationFrame() (new) called on EVERY collected
+                                     frame regardless of mode (no-ops internally unless walking/guiding
+                                     is active) — RotationTracker wants a continuous per-frame trickle,
+                                     not the interval-gated mapping-mode push — see "Server-planned
+                                     walking path". Owns the rotationTracker/pdrStepEstimator instances,
+                                     passed into ToolDispatcher's constructor.
 
 depth-anything-3/                DA3 model package (installed locally)
 ```
@@ -3058,48 +7462,63 @@ User names a target → start_tracking(target) tool
 
 ### Live navigation (guiding/walking)
 
-Two layers now — global route (guiding only, `MappingService`) and local
-reactive dodge (both modes, `PerceptionService`) — see "Local reactive
-HRTF obstacle-dodge" for the full design.
+Path PLANNING is entirely server-side now for both modes (see
+"Server-planned walking path + client-side latency bridging" for the full
+design) — the client only follows what the server returns, bridging the
+gap between updates with its own rotation/PDR motion estimate.
 
 ```
 User says "guide me to the couch" → start_guiding tool
-  → GLOBAL: ToolDispatcher opens a MappingService.UpdateMapping bidi
-    stream, feeding camera frames (RTAB-Map pose only) → server streams
-    back Pose + OccupancyGrid (only when changed) + landmarks →
-    LocalPathPlanner.findPath() (Kotlin A*) computes/updates a route
-    entirely on-device against the received grid; checkWaypointProgress()
-    sendSystemNote()s "[SYSTEM] Waypoint reached"/"Arrived at X" for Gemini
-    to react to in audio.
-  → LOCAL (same as walking below, goal-biased): the actual HRTF beacon
-    direction — HrtfBeacon.directionTo()'s azimuth (to the current
-    waypoint) feeds in as the goal-bias term, not as the beacon's direction
-    directly any more.
+  → ToolDispatcher resolves "the couch" via MappingService.FindLandmark
+    (unchanged RPC) → stashes the resulting (x, z) as state.guidingGoalXz
+  → opens a MappingService.UpdateMapping bidi stream, feeding camera
+    frames (RTAB-Map pose) + the resolved goal (MappingChunk.has_goal/
+    goal_x/goal_z) → server plans a route (LiveGridPathPlanner.find_path())
+    against its own occupancy grid and streams back Pose + PlannedPath
+    (+ OccupancyGrid, still sent but no longer read client-side) every
+    update → ToolDispatcher.checkGuidingArrival() announces arrival once
+    the extrapolated position nears the path's final point.
 
-User says "start walking" → start_walking tool (no MappingService at all)
-  → ToolDispatcher.startLocalAvoidanceTicks(): every avoidanceIntervalMs,
-    pull the current frame (clearestRecentFrame()) →
-    PerceptionService.AnalyzeFrame(TRAVERSABILITY) → per-frame, ground-
-    segmented obstacle-clearance fan, no world state → TraversabilityScorer
-    picks the most open direction (pure clearance, no goal bias — walking
-    has no destination) → EMA-smoothed → HrtfBeacon plays continuously
-    toward that azimuth (elevation 0, fixed radius — pure steering command,
-    not a position), muted only when nothing safe is found. Purely
-    ambient — no [SYSTEM] messages, no spoken alerts, matching this
-    project's established beacon behavior. Replaced the old fixed-interval
-    PerceptionService.AnalyzeFrame(DEPTH op) polling + spoken "[SYSTEM]
-    Obstacle ~Xm ahead" alert (`quick_label_obstacle` tool,
-    `LiveSessionState.walkingObstacleCache`) entirely — both long since
-    removed, not deprecated — AND its own successor, the occupancy-grid
-    `findMostOpenDirection()` ray-cast, which is now removed too (too slow
-    to react — see "Local reactive HRTF obstacle-dodge").
+User says "start walking" → start_walking tool
+  → SAME MappingService.UpdateMapping stream, no goal sent — server
+    infers "keep walking forward" from its own RTAB-Map pose's heading and
+    plans toward the farthest open direction within a turn budget
+    (find_farthest_open_path()) → an empty PlannedPath (nothing walkable
+    anywhere) triggers ToolDispatcher.playDeadEndAlert() (ToneGenerator
+    tone).
+
+BOTH modes, every avoidanceIntervalMs (ToolDispatcher.runUnifiedAvoidanceTick()):
+  → step-down/drop-off hazard check (PerceptionService.AnalyzeFrame
+    TRAVERSABILITY, unchanged — see "Hazard warnings" below)
+  → HrtfBeacon.extrapolate(state.lastMappingPose, rotationTracker.
+    accumulatedRotation(), pdrStepEstimator.distanceSinceReset()) — the
+    client's own best-current-estimate position/orientation, bridging the
+    gap since the last server update via frame-to-frame Essential-matrix
+    rotation tracking + step-detector-based walked distance
+  → PathPursuit projects that estimate onto state.plannedPath and steers
+    the beacon toward a look-ahead point sliding forward along it —
+    azimuth-only, fixed radius, muted only when there's no path at all.
+    Purely ambient — no [SYSTEM] messages for the beacon itself, matching
+    this project's established behavior (the hazard check above is the
+    one thing that DOES speak, additively, when relevant).
 ```
 
 ### Reading a document aloud
 ```
 User says "read this" → enter_reading_mode() then read_aloud(scope="new")
-  → OcrClient.kt POSTs the current frame directly to paddle_ocr_server
-    (no server proxy) → new text deduped against the local reading buffer
+  → acquireSharpFrame() blur skip/retry, then OcrClient.kt POSTs the frame
+    directly to OCR.space (no server proxy, no self-hosted OCR service) →
+    analyze() drops rotation-mismatched/short-small-isolated-noise/locally-
+    blurry lines (TextBlockFilters.kt) → surviving text folded into
+    readingBlocks via raw-first fuzzy dedup + boundary stitching
+    (OcrBlockFilters.integrateRawBlock() — see "Reading-mode OCR
+    correction + fuzzy stitching" above) → "new"/"stitched" spoken
+    immediately using the block's RAW text; "new"/"stitched"/"updated" all
+    also get queued onto ToolDispatcher's correction worker, which
+    corrects/translates the block via GeminiCorrectionClient
+    asynchronously and patches `corrected` in place once it lands —
+    read_aloud(scope="all")/get_reading_section always read whatever
+    correction has landed by then, never blocking on it
   → PerceptionService.Synthesize streams KokoroTTS PCM back → played
     directly by the client — Gemini's own voice is NOT used
   → User asks about already-scanned content → get_reading_section(query)
@@ -3120,52 +7539,128 @@ against every prior accepted frame, not raw keypoint comparison).
 - `extractor.py` — `extract_new_frames()`, `OrbNoveltyGate`. RTAB-Map
   pose/node-id and DA3 depth are optional metadata (`rtabmap_addr`,
   batched via `da3_batch_size`), no longer gate acceptance.
-- `tagging.py` — `FrameTagger`: RAM++ (open-set image tagging) →
-  GroundingDINO tiny (open-vocab detection), run on every accepted frame.
-  RAM++'s own tags become GroundingDINO's per-frame text prompt, so boxes
-  track what RAM++ actually saw instead of one fixed prompt for every
-  frame. Both models loaded once and reused; frames are batched
-  (`tag_batch_size`, independent of `da3_batch_size` — no chronological
-  dependency, different VRAM profile). Each model gets resized to its own
-  preferred input resolution (RAM++ 384x384; GroundingDINO tiny's own
-  shortest_edge=800/longest_edge=1333 processor config) rather than native
-  frame resolution. `draw_detections()` draws GroundingDINO boxes (yellow)
-  on top of `extractor.py`'s ORB-keypoint annotation (green=new/red=old).
+- `tagging.py` — `FrameTagger`: Gemini (`gemini-3.1-flash-lite` via the
+  `google-genai` SDK, open-set tagging — supersedes an earlier RAM++-based
+  tagging step, see "Semantic mapper adapted to frame_extractor's Gemini ->
+  GroundingDINO-tiny pipeline" above) → GroundingDINO tiny (open-vocab
+  detection, local), run on every accepted frame. The tagging step's own
+  tags become GroundingDINO's per-frame text prompt, so boxes track what
+  was actually tagged instead of one fixed prompt for every frame.
+  GroundingDINO tiny loaded once and reused; Gemini tagging is one batched
+  multi-image API call per flush. Frames are batched (`tag_batch_size`,
+  independent of `da3_batch_size` — no chronological dependency, different
+  VRAM/latency profile). GroundingDINO tiny resizes to its own preferred
+  input resolution (shortest_edge=800/longest_edge=1333 processor config);
+  Gemini receives full-resolution images directly. `draw_detections()`
+  draws GroundingDINO boxes (yellow) on top of `extractor.py`'s
+  ORB-keypoint annotation (green=new/red=old).
 - `app.py` — Gradio UI; `_get_tagger()` caches the loaded `FrameTagger` at
   module level across requests (unlike the RTAB-Map client/DA3 estimator,
-  which are cheap to reconstruct per call, a RAM++ checkpoint load is
-  expensive — ~1-2 min — so it's built once and reused, not reloaded
-  per "Extract new frames" click).
+  which are cheap to reconstruct per call, loading GroundingDINO tiny still
+  costs a few seconds — built once and reused, not reloaded per "Extract
+  new frames" click). "Gemini API Key"/"Gemini tagging model id" textboxes
+  (defaulting from `GEMINI_API_KEY`/`GEMINI_TAGGING_MODEL_ID`) replaced the
+  old "RAM++ checkpoint path" textbox.
 
 **Environment note**: `hrtf`'s `transformers` is pinned to `4.46.3` (not
-5.13.0, unlike the rest of `hrtf`/`server/.venv`) — the `ram`
-(recognize-anything, RAM++) package vendors its own BERT copy against a
-much older transformers API (`apply_chunking_to_forward`/
+5.13.0, unlike the rest of `hrtf`/`server/.venv`) — `AutoModelForZeroShot
+ObjectDetection`'s `post_process_grounded_object_detection` has a different
+signature at 4.46.3 (`box_threshold` param, `"labels"` dict key with
+pre-decoded phrase strings) vs. 5.13.0's (`threshold`, `"text_labels"`),
+which `tagging.py`'s GroundingDINO-tiny usage depends on — `server/tools/
+detector.py`'s own (unrelated, full-size) GroundingDINO usage is
+unaffected (different venv, `server/.venv`, stays on 5.13.0). The `ram`
+(recognize-anything, RAM++) package this pin was ORIGINALLY needed for
+(its vendored BERT copy breaks under 5.13.0 — `apply_chunking_to_forward`/
 `find_pruneable_heads_and_indices` import paths, `PreTrainedModel` weight
-tying internals, `BertTokenizer.additional_special_tokens_ids`), all of
-which broke under 5.13.0; patched in the installed `ram` package itself
-(`site-packages/ram/models/bert.py`, `site-packages/ram/models/utils.py`,
-applied via `frame_extractor/patch_ram_package.py` — see
-`frame_extractor/requirements.txt`) rather than forking the repo, and
-pinning `transformers` down to a version old enough for those internals to
-still exist was simpler than chasing further breakage forward.
-`AutoModelForZeroShotObjectDetection`'s
-`post_process_grounded_object_detection` also has a different signature at
-4.46.3 (`box_threshold` param, `"labels"` dict key with pre-decoded phrase
-strings) vs. 5.13.0's (`threshold`, `"text_labels"`) — `server/tools/
-detector.py`'s GroundingDINO usage is unaffected (different venv,
-`server/.venv`, stays on 5.13.0). Verified end-to-end on a real video with
-a live RTX 3060 (~4.6GB VRAM reserved for both models at batch size 2;
-GroundingDINO's CUDA deformable-attention kernel fails to JIT-compile
-against this environment's torch/CUDA combination and silently falls back
-to its pure-PyTorch path — functionally correct, just not the fastest
-possible path on this particular machine).
+tying internals, `BertTokenizer.additional_special_tokens_ids`, patched via
+`frame_extractor/patch_ram_package.py`) is no longer imported by the live
+tagging path at all (see the Gemini swap above) — `patch_ram_package.py`
+and the `ram` install step are left in the repo, unreferenced, in case
+RAM++ tagging is ever revisited, but the `transformers` pin itself stays
+for GroundingDINO-tiny's own sake regardless. Verified end-to-end on a real
+video with a live RTX 3060 BEFORE the Gemini swap (~4.6GB VRAM reserved for
+both models at batch size 2; GroundingDINO's CUDA deformable-attention
+kernel fails to JIT-compile against this environment's torch/CUDA
+combination and silently falls back to its pure-PyTorch path — functionally
+correct, just not the fastest possible path on this particular machine) —
+not re-verified against a live GPU/Gemini API call from this environment
+after the swap, compile-verified only.
+
+## Pixie HRTF Test Harness (offline tool, `test_module/pixie_hrtf_app/`)
+
+Standalone, throwaway test harness — not part of the main client/server
+system — built at the user's request to validate the design behind a
+future persistent-companion HRTF beacon ("Pixie") before it's built into
+`client/android/` itself. The eventual real design (discussed but
+deliberately NOT yet implemented in the main app — see this tool's own
+README for the full deferred spec): a beacon entity that exists for the
+whole app lifecycle regardless of mode, defaults to a fixed egocentric
+position (front-left, a bit upper), exposes a `moveTo(destination, speed?)`
+called by navigation/guiding (fly toward open space) or tracking (fly
+toward the tracked target), moves gradually with the flapping sound only
+audible while actually in transit (fading out shortly after arrival),
+rides along with the user's own translation without that counting as
+"flying," teleports to the default position on any loss-of-track/reset,
+and gets a Settings toggle for whether Gemini Live's own voice is also
+routed through the pixie's HRTF position.
+
+This harness tests only the trickiest underlying piece first, per the
+user's explicit "need to test first" request: whether an RTAB-Map-derived,
+**anchor-relative** head heading (the first tracked frame after connecting
+defines "straight ahead") can drive a stable-sounding HRTF direction, with
+the server round-trip latency bridged by a local ORB/Essential-matrix
+RANSAC drift estimate on the Android side (a duplicate of `client/
+android`'s own `RotationTracker.kt`) — the same "server gives an
+authoritative but stale fix, client bridges the gap locally" pattern this
+project's real walking/guiding beacon already uses (see "Server-planned
+walking path + client-side latency bridging" above), applied here to pure
+head orientation instead of position-on-a-path.
+
+- `server/pixie_hrtf_server.py` — WebSocket server (reuses `scan_server/
+  rtabmap_client.py` + `da3_wrapper.py`, same RTAB-Map docker service the
+  real `MappingService` talks to) + a Gradio dashboard. **Second design
+  pass, per direct follow-up request**: the pixie now moves autonomously
+  server-side (`PixieMotion`) — loops MOVING (travel ALONG the
+  circumference of a radius/speed-configurable circle centered on the
+  anchor, to a random point) then WAITING (configurable duration) then
+  repeats; the dashboard's sliders configure radius/speed/wait/elevation
+  instead of setting a fixed azimuth directly.
+- `android/` — a separate Gradle project (`com.tracking.pixietest`,
+  installable alongside the real client app on one test device), CameraX
+  capture (Y-plane luma straight into OpenCV, no Bitmap/JPEG round trip —
+  a real ~0.5s-per-update lag traced to that round trip, plus running at
+  full sensor resolution instead of a bounded ~640x480 analysis stream) +
+  `RotationTracker.kt` (duplicated from `client/android/`) for local
+  drift bridging. **ORB detect+match only** — a Lucas-Kanade optical-flow
+  alternative was tried and dropped outright per direct request; ORB's
+  working resolution (3 dropdown presets) and feature count (dropdown,
+  steps of 100) are both live-adjustable from the UI. `PixiePositionView`
+  draws two compasses side by side (anchor-relative bearing, which doesn't
+  rotate with the head, and facing-relative bearing, which does); a
+  synthesized alignment tone (`PingTonePlayer.kt`) replaces the earlier
+  continuous HRTF "flapping" beacon (`HrtfConvolver.kt`/
+  `HrtfBeaconPlayer.kt`, still present, unreferenced) — silent within ±2°
+  of facing the pixie exactly, louder the more deviated, a null-seeking
+  cue rather than a peak-seeking one.
+- Deliberately simplified vs. the eventual real design: the circle is
+  centered on the anchor and assumes the user's own position stays there
+  too (no live translation tracking — this harness only exercises head
+  ROTATION); no `moveTo(destination, speed)` API called by other
+  components, no flying-vs-attached-to-user distinction, no
+  teleport-on-reset. See the tool's own README for the full list and
+  setup/run instructions.
+- Not verified against a live device/RTAB-Map rig from this environment —
+  compile-verified only (`./gradlew assembleDebug` succeeded for the
+  Android app; `python -m py_compile` succeeded for the server).
+
+---
 
 ## Deployment
 
 | Component | Default Port | Command |
 |-----------|-------------|---------|
-| OCR server | 8100 (+ Gradio at `:8100/gui`) | `cd paddle_ocr_server && uvicorn server:app --host 0.0.0.0 --port 8100` (called directly by Android; pipeline-stage debug UI mounted on the same port, no separate process) |
+| OCR | — (external) | No server to run — Android calls OCR.space directly (API key entered in Settings); see "Reading-mode OCR" above |
 | Main server | 50051 + Gradio 7860 | `python server/grpc_server.py` — imports scan_server/ in-process for MappingService, no separate Scan server process any more |
 | RTAB-Map pose service (required) | 5556 (ZeroMQ, no ROS) | `docker compose up rtabmap` — see `scan_server/rtabmap_docker/README.md`; MappingService is disabled (logs and no-ops) without `RTABMAP_ADDR` set |
 
@@ -3201,12 +7696,12 @@ it, or `docker compose up rtabmap`.
 | Android client | — | Gradle project root: `client/android/`; run `./gradlew build` from there. The only client — see "Client-Orchestrated Live Session" |
 
 Environment variables:
-- `GEMINI_API_KEY` — used server-side only by `MappingService`'s `SemanticMapper` (Gemma VLM landmark extraction); the Gemini Live API key itself is entered in the Android app's Settings screen and never touches the server
+- `GEMINI_API_KEY` — used server-side by `MappingService`'s/`scan_server.py`'s `SemanticMapper` for its tagging step (see "Semantic mapper adapted to frame_extractor's Gemini -> GroundingDINO-tiny pipeline" — no separate key needed, reused from this same var); the Gemini Live API key itself is entered in the Android app's Settings screen and never touches the server
 - `RTABMAP_ADDR` — e.g. `tcp://localhost:5556` — **required** for `MappingService`; without it, `MappingService` registration is skipped entirely (logged, not fatal)
 - `DA3_ONNX_PATH` — ONNX weight path for `PerceptionService.AnalyzeFrame`'s `DEPTH` op, always `DA3DepthDetector` now (default `DA3METRIC-LARGE.onnx`, or `/opt/models/DA3METRIC-LARGE.onnx` inside the Docker image — see Docker note above) — uses the DA3-METRIC checkpoint's own `metric_depth` output directly, no separate scale-alignment step; `SparseObstacleDetector`/`StereoDepthDetector`/the DA3 torch backend were removed, so there's no longer a `DEPTH_MODEL` selector
 - `REPO_URL`/`REPO_REF` — Docker-image-only (`server/entrypoint.sh`), default `https://github.com/hungq1205/tracking` / `vi-slam` — which repo/branch the container clones/updates `/app` from on every start; not read by `grpc_server.py` itself
 - `SCAN_DA3_TORCH_MODEL_ID` — DA3 torch model for `MappingService`'s live-mapping pipeline (default `depth-anything/DA3METRIC-LARGE`, monocular-metric — was `depth-anything/da3-large` until a live-debugging incident traced total RTAB-Map tracking failure to that non-metric default, see "DA3 model default + per-frame processing + pre-DA3 blur gate") — a separate subsystem (dense reconstruction depth, not obstacle checks), independent of `DA3_ONNX_PATH` above — see "Client-Orchestrated Live Session"
-- `SCAN_GEMMA_MODEL_ID` — Gemma model for `MappingService`'s landmark extraction via Gemini API (default `gemma-4-31b-it`); uses `GEMINI_API_KEY` above
+- `GEMINI_TAGGING_MODEL_ID` — Gemini model id for `MappingService`'s/`scan_server.py`'s `SemanticMapper` tagging step (default `gemini-3.1-flash-lite`); `GDINO_TAGGING_MODEL_ID` — GroundingDINO-base model id for the same (default `IDEA-Research/grounding-dino-base`) — see "Semantic mapper adapted to frame_extractor's Gemini -> GroundingDINO-tiny pipeline". `SCAN_GEMMA_MODEL_ID`/`gemma_vlm.py` are no longer read by any live path.
 - `MEMORY_STORE_DIR` — on-disk dir for `RagStore`'s text-embedding storage (default `server/data/memory`)
 - `RAG_MODEL_ID` — sentence-transformer model id for `RagStore.embed_text()`, backing `PerceptionService.Embed` (default `sentence-transformers/all-MiniLM-L6-v2`)
 

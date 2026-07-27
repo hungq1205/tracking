@@ -18,6 +18,13 @@ class LocalEdgeDevice(
 ) : EdgeDevice {
 
     override val frameFlow: SharedFlow<ByteArray> = cameraManager.frameFlow
+    override val lumaFlow: SharedFlow<CameraManager.LumaFrame> = cameraManager.lumaFlow
+
+    // Unused/empty: the phone's own mic is captured directly by
+    // ContinuousVadRecorder's AudioRecord loop (VOICE_COMMUNICATION source +
+    // AEC/NS), not routed through EdgeDevice at all — only RemoteEdgeDevice
+    // actually populates this.
+    override val micFlow: SharedFlow<ByteArray> = MutableSharedFlow()
 
     private val _audioFlow = MutableSharedFlow<ByteArray>(
         extraBufferCapacity = 64,
@@ -25,8 +32,7 @@ class LocalEdgeDevice(
     )
     override val audioFlow: SharedFlow<ByteArray> = _audioFlow
 
-    /** Called by MainViewModel to deliver a PCM chunk to be played on this device's speaker. */
-    fun emitAudio(pcm: ByteArray) { _audioFlow.tryEmit(pcm) }
+    override fun emitAudio(pcm: ByteArray) { _audioFlow.tryEmit(pcm) }
 
     override fun connect() = Unit
     override fun disconnect() = Unit

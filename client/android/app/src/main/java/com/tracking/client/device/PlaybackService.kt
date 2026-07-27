@@ -15,18 +15,38 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 class PlaybackService : Service() {
 
     private var player: ExoPlayer? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Ducking while the user speaks (PTT held) — see
+        // LiveAssistantService.startPtt()/stopPtt(). No-op (and stops this
+        // service if it wasn't already playing anything) rather than a
+        // dedicated bound API, since this Service has always been
+        // started-only, never bound (onBind() stub below).
+        when (intent?.action) {
+            ACTION_PAUSE -> {
+                if (player == null) stopSelf() else player?.pause()
+                _isPlaying.value = false
+                return START_NOT_STICKY
+            }
+            ACTION_RESUME -> {
+                if (player == null) stopSelf() else player?.play()
+                _isPlaying.value = player != null
+                return START_NOT_STICKY
+            }
+        }
+
         val streamUrl = intent?.getStringExtra("stream_url") ?: return START_NOT_STICKY
         val title     = intent.getStringExtra("title") ?: ""
         val channel   = intent.getStringExtra("channel") ?: ""
 
         player?.release()
-        player = ExoPlayer.Builder(this)
+        val newPlayer = ExoPlayer.Builder(this)
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
@@ -36,17 +56,47 @@ class PlaybackService : Service() {
             )
             .setHandleAudioBecomingNoisy(true)
             .build()
-            .apply {
-                addListener(object : Player.Listener {
-                    override fun onPlayerError(error: PlaybackException) {
-                        Log.e(TAG, "Playback error: ${error.message}", error)
-                        stopSelf()
-                    }
-                })
-                setMediaItem(MediaItem.fromUri(streamUrl))
-                prepare()
-                play()
+        newPlayer.addListener(object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                Log.e(TAG, "Playback error: ${error.message}", error)
+                _isPlaying.value = false
+                stopSelf()
             }
+        })
+        player = newPlayer
+
+        // Settings "Other Sound Volume" slider — read directly from prefs
+        // (same convention LiveAssistantService.restoreSessionFromPrefsIfAvailable()
+        // already uses) rather than threading a param through every call
+        // site that starts playback (play_video/play_radio/resolved
+        // YouTube stream all funnel through here) — this Service is a
+        // process-wide singleton with no other config-passing path.
+        val volume = java.lang.Float.intBitsToFloat(
+            getSharedPreferences("tracking_prefs", MODE_PRIVATE)
+                .getInt("other_sound_volume_bits", java.lang.Float.floatToIntBits(1f))
+        ).coerceIn(0f, 1f)
+        newPlayer.volume = volume
+
+        // setMediaItem()/prepare() can throw SYNCHRONOUSLY, not just report
+        // an async onPlayerError — e.g. IllegalStateException("No suitable
+        // media source factory found for content type: N") for a stream
+        // format this build has no extension registered for (real incident:
+        // an HLS radio stream crashed the whole app here before this
+        // try/catch existed, since an uncaught exception inside
+        // onStartCommand kills the process, not just this Service).
+        try {
+            newPlayer.setMediaItem(MediaItem.fromUri(streamUrl))
+            newPlayer.prepare()
+            newPlayer.play()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start playback for '$streamUrl': ${e.message}", e)
+            newPlayer.release()
+            player = null
+            _isPlaying.value = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        _isPlaying.value = true
 
         startForeground(NOTIF_ID, buildNotification(title, channel))
         return START_NOT_STICKY
@@ -71,6 +121,7 @@ class PlaybackService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         player?.release()
         player = null
+        _isPlaying.value = false
         stopSelf()
         super.onTaskRemoved(rootIntent)
     }
@@ -78,6 +129,7 @@ class PlaybackService : Service() {
     override fun onDestroy() {
         player?.release()
         player = null
+        _isPlaying.value = false
         super.onDestroy()
     }
 
@@ -87,5 +139,14 @@ class PlaybackService : Service() {
         private const val TAG        = "PlaybackService"
         private const val NOTIF_ID  = 42
         private const val CHANNEL_ID = "playback"
+
+        const val ACTION_PAUSE = "com.tracking.client.action.PLAYBACK_PAUSE"
+        const val ACTION_RESUME = "com.tracking.client.action.PLAYBACK_RESUME"
+
+        // Process-wide — there's only ever one PlaybackService instance —
+        // so ContinuousVadRecorder's output-aware VAD gating (see its own
+        // doc comment) can check this without needing a bound connection.
+        private val _isPlaying = MutableStateFlow(false)
+        val isPlaying: StateFlow<Boolean> = _isPlaying
     }
 }
