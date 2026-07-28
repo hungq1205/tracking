@@ -136,17 +136,29 @@ class LiveGridPathPlanner:
     # far more from "fewer, clearer turns" than from an A*-optimal polyline.
     SIMPLIFY_COST_SLACK_FRAC = 0.08
 
-    # find_path()'s optional previous-path attraction bias (GUIDING) — see
-    # find_path()'s own docstring and CLAUDE.md's path-stability note.
-    # PREV_PATH_PROXIMITY_DECAY_RATE deliberately mirrors the "reward
-    # staying close over several metres, not just near-collision"
-    # reasoning behind SOFT_CLEARANCE_DECAY_RATE above (same order of
-    # magnitude) — this needs to keep favoring the OLD route over the
-    # first few metres from the user's current position, tapering off
-    # further out (where the old route is more likely to have been
-    # overtaken by real progress/new information anyway).
+    # Previous-path attraction bias (both find_path()/GUIDING and
+    # find_natural_path()/WALKING, via _prev_path_bias() below) — see that
+    # method's own docstring and CLAUDE.md's path-stability note. Narrowed
+    # per direct user follow-up feedback: ONLY the approach to the OLD
+    # route's own FIRST joint matters (nothing beyond it — the rest of the
+    # old multi-waypoint route is never referenced), and even then only the
+    # FINAL PREV_PATH_BIAS_RANGE_M (1.5m) stretch leading into that joint —
+    # "need to only keep up to 1.5m on the way to the joint, the remaining
+    # path to the joint if has, can be freely adjust." A cell farther than
+    # this from the old first joint gets ZERO bias (hard cutoff, not a
+    # decay) — completely free to differ from the old route.
     PREV_PATH_PENALTY_SCALE = 2.0
-    PREV_PATH_PROXIMITY_DECAY_RATE = 0.5
+    PREV_PATH_BIAS_RANGE_M = 1.5
+
+    # path_blocked_ahead()'s "nothing left to reuse" trigger — a route
+    # whose remaining length has dropped below this forces a fresh plan
+    # even though nothing along it is actually blocked. Found via a real
+    # bug: without this, an unobstructed straight corridor longer than the
+    # route's own planning horizon would have the server reuse the SAME
+    # route indefinitely, and once the client walked/joint-advanced past
+    # its last waypoint it had nothing left to steer by — see
+    # path_blocked_ahead()'s own docstring.
+    REPLAN_NEAR_END_M = 1.0
 
     # find_natural_path()'s cost-function weights — directly the weights
     # the user specified for the "natural walking path" planner (see
@@ -420,21 +432,42 @@ class LiveGridPathPlanner:
         self, row: int, col: int,
         start_xz: Tuple[float, float], previous_path_xz: List[Tuple[float, float]],
     ) -> float:
-        """Additive A* edge-cost penalty for `find_path()`'s optional
-        previous-path attraction (see that method's own docstring) —
-        proportional to this cell's distance from the old route, decayed
-        by how far the cell itself is from `start_xz` so the bias matters
-        most near the user's current position and fades further out."""
+        """Additive edge-cost penalty shared by `find_path()`'s A* (GUIDING)
+        and `find_natural_path()`'s direction-augmented search (WALKING) —
+        see PREV_PATH_BIAS_RANGE_M's own comment for the exact scope, and
+        find_path()/find_natural_path()'s own docstrings for how each
+        threads `previous_path_xz` in.
+
+        Deliberately narrow, per direct user feedback: only the OLD
+        route's own FIRST joint (`previous_path_xz[0]`) is ever referenced
+        — nothing beyond it — and even then only the FINAL
+        PREV_PATH_BIAS_RANGE_M (1.5m) stretch of the straight-line approach
+        from `start_xz` into that joint is biased. A cell farther than
+        that from the old first joint gets ZERO bias (a hard cutoff, not a
+        decay) — completely free to differ from the old route. Within that
+        final stretch, the penalty is proportional to the cell's distance
+        from the (possibly-trimmed) approach segment, so the search still
+        prefers converging toward the joint along roughly the same
+        corridor as before, not just "be near the joint from any angle."
+        """
         if not previous_path_xz:
             return 0.0
+        first_joint = previous_path_xz[0]
         cell_xz = self.cell_to_world(row, col)
-        dist_from_start_m = math.hypot(cell_xz[0] - start_xz[0], cell_xz[1] - start_xz[1])
-        dist_to_prev_m = _distance_to_polyline_m(cell_xz, previous_path_xz)
-        return (
-            self.PREV_PATH_PENALTY_SCALE
-            * math.exp(-self.PREV_PATH_PROXIMITY_DECAY_RATE * dist_from_start_m)
-            * dist_to_prev_m
+        dist_to_joint_m = math.hypot(cell_xz[0] - first_joint[0], cell_xz[1] - first_joint[1])
+        if dist_to_joint_m > self.PREV_PATH_BIAS_RANGE_M:
+            return 0.0
+        total_dist_m = math.hypot(first_joint[0] - start_xz[0], first_joint[1] - start_xz[1])
+        if total_dist_m < 1e-6:
+            return 0.0
+        trim_m = min(self.PREV_PATH_BIAS_RANGE_M, total_dist_m)
+        frac = (total_dist_m - trim_m) / total_dist_m
+        bias_start = (
+            start_xz[0] + frac * (first_joint[0] - start_xz[0]),
+            start_xz[1] + frac * (first_joint[1] - start_xz[1]),
         )
+        dist_to_segment_m = _point_segment_distance_m(cell_xz, bias_start, first_joint)
+        return self.PREV_PATH_PENALTY_SCALE * dist_to_segment_m
 
     def segment_blocked(self, a_xz: Tuple[float, float], b_xz: Tuple[float, float]) -> bool:
         """True if the straight-line cell-walk between two world points
@@ -464,14 +497,32 @@ class LiveGridPathPlanner:
         start) to find which segment the user's CURRENT progress falls
         within, since local joint-arrival advancement happens client-side
         only and the server has no other way to know how far along an
-        already-served route the user has actually gotten."""
+        already-served route the user has actually gotten.
+
+        ALSO forces a replan (returns True) once the user's progress along
+        the route is within REPLAN_NEAR_END_M of its own final point —
+        reusing a route with nothing left ahead of it would otherwise
+        silently strand the caller once its last joint is reached. Real
+        bug this fixes: WALKING's route has a bounded ~5m planning
+        horizon, and "not blocked" alone would let the server keep reusing
+        the SAME route indefinitely down an unobstructed corridor — the
+        client would eventually joint-advance past its last waypoint with
+        nothing new ever arriving to replace it (mainPathIdx running past
+        the available points mutes the beacon client-side, see
+        ToolDispatcher.kt's steerAlongMainPath())."""
         if not path_xz:
             return True
         pursuit_path = [pose_xz] + list(path_xz)
+        total_len_m = sum(
+            math.hypot(pursuit_path[i + 1][0] - pursuit_path[i][0], pursuit_path[i + 1][1] - pursuit_path[i][1])
+            for i in range(len(pursuit_path) - 1)
+        )
         projected = nearest_point_on_path(pursuit_path, pose_xz)
         if projected is None:
             return True
         _point, arc_len = projected
+        if total_len_m - arc_len <= self.REPLAN_NEAR_END_M:
+            return True
         cumulative = 0.0
         for i in range(len(pursuit_path) - 1):
             ax, az = pursuit_path[i]
@@ -546,6 +597,7 @@ class LiveGridPathPlanner:
         safe_clearance_m: float = 0.5,
         cone_stages_deg: Tuple[float, ...] = (45.0, 90.0, 180.0),
         min_progress_frac: float = 0.3,
+        previous_path_xz: Optional[List[Tuple[float, float]]] = None,
     ) -> Optional[Tuple[List[Tuple[float, float]], bool, bool]]:
         """
         WALKING's target/route strategy (no destination) — replaces the old
@@ -622,6 +674,15 @@ class LiveGridPathPlanner:
         this single criterion is what replaces the old two-stage straight-
         then-cone-fallback heuristic with one continuous decision.
 
+        [previous_path_xz] (optional — the PREVIOUS call's own returned
+        waypoints): threaded straight through to `_natural_step_cost()` via
+        `_prev_path_bias()` — see that method's own docstring for the exact
+        scope (only the final 1.5m approach into the OLD route's first
+        joint is biased, nothing beyond it, nothing farther out). Always
+        uses the REAL `heading_rad` for the cone/cost/target-selection
+        heading terms regardless — this bias is a separate, additive,
+        distance-bounded term, not a substitute reference direction.
+
         Returns None only if literally nothing beyond `start_xz` is
         reachable in ANY direction even at the widest (180 deg) cone stage
         — WALKING's dead-end trigger. `confirmed` is always True (expansion
@@ -635,7 +696,7 @@ class LiveGridPathPlanner:
         for i, cone_deg in enumerate(cone_stages_deg):
             result = self._search_natural(
                 start, start_xz, heading_rad, max_distance_m, safe_clearance_m,
-                math.radians(cone_deg),
+                math.radians(cone_deg), previous_path_xz,
             )
             if result is None:
                 continue
@@ -651,6 +712,7 @@ class LiveGridPathPlanner:
         self,
         start: Tuple[int, int], start_xz: Tuple[float, float], heading_rad: float,
         max_distance_m: float, safe_clearance_m: float, cone_half_rad: float,
+        previous_path_xz: Optional[List[Tuple[float, float]]] = None,
     ) -> Optional[Tuple[List[Tuple[float, float]], bool, bool]]:
         """One cone-bounded search attempt for find_natural_path() — see
         that method's own docstring for the overall design. State =
@@ -701,6 +763,7 @@ class LiveGridPathPlanner:
 
                 step_cost = self._natural_step_cost(
                     nr, nc, azimuth, heading_rad, dir_idx, step_dist_m, safe_clearance_m,
+                    start_xz, previous_path_xz,
                 )
                 tentative_g = cost + step_cost
                 nstate = (nr, nc, ndir_idx)
@@ -746,12 +809,17 @@ class LiveGridPathPlanner:
     def _natural_step_cost(
         self, row: int, col: int, azimuth: float, heading_rad: float,
         prev_dir_idx: int, step_dist_m: float, safe_clearance_m: float,
+        start_xz: Optional[Tuple[float, float]] = None,
+        previous_path_xz: Optional[List[Tuple[float, float]]] = None,
     ) -> float:
         """Additive weighted step cost for find_natural_path()'s search —
         see that method's own docstring for the full formula/reasoning.
         `prev_dir_idx < 0` means this is the first step of the path (no
         prior direction to compare against), so it incurs no turn cost
-        regardless of which of the 8 directions it picks."""
+        regardless of which of the 8 directions it picks. `start_xz`/
+        `previous_path_xz`, when both given, add `_prev_path_bias()`'s
+        bounded previous-route attraction term (see that method's own
+        docstring) on top of the four terms below."""
         heading_err = abs(_wrap_angle(azimuth - heading_rad))
         heading_cost = self.W_HEADING * (heading_err / math.pi) ** 2
 
@@ -799,7 +867,12 @@ class LiveGridPathPlanner:
         cls = self._class[row][col]
         length_cost = self.W_LENGTH * step_dist_m * _COST_BY_CLASS.get(cls, 1.0)
 
-        return heading_cost + obstacle_cost + turn_cost + length_cost
+        prev_path_cost = (
+            self._prev_path_bias(row, col, start_xz, previous_path_xz)
+            if start_xz is not None and previous_path_xz else 0.0
+        )
+
+        return heading_cost + obstacle_cost + turn_cost + length_cost + prev_path_cost
 
 
 def _directional_distance(
@@ -824,8 +897,10 @@ def _point_segment_distance_m(
     point_xz: Tuple[float, float], a_xz: Tuple[float, float], b_xz: Tuple[float, float],
 ) -> float:
     """Shortest distance from `point_xz` to the segment a_xz->b_xz (clamped
-    to the segment, not the infinite line) — the single-segment building
-    block `_distance_to_polyline_m()` below reduces a whole polyline to."""
+    to the segment, not the infinite line) — used by
+    `LiveGridPathPlanner._prev_path_bias()` to measure how far a candidate
+    cell strays from the (possibly-trimmed) approach into a previous
+    route's first joint."""
     px, pz = point_xz
     ax, az = a_xz
     bx, bz = b_xz
@@ -835,21 +910,6 @@ def _point_segment_distance_m(
         return math.hypot(px - ax, pz - az)
     t = max(0.0, min(1.0, ((px - ax) * dx + (pz - az) * dz) / seg_len_sq))
     return math.hypot(px - (ax + dx * t), pz - (az + dz * t))
-
-
-def _distance_to_polyline_m(point_xz: Tuple[float, float], polyline_xz: List[Tuple[float, float]]) -> float:
-    """Shortest distance from `point_xz` to any segment of `polyline_xz` —
-    used by `LiveGridPathPlanner._prev_path_bias()` to measure how far a
-    candidate cell strays from a previously-served route. A single-point
-    "polyline" degrades to plain point distance."""
-    if not polyline_xz:
-        return float("inf")
-    if len(polyline_xz) == 1:
-        return math.hypot(point_xz[0] - polyline_xz[0][0], point_xz[1] - polyline_xz[0][1])
-    return min(
-        _point_segment_distance_m(point_xz, polyline_xz[i], polyline_xz[i + 1])
-        for i in range(len(polyline_xz) - 1)
-    )
 
 
 # Beacon look-ahead distance — matches ToolDispatcher.kt's PATH_LOOKAHEAD_M

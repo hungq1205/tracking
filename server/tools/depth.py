@@ -5,7 +5,7 @@ from typing import Optional
 
 from tools.traversability import TraversabilityResult, estimate_traversability
 
-CORRIDOR_FRACTION = 1 / 3
+CORRIDOR_FRACTION = 0.5  # "the middle area" — see check_obstacle()
 
 
 class DA3DepthDetector:
@@ -28,7 +28,7 @@ class DA3DepthDetector:
     inference twice.
     """
 
-    OBSTACLE_THRESHOLD_M = 1.5
+    OBSTACLE_THRESHOLD_M = 1.0
 
     def __init__(
         self,
@@ -57,7 +57,13 @@ class DA3DepthDetector:
         return self._da3.estimate(rgb).depth_map
 
     def check_obstacle(self, frame_bgr: np.ndarray) -> tuple[bool, float]:
-        """Returns (obstacle_present, min_depth_metres)."""
+        """Returns (obstacle_present, min_depth_metres). Deliberately no
+        RANSAC ground-plane fit (unlike estimate_traversability) — one DA3
+        call + a percentile over the middle-width corridor, so this stays
+        fast enough for a client to poll on its own fixed cadence
+        (ToolDispatcher.kt's obstacle-ahead beep, decoupled from the much
+        slower MappingService stream) as well as for the on-demand
+        Gemini-invoked check_obstacle tool."""
         w_bgr = frame_bgr.shape[1]
         depth_metric = self._depth_map(frame_bgr)
 
@@ -68,7 +74,7 @@ class DA3DepthDetector:
         if not valid_c.any():
             return False, 1.0
 
-        min_depth = float(np.percentile(corridor[valid_c], 10))
+        min_depth = float(np.percentile(corridor[valid_c], 5))
         return min_depth < self.OBSTACLE_THRESHOLD_M, min_depth
 
     def estimate_traversability(

@@ -67,6 +67,22 @@ RUN pip install \
 ENV DA3_ONNX_PATH=/opt/models/DA3METRIC-LARGE.onnx
 COPY DA3METRIC-LARGE.onnx ${DA3_ONNX_PATH}
 
+# Pre-cache GroundingDINO-base (server/tools/detector.py's GroundingDINODetector
+# default model_id — the TrackingService/PerceptionService.AnalyzeFrame(DETECT)
+# detector) into the image's HF cache, same "baked in at build time, not
+# fetched at runtime" precedent as DA3METRIC-LARGE.onnx above — just via
+# from_pretrained's own cache instead of a single-file COPY, since a HF Hub
+# model has no equivalent standalone artifact. CPU-only here (no GPU during
+# a normal `docker build`) — this only downloads/caches the weights, the
+# same processor/model construction detector.py itself does at runtime,
+# minus .to(device)/.half(), which need a real CUDA device to be meaningful.
+RUN python3.11 -c "\
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection; \
+model_id = 'IDEA-Research/grounding-dino-base'; \
+AutoProcessor.from_pretrained(model_id, use_fast=True); \
+AutoModelForZeroShotObjectDetection.from_pretrained(model_id, low_cpu_mem_usage=True); \
+print(f'[build] Pre-cached {model_id}')"
+
 ENV REPO_URL=https://github.com/hungq1205/tracking \
     REPO_REF=vi-slam
 

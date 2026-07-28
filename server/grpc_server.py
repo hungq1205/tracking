@@ -5,6 +5,17 @@ import grpc
 import os
 from concurrent import futures
 
+# Depth-Anything-3's own logger (depth_anything_3/utils/logger.py, NOT the
+# stdlib `logging` module) prints an INFO line per stage on every single
+# depth call ("Processed Images Done", "Model Forward Pass Done",
+# "Conversion to Prediction Done") — with walking/guiding polling depth
+# multiple times a second (both the mapping pipeline and the new fast
+# obstacle-ahead RPC), this floods the console. Set before anything imports
+# da3_wrapper/depth_anything_3 so it's read at that package's own import
+# time; respects an explicit DA3_LOG_LEVEL if the environment already set
+# one, only defaulting it down otherwise.
+os.environ.setdefault("DA3_LOG_LEVEL", "WARN")
+
 import torch
 
 import sys
@@ -39,10 +50,8 @@ activity_monitor = ActivityMonitor()
 print("[SERVER] Initializing models...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# detector = GroundingDINODetector()
-# embedder = DINOv2Embedder()
-detector = None
-embedder = None
+detector = GroundingDINODetector()
+embedder = DINOv2Embedder()
 
 depth_detector = DA3DepthDetector(
     onnx_path=os.getenv("DA3_ONNX_PATH", "DA3METRIC-LARGE.onnx"),

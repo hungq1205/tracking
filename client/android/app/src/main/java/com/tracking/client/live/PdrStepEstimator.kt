@@ -37,11 +37,13 @@ class PdrStepEstimator(context: Context, private val strideLengthM: Float = STRI
     private val stepSensor: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
 
     @Volatile private var stepsSinceReset = 0
+    @Volatile private var lastStepAtMs = 0L
     private var registered = false
 
     private val listener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
             stepsSinceReset++
+            lastStepAtMs = System.currentTimeMillis()
         }
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     }
@@ -74,6 +76,19 @@ class PdrStepEstimator(context: Context, private val strideLengthM: Float = STRI
      * "how far." */
     fun distanceSinceReset(): Float = stepsSinceReset * strideLengthM
 
+    /** True if the step detector fired within the last [windowMs] — the
+     * IMU-derived "is the user actively walking right now" signal
+     * requested directly by the user for gating the depth-based obstacle-
+     * ahead alert (see ToolDispatcher.checkAndWarnObstacleAhead()):
+     * TYPE_STEP_DETECTOR fires per-step (roughly every 0.4-0.8s during
+     * normal gait), so a couple of seconds of silence is a reasonable
+     * "stopped walking" signal without needing a second, continuous
+     * accelerometer-magnitude listener alongside this one. Reads false
+     * before the first-ever step (lastStepAtMs starts at 0) — correct,
+     * since nothing has confirmed movement yet at that point either. */
+    fun isRecentlyMoving(windowMs: Long = MOVING_WINDOW_MS): Boolean =
+        lastStepAtMs != 0L && (System.currentTimeMillis() - lastStepAtMs) <= windowMs
+
     /** Called whenever the client folds this into a fresh authoritative
      * server pose (see ToolDispatcher's mapping-stream collector) — starts
      * a new distance-since-last-fix window. */
@@ -84,5 +99,9 @@ class PdrStepEstimator(context: Context, private val strideLengthM: Float = STRI
     companion object {
         private const val TAG = "PdrStepEstimator"
         const val STRIDE_LENGTH_M = 0.7f
+        // Comfortably covers normal walking cadence (a step roughly every
+        // 0.4-0.8s) while still reading "stopped" within ~2s of actually
+        // stopping.
+        private const val MOVING_WINDOW_MS = 2000L
     }
 }

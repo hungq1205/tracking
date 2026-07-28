@@ -588,7 +588,7 @@ fun SettingsScreen(
                     onValueChange = { edgeDeviceHost = it },
                     label = { Text("Edge Device IP") },
                     placeholder = { Text("192.168.1.50") },
-                    supportingText = { Text("Fixed ports 5601-5604 (mic/frame/audio/luma)") },
+                    supportingText = { Text("Fixed ports 5601-5605 (mic/frame/audio/luma/control)") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(

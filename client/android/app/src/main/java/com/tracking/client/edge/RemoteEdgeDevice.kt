@@ -24,9 +24,10 @@ import kotlin.concurrent.thread
  * no polling either direction):
  *
  *   frame_out (edge PUSHes, this PULLs) -> [frameFlow]  — JPEG, 640px long-edge, q50
- *   luma_out  (edge PUSHes, this PULLs) -> [lumaFlow]   — raw Y-plane, 480px long-edge, 15fps
+ *   luma_out  (edge PUSHes, this PULLs) -> [lumaFlow]   — raw Y-plane, 360px long-edge, 15fps
  *   mic_out   (edge PUSHes, this PULLs) -> [micFlow]    — 16kHz mono PCM16, 512-sample chunks
  *   audio_in  (edge PULLs,  this PUSHes) <- [emitAudio] — rendered PCM to play on the edge speaker
+ *   control   (edge PULLs,  this PUSHes) <- [reportMode] — current mode string, gates luma_out only
  *
  * Each ZMQ message is a 2-frame multipart: [8-byte LE seq][8-byte LE double
  * unix-seconds timestamp], then the raw payload — identical framing to
@@ -35,15 +36,17 @@ import kotlin.concurrent.thread
  * little-endian int32s) ahead of the luma bytes, since — unlike a JPEG or
  * raw PCM chunk — a luma frame needs that metadata to reconstruct a
  * [CameraManager.LumaFrame]; this sub-header is this class's own contract
- * with the (not-yet-written) Pi-side server, not an existing convention.
+ * with the Pi-side server, not an existing convention.
  *
- * No dynamic frame-rate/resolution control channel yet (a PUB/SUB "control"
- * socket the Android side would use to push {frame_interval_ms,
- * frame_long_edge_px, frame_quality, luma_interval_ms, mic_enabled} whenever
- * mode changes, matching the existing frameIntervalMs/scanIntervalMs/
- * walkingIntervalMs per-mode cadence this app already has) — the Pi side
- * would need to read and honor it. Deliberately left for a follow-up: this
- * class only implements the Android-side media pipe itself.
+ * [reportMode]'s control socket is a NARROW slice of the "dynamic control
+ * channel" this class's docstring used to flag as a future follow-up — it
+ * only tells the Pi which mode the app is in, purely so the Pi can skip
+ * capturing/sending [lumaFlow] when nothing will consume it (only
+ * walking/guiding actually process luma client-side — see
+ * ToolDispatcher.feedAngleLumaFrame()). A fuller control channel (dynamic
+ * frame_interval_ms/frame_quality/etc, matching frameIntervalMs/
+ * scanIntervalMs/walkingIntervalMs's per-mode cadence) is still a real,
+ * separate follow-up, not attempted here.
  */
 class RemoteEdgeDevice(
     private val host: String,
@@ -51,6 +54,7 @@ class RemoteEdgeDevice(
     private val lumaPort: Int = 5604,
     private val micPort: Int = 5601,
     private val audioInPort: Int = 5603,
+    private val controlPort: Int = 5605,
 ) : EdgeDevice {
 
     private val _frameFlow = MutableSharedFlow<ByteArray>(
@@ -78,8 +82,10 @@ class RemoteEdgeDevice(
     private var lumaPull: ZMQ.Socket? = null
     private var micPull: ZMQ.Socket? = null
     private var audioPush: ZMQ.Socket? = null
+    private var controlPush: ZMQ.Socket? = null
     @Volatile private var running = false
     private var audioSeq = 0L
+    private var controlSeq = 0L
 
     override fun connect() {
         if (running) return
@@ -95,6 +101,8 @@ class RemoteEdgeDevice(
         micPull = mic
         val audioOut = context.socket(SocketType.PUSH).apply { sndHWM = 32; connect("tcp://$host:$audioInPort") }
         audioPush = audioOut
+        val control = context.socket(SocketType.PUSH).apply { sndHWM = 8; connect("tcp://$host:$controlPort") }
+        controlPush = control
 
         thread(name = "remote-edge-frame", isDaemon = true) {
             recvLoop(frame) { payload -> _frameFlow.tryEmit(payload) }
@@ -109,9 +117,9 @@ class RemoteEdgeDevice(
 
     override fun disconnect() {
         running = false
-        framePull?.close(); lumaPull?.close(); micPull?.close(); audioPush?.close()
+        framePull?.close(); lumaPull?.close(); micPull?.close(); audioPush?.close(); controlPush?.close()
         ctx?.term()
-        framePull = null; lumaPull = null; micPull = null; audioPush = null
+        framePull = null; lumaPull = null; micPull = null; audioPush = null; controlPush = null
         ctx = null
     }
 
@@ -126,6 +134,21 @@ class RemoteEdgeDevice(
             push.sendMore(header)
             push.send(pcm, 0)
             audioSeq++
+        } catch (_: ZMQException) {
+            // socket torn down mid-send during disconnect(); harmless
+        }
+    }
+
+    override fun reportMode(mode: String) {
+        val push = controlPush ?: return
+        val header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(controlSeq)
+            .putDouble(System.currentTimeMillis() / 1000.0)
+            .array()
+        try {
+            push.sendMore(header)
+            push.send(mode.toByteArray(Charsets.UTF_8), 0)
+            controlSeq++
         } catch (_: ZMQException) {
             // socket torn down mid-send during disconnect(); harmless
         }

@@ -516,6 +516,26 @@ def create_ui(activity_monitor) -> gr.Blocks:
             or _TAB_BY_CATEGORY.get(snap["last_category"], "tab_log")
         )
 
+        # Broad, deliberate try/except around every render call — found
+        # investigating a real "dashboard freezes during a long WALKING
+        # session" report: _render_occupancy already guarded itself this
+        # way, but an uncaught exception from any OTHER render helper here
+        # (e.g. _annotate_mapping) would abort this whole _poll() call.
+        # Skipping a tick on a transient failure (stale-but-valid previous
+        # values via gr.update()) is far better than one bad tick wedging
+        # the dashboard until a reload — see trigger_mode="multiple" above
+        # for the other half of this fix.
+        try:
+            mapping_image = _annotate_mapping(snap["mapping"])
+        except Exception as e:
+            print(f"[server_gui] _poll: _annotate_mapping failed: {e}")
+            mapping_image = gr.update()
+        try:
+            occupancy_fig = _render_occupancy(snap["mapping"], False)  # Recording is handled by a separate event
+        except Exception as e:
+            print(f"[server_gui] _poll: _render_occupancy failed: {e}")
+            occupancy_fig = gr.update()
+
         return (
             gr.update(selected=tab_id),
             _client_mode_text(snap),
@@ -525,9 +545,9 @@ def create_ui(activity_monitor) -> gr.Blocks:
             _perception_status(snap["perception"]),
             _render_beacon_polar(snap),
             _beacon_status(snap),
-            _annotate_mapping(snap["mapping"]),
+            mapping_image,
             _mapping_status(snap["mapping"]),
-            _render_occupancy(snap["mapping"], False),  # Recording is handled by a separate event
+            occupancy_fig,
             _log_html(snap["log"]),
             snap,  # Pass the full snapshot to the state component
         )
@@ -599,6 +619,17 @@ def create_ui(activity_monitor) -> gr.Blocks:
         timer.tick(
             fn=_poll,
             inputs=[],
+            # trigger_mode="multiple" (default is "once", which per Gradio's
+            # own docs "would not allow any submissions while an event is
+            # pending") — found investigating a real report that the
+            # dashboard would freeze during a long WALKING session and only
+            # a browser reload (a fresh Timer) temporarily fixed it: a
+            # single pathologically slow _poll() call (heavy render cost on
+            # a large occupancy grid, or contention against the gRPC
+            # servicer thread) would otherwise silently swallow every tick
+            # queued behind it, wedging the dashboard on its last successful
+            # frame instead of just skipping a beat.
+            trigger_mode="multiple",
             outputs=[
                 ui_tabs,
                 ui_client_mode,

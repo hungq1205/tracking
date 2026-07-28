@@ -5,6 +5,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
+import android.os.Process
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.SharedFlow
@@ -120,6 +121,18 @@ class ContinuousVadRecorder {
     }
 
     private fun recordLoop(startThreshold: Float, noiseGate: Float, hangoverMs: Long, isOutputActive: () -> Boolean) {
+        // Real bug found via a user report: mic capture could go silent
+        // entirely during SCAN mode (queues every camera frame unbounded,
+        // see ToolDispatcher.startMappingStream()'s Channel.UNLIMITED for
+        // "scanning") — this thread ran at normal/default priority with
+        // nothing telling the OS scheduler it's latency-critical, so under
+        // SCAN's own CPU/GC pressure it could get starved long enough for
+        // the small AudioRecord ring buffer (~256ms, see maxOf below) to
+        // overrun before a speech-shaped RMS pattern was ever read.
+        // Process.setThreadPriority (not Thread.setPriority — Android's
+        // scheduler only honors the former) with THREAD_PRIORITY_URGENT_AUDIO
+        // is the standard fix for a raw-audio-capture thread.
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
@@ -208,6 +221,7 @@ class ContinuousVadRecorder {
         hangoverMs: Long,
         isOutputActive: () -> Boolean,
     ) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
         var speaking = false
         var lastAboveGateAtMs = 0L
         try {

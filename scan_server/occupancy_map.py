@@ -137,6 +137,7 @@ this file's ray logic.
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -358,6 +359,13 @@ class OccupancyMap:
         self.HEIGHT_EWMA_ALPHA = (
             self.HEIGHT_EWMA_ALPHA if height_ewma_alpha is None else height_ewma_alpha
         )
+        # Guards every mutating/reading entry point below (update(),
+        # reset(), seed_from_summary(), render_plotly(),
+        # render_confidence_plotly(), extract_subgrid(), extract_full_grid(),
+        # bounds(), extract_dirty_delta()) — see update()'s own docstring
+        # for the race this fixes (gRPC servicer thread vs. Gradio polling
+        # thread on a long-running WALKING/GUIDING session).
+        self._lock = threading.Lock()
         self._cells: Dict[Tuple[int, int], _CellState] = {}
         # Cells touched (any _register_* call) since the last
         # extract_dirty_delta() call — the sparse counterpart to
@@ -428,13 +436,21 @@ class OccupancyMap:
         """Clear all accumulated belief/trajectory data. Used before a full
         rebuild from a complete point cloud so re-running it doesn't keep
         re-accumulating the same data on top of itself."""
-        self._cells.clear()
-        self._dirty_cells.clear()
-        self._ground_y = None
-        self._trajectory.clear()
-        self._update_count = 0
+        with self._lock:
+            self._cells.clear()
+            self._dirty_cells.clear()
+            self._ground_y = None
+            self._trajectory.clear()
+            self._update_count = 0
 
     def seed_from_summary(self, grid_dict: dict, ground_y: float) -> None:
+        """Thread-safe entry point — see _seed_from_summary_locked() for the
+        real body (unchanged below, just renamed); see update()'s own
+        docstring for why this class now has a lock at all."""
+        with self._lock:
+            self._seed_from_summary_locked(grid_dict, ground_y)
+
+    def _seed_from_summary_locked(self, grid_dict: dict, ground_y: float) -> None:
         """
         Coarse re-seed from a previously-EXPORTED summary (class + normalized
         height per cell — NOT the raw per-cell logodds/height_ewma, which
@@ -491,6 +507,27 @@ class OccupancyMap:
         print(f"[OccupancyMap] seed_from_summary: reseeded {seeded} cells from saved snapshot (ground_y={ground_y:.3f}).")
 
     def update(
+        self, trajectory: np.ndarray, cloud_points: np.ndarray,
+        confidence: float = 1.0,
+        point_is_ground: Optional[np.ndarray] = None,
+    ) -> None:
+        """Thread-safe entry point — see _update_locked() for the real body
+        (unchanged below, just renamed). Added after a real bug: server_gui.py's
+        Gradio polling thread reads self._cells/self._trajectory (render_plotly/
+        render_confidence_plotly/extract_full_grid/extract_subgrid/bounds/
+        extract_dirty_delta) completely unsynchronized against this method's
+        mutations, which run on the gRPC servicer thread on every processed
+        WALKING/GUIDING batch — a bbox-expanding cell inserted mid-render
+        could throw IndexError/RuntimeError inside the render, and only ONE
+        of the two dashboard render call sites (_render_occupancy, not
+        _annotate_mapping) had a try/except broad enough to survive that —
+        the other could leave the Gradio polling loop stuck on a WALKING
+        session that had run long enough to hit the race. self._lock (new)
+        serializes every mutating/reading entry point on this class."""
+        with self._lock:
+            self._update_locked(trajectory, cloud_points, confidence, point_is_ground)
+
+    def _update_locked(
         self, trajectory: np.ndarray, cloud_points: np.ndarray,
         confidence: float = 1.0,
         point_is_ground: Optional[np.ndarray] = None,
@@ -593,9 +630,26 @@ class OccupancyMap:
                 n_ceiling_pts += 1
                 continue
             key = (ix, iz)
-            is_ground_pt = bool(ground_flags[i]) if ground_flags is not None else (height < self.OBSTACLE_MIN_H)
+            rtabmap_confirmed_ground = ground_flags is not None and bool(ground_flags[i])
+            is_ground_pt = rtabmap_confirmed_ground if ground_flags is not None else (height < self.OBSTACLE_MIN_H)
             if is_ground_pt:
-                cell_ground_ys.setdefault(key, []).append(y)
+                # RTAB-Map's own 3D ground segmentation (util3d::
+                # segmentObstaclesFromGround) is a genuinely independent
+                # signal from this point's own (depth-noise-affected)
+                # measured Y — when it confirms a point IS ground, force
+                # its recorded height to exactly ground level
+                # (self._ground_y, i.e. height=0) instead of letting that
+                # point's own measurement noise into height_ewma/the
+                # cumulative ground_y re-estimate below. Requested directly
+                # by the user. Height-HEURISTIC-classified ground
+                # (ground_flags is None — IMU+VO/VO pose mode, no
+                # independent segmentation available) keeps its own real
+                # measured Y unchanged — there's no independent
+                # confirmation to force toward there, only the height
+                # heuristic itself (which the ground_y estimate is already
+                # derived from), so forcing would just be circular.
+                ground_y_for_cell = self._ground_y if rtabmap_confirmed_ground else y
+                cell_ground_ys.setdefault(key, []).append(ground_y_for_cell)
                 n_ground_pts += 1
             else:
                 n_obstacle_pts += 1
@@ -781,8 +835,12 @@ class OccupancyMap:
     ) -> go.Figure:
         """Times the render (rendering is CPU-only — Plotly/numpy grid
         construction has no GPU path) and delegates to _render_plotly_impl.
-        `route`/`route_confirmed` — see _overlay_route()."""
-        with timed(f"occupancy_map.render_plotly ({len(self._cells)} cells)"):
+        `route`/`route_confirmed` — see _overlay_route(). Holds self._lock
+        for the whole render (see update()'s docstring for why) — a
+        WALKING/GUIDING session's own update() calls only ever briefly wait
+        behind a render, never the reverse deadlock risk, since update()
+        never itself calls back into a render method."""
+        with self._lock, timed(f"occupancy_map.render_plotly ({len(self._cells)} cells)"):
             return self._render_plotly_impl(zones, route, route_confirmed)
 
     def _empty_figure(
@@ -955,8 +1013,10 @@ class OccupancyMap:
         route: Optional[List[Tuple[float, float]]] = None,
         route_confirmed: Optional[bool] = None,
     ) -> go.Figure:
-        """Times the render, same convention as render_plotly()."""
-        with timed(f"occupancy_map.render_confidence_plotly ({len(self._cells)} cells)"):
+        """Times the render, same convention as render_plotly() — including
+        holding self._lock for the whole call, see that method's own
+        comment."""
+        with self._lock, timed(f"occupancy_map.render_confidence_plotly ({len(self._cells)} cells)"):
             return self._render_confidence_plotly_impl(zones, route, route_confirmed)
 
     def _render_confidence_plotly_impl(
@@ -1155,14 +1215,17 @@ class OccupancyMap:
     def extract_subgrid(self, bbox_min: List[float], bbox_max: List[float]) -> dict:
         """
         Extract the occupancy cells that fall within a 3D AABB (only X and Z axes used).
-        See _build_grid_dict for the returned dict's schema.
+        See _build_grid_dict for the returned dict's schema. Holds self._lock
+        for the whole call — see update()'s docstring for why this class has
+        a lock at all.
         """
-        res = self.resolution
-        ix_lo = int(math.floor(bbox_min[0] / res))
-        ix_hi = int(math.ceil(bbox_max[0] / res))
-        iz_lo = int(math.floor(bbox_min[2] / res))
-        iz_hi = int(math.ceil(bbox_max[2] / res))
-        return self._build_grid_dict(ix_lo, ix_hi, iz_lo, iz_hi)
+        with self._lock:
+            res = self.resolution
+            ix_lo = int(math.floor(bbox_min[0] / res))
+            ix_hi = int(math.ceil(bbox_max[0] / res))
+            iz_lo = int(math.floor(bbox_min[2] / res))
+            iz_hi = int(math.ceil(bbox_max[2] / res))
+            return self._build_grid_dict(ix_lo, ix_hi, iz_lo, iz_hi)
 
     def extract_full_grid(self) -> Optional[dict]:
         """
@@ -1171,21 +1234,23 @@ class OccupancyMap:
         across zone boundaries, not just within one zone's AABB. Returns
         None if there's no data yet (caller — map_exporter.py — omits the
         top-level occupancy_grid field in that case rather than exporting an
-        empty grid).
+        empty grid). Holds self._lock for the whole call.
         """
-        if not self._cells or self._ground_y is None:
-            return None
-        keys = np.array(list(self._cells.keys()), dtype=np.int32)
-        ix_lo, iz_lo = int(keys[:, 0].min()), int(keys[:, 1].min())
-        ix_hi, iz_hi = int(keys[:, 0].max()) + 1, int(keys[:, 1].max()) + 1
-        return self._build_grid_dict(ix_lo, ix_hi, iz_lo, iz_hi)
+        with self._lock:
+            if not self._cells or self._ground_y is None:
+                return None
+            keys = np.array(list(self._cells.keys()), dtype=np.int32)
+            ix_lo, iz_lo = int(keys[:, 0].min()), int(keys[:, 1].min())
+            ix_hi, iz_hi = int(keys[:, 0].max()) + 1, int(keys[:, 1].max()) + 1
+            return self._build_grid_dict(ix_lo, ix_hi, iz_lo, iz_hi)
 
     def clear_dirty(self) -> None:
         """Discards pending dirty cells without extracting them — used after
         a FULL grid export (mapping_servicer.py), since those cells' current
         values are already covered by the full send and would otherwise be
         redundantly included in the next delta too."""
-        self._dirty_cells.clear()
+        with self._lock:
+            self._dirty_cells.clear()
 
     def bounds(self) -> Optional[Tuple[int, int, int, int]]:
         """(ix_lo, iz_lo, width, height) of the current full-grid bounding
@@ -1194,7 +1259,15 @@ class OccupancyMap:
         decide whether the box grew since the last full resync (in which
         case a delta's fixed-origin cell indices would no longer line up
         with what the client has, and a fresh extract_full_grid() is
-        needed instead of extract_dirty_delta())."""
+        needed instead of extract_dirty_delta()). Thread-safe entry point —
+        see _bounds_locked() for the real body (also called internally by
+        extract_dirty_delta(), which already holds self._lock itself and so
+        must call _bounds_locked() directly rather than re-entering this
+        method — self._lock is a plain, non-reentrant Lock)."""
+        with self._lock:
+            return self._bounds_locked()
+
+    def _bounds_locked(self) -> Optional[Tuple[int, int, int, int]]:
         if not self._cells:
             return None
         keys = np.array(list(self._cells.keys()), dtype=np.int32)
@@ -1203,6 +1276,12 @@ class OccupancyMap:
         return ix_lo, iz_lo, ix_hi - ix_lo, iz_hi - iz_lo
 
     def extract_dirty_delta(self) -> Optional[dict]:
+        """Thread-safe entry point — see _extract_dirty_delta_locked() for
+        the real body (unchanged below, just renamed)."""
+        with self._lock:
+            return self._extract_dirty_delta_locked()
+
+    def _extract_dirty_delta_locked(self) -> Optional[dict]:
         """
         Sparse counterpart to extract_full_grid() — only cells touched
         (self._dirty_cells) since the last call, for incremental sync
@@ -1236,7 +1315,7 @@ class OccupancyMap:
         """
         if not self._dirty_cells or self._ground_y is None:
             return None
-        b = self.bounds()
+        b = self._bounds_locked()
         if b is None:
             return None
         ix_lo, iz_lo, width, height = b

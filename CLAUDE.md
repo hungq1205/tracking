@@ -5477,6 +5477,178 @@ Not verified end-to-end on a real device from this environment — compile-
 verified only (`./gradlew :app:compileDebugKotlin`), same standing caveat
 as the rest of this file's Android work.
 
+### Documentation drift found and corrected this round (read before trusting older sections on these topics)
+
+While investigating the items below, two places were found where the CODE
+had already moved on from what CLAUDE.md still described, with no update
+ever made — a violation of this file's own "keep it accurate" mandate.
+Not a full audit, just what surfaced incidentally:
+
+- **`EdgeDevice`/`LocalEdgeDevice`/edge hardware.** CLAUDE.md's "Foreground-
+  service migration"/`test_module/edge_mock_app` sections still describe
+  `LocalEdgeDevice` as an unbuilt, in-process-only stub with "no real
+  remote transport of its own yet." That's stale — `RemoteEdgeDevice.kt`
+  (ZeroMQ PUSH/PULL to a Raspberry-Pi-class device: `frame_out`/`luma_out`/
+  `mic_out`/`audio_in`) is real, wired code, toggled via Settings' "Use
+  Remote Edge Device" switch (default off — phone-local by default) and
+  `LiveAssistantService.configureEdgeDevice()`. `AudioMixer.kt` combines
+  Gemini's voice + the Pixie cue into one stream for the remote speaker.
+  Reading-mode TTS (`ReadingTtsPlayer`, native Android `TextToSpeech`)
+  still only plays on the phone regardless of the toggle — never wired
+  into the mixer/edge path. Not rewritten in this pass — flagged for a
+  dedicated cleanup, offered to the user, not yet actioned.
+- **The step-down/obstacle hazard warning.** The "Hazard warnings —
+  step-down frames fed to Gemini Live" section below still describes a
+  local-depth-heuristic design (`checkAndWarnHazard()`, `dropoff_m`/
+  `clearance_m` thresholds). That was ALREADY replaced, in code not
+  reflected here, by `runPeriodicVisionCheck()` — a flat-cadence,
+  novelty-gated (`AngleTracker.consumeNoveltyTrigger()`), purely
+  Gemini-vision-judged narration/hazard check, specifically because the
+  single-frame RANSAC ground-plane heuristic "proved unreliable on real
+  stairs/drop-offs" (see that function's own doc comment). This round's
+  new `checkAndWarnObstacleAhead()` (below) reintroduces a depth-based
+  signal, but deliberately narrower-scoped than the old one — see its own
+  entry for why that's not just reverting the earlier finding.
+
+### Pixie beacon not reliably reflecting large drift; obstacle-ahead alert moved to depth+IMU gating; previous-path bias narrowed to the final 1.5m into the first joint only; RTAB-Map ground segmentation now forces height to 0
+
+Four related fixes/investigations from the same round, following up on
+real on-device testing (Android client, not an edge device) of the
+path-stability work above.
+
+**1. Investigated: Pixie/HRTF cue sometimes not audible despite large
+real-world drift.** Not reproducible from this environment (no device) —
+code review turned up two real, independent contributing bugs, both fixed
+here; if the symptom persists after these, the next thing to check is
+whether `AngleTracker.processLumaFrame()`'s frame-to-frame ORB matching is
+failing outright during fast/large rotations (large inter-frame motion
+reduces descriptor-match overlap) — when that happens, `accumulatedRotation()`
+simply doesn't update that call, so the extrapolated pose silently lags
+the user's REAL orientation until the next authoritative RTAB-Map fix
+corrects it. No fix attempted for that specific path in this round (no
+device to verify a change against) — noted here as the leading remaining
+suspect.
+
+- **Real bug found and fixed: a fully-reused server path could silently
+  run out, muting the beacon with no path left to give.** `steerAlongMainPath()`
+  (`ToolDispatcher.kt`) mutes whenever `state.mainPathIdx >= mainPath.size`
+  — correct behavior on its own, but combined with this session's own
+  earlier path-reuse work (`path_blocked_ahead()` only forcing a replan
+  when the near-term segment is BLOCKED, never when the route is simply
+  EXHAUSTED), an unobstructed straight corridor longer than WALKING's own
+  ~5m planning horizon would have the server keep reusing the identical
+  route indefinitely — the user would eventually joint-advance past its
+  last waypoint, and since nothing was ever "blocked," no replan ever
+  fired to replace it. Fixed: `LiveGridPathPlanner.path_blocked_ahead()`
+  now ALSO forces a replan once the user's progress along the route is
+  within `REPLAN_NEAR_END_M` (1.0m) of its own final point, regardless of
+  whether anything along it is actually blocked. Applies to both WALKING
+  and GUIDING (shared method).
+- **`checkAndWarnObstacleAhead()`'s own frame fetch reuse** (see #2 below)
+  incidentally also removed a redundant `AnalyzeFrame(TRAVERSABILITY)`
+  call — `runUnifiedAvoidanceTick()` now fetches the fan ONCE per tick and
+  passes it into both the new obstacle check and `steerAlongMainPath()`
+  (which no longer calls `fetchTraversability()` itself) — not a
+  volume/audibility fix on its own, but removes one possible source of
+  per-tick latency/jitter in the steering signal.
+
+**2. Obstacle-directly-ahead alert switched from pure Gemini-vision
+judgment to depth-map detection, gated on IMU movement + range
+(`ToolDispatcher.kt`, `PdrStepEstimator.kt`).** Requested directly by the
+user. `runPeriodicVisionCheck()` (novelty-triggered, asks Gemini's own
+vision to judge hazards from the frame — see the drift note above for why
+that design exists) is UNCHANGED and still fires for general narration/
+hazard judgment. New, separate, additive: `checkAndWarnObstacleAhead()`,
+called every avoidance tick (both WALKING and GUIDING) — DETECTION is
+deterministic, off the SAME `AnalyzeFrame(TRAVERSABILITY)` fan
+`computeSubPath()`'s local dodge already fetches (`minClearanceInCone()`,
+a +-10° straight-ahead cone, not a single exact-0° bin — tolerates pose/
+discretization jitter). Only actually sends a `[SYSTEM]` note + frame to
+Gemini (asking for a brief immediate reaction, same "hand judgment to
+Gemini's vision, don't assert a distance as fact" convention this
+codebase already uses) when BOTH hold on the SAME tick:
+- `PdrStepEstimator.isRecentlyMoving()` (new) — the step detector fired
+  within the last `MOVING_WINDOW_MS` (2s); the user is actively walking,
+  not standing still facing something.
+- the nearest clearance in that forward cone is within
+  `OBSTACLE_AHEAD_RANGE_M` (1.5m).
+
+Own independent rate limit (`OBSTACLE_AHEAD_COOLDOWN_MS`, 2s — shorter
+than `runPeriodicVisionCheck()`'s general 3s, since a close obstacle
+someone is actively walking into is more time-critical); re-fires
+repeatedly while the condition persists, not one-shot. Deliberately
+narrower in scope than the OLD (already-replaced, see the drift note
+above) depth-heuristic hazard check: THAT one tried to judge step-downs/
+drop-offs from a single-frame RANSAC ground-plane fit and proved
+unreliable; THIS one only ever asks "is there a near-range return
+directly ahead while the user is walking toward it" — a much simpler,
+more robust read of the same depth data, with two extra gates (movement +
+tight forward cone) the old design never had.
+
+**3. Previous-path bias narrowed to the final 1.5m approach into the OLD
+route's first joint — nothing beyond it, nothing farther out
+(`scan_server/live_path_planner.py`, `server/services/mapping_servicer.py`).**
+Direct follow-up feedback on the path-stability work above: "only
+incentivize up to the first joint of previous path and up to 1.5 meters up
+to that joint... the remaining path to the joint if has, can be freely
+adjust." Two real changes:
+- **GUIDING** (`find_path()`'s `previous_path_xz` bias): `_prev_path_bias()`
+  was a whole-route, distance-from-START-decayed term
+  (`PREV_PATH_PROXIMITY_DECAY_RATE`) — replaced with a HARD cutoff
+  (`PREV_PATH_BIAS_RANGE_M`, 1.5m): a candidate cell farther than this
+  from `previous_path_xz[0]` (the old route's own first joint — nothing
+  beyond it is ever referenced any more) gets ZERO bias, completely free
+  to differ. Within that range, the penalty is distance to the
+  (possibly-trimmed-to-1.5m) straight-line approach segment from the
+  current pose into that joint — still pulling the search toward
+  converging along roughly the same corridor, not just "be near the joint
+  from any angle."
+- **WALKING** (`find_natural_path()`): the EARLIER version of this fix
+  (this same session) swapped the search's WHOLE reference heading to
+  "bearing toward the old first joint," biasing the entire ~5m planning
+  horizon toward the old route — too broad per this follow-up. Reverted:
+  `find_natural_path()` now always uses the REAL live heading for its
+  cone/cost/target-selection terms, and instead threads a new
+  `previous_path_xz` param straight into `_natural_step_cost()`, which
+  adds the SAME `_prev_path_bias()` term GUIDING uses, as one more
+  additive cost alongside heading/obstacle/turn/length. One shared bias
+  mechanism for both modes now, not two different ones.
+- `path_blocked_ahead()`'s reuse gate (see #1 above) is unaffected by
+  this — it decides WHETHER to replan; `_prev_path_bias()` only shapes
+  WHAT a replan looks like when one does happen.
+
+**4. Confirmed RTAB-Map's own ground segmentation IS wired into the
+occupancy map (already true, verified not assumed) — but its flagged
+points weren't forcing height to exactly ground level
+(`scan_server/occupancy_map.py`).** Checked directly (per the user's own
+request) rather than trusted from CLAUDE.md, given the drift found
+elsewhere this round: `scan_session.py`'s `_voxel_majority_flags()` +
+`_rtabmap_process_nodes()` DO thread RTAB-Map's per-point `is_ground`
+(from `rtabmap_server.cc`'s `segment_ground_flags()`) through to
+`OccupancyMap.update(point_is_ground=...)`, confirmed still current and
+correctly wired — the "RTAB-Map-native ground segmentation" section below
+is accurate on this point. What it hadn't done: for a point RTAB-Map
+independently confirms IS ground, `update()` still fed that point's own
+raw (depth/pose-noise-affected) measured Y into `height_ewma`/the
+cumulative `ground_y` re-estimate, same as an unconfirmed height-heuristic
+point would. Fixed: when `ground_flags[i]` is True, the Y value
+accumulated for that cell is forced to `self._ground_y` itself (height=0)
+instead of the point's own measured Y — RTAB-Map's segmentation is a
+genuinely independent signal from per-point depth noise, so this removes
+noise rather than being circular. Height-heuristic-classified ground
+(IMU+VO/VO pose mode, no `ground_flags` available at all) is UNCHANGED —
+forcing there would be circular, since the height heuristic IS how
+`ground_y` gets estimated in that mode.
+
+Not verified end-to-end on a real device/live server from this
+environment — compile-verified only (`./gradlew :app:compileDebugKotlin`,
+`python3 -m py_compile`), same standing caveat as every other round of
+this project's work. Specifically unverified: whether items #1/#2 above
+actually resolve the reported Pixie-silence symptom (the AngleTracker
+large-rotation-matching-failure suspect noted in #1 was NOT changed this
+round), and whether `OBSTACLE_AHEAD_RANGE_M`/`OBSTACLE_AHEAD_CONE_HALF_DEG`/
+`MOVING_WINDOW_MS`/`REPLAN_NEAR_END_M` need real-world tuning.
+
 ---
 
 ## 3D Scanning Pipeline
@@ -7587,6 +7759,33 @@ correct, just not the fastest possible path on this particular machine) —
 not re-verified against a live GPU/Gemini API call from this environment
 after the swap, compile-verified only.
 
+**Real incident, root-caused and fixed: `FrameTagger.__init__` (and
+`server/grpc_server.py`'s in-process reuse of it for `MappingService`) can
+HANG INDEFINITELY, not just take the ~30s the JIT-compile-then-fall-back
+above normally costs.** Cause: `torch.utils.cpp_extension.load()` (which
+`transformers`' `load_cuda_kernels()` calls to attempt the compile above)
+uses a lock file under `~/.cache/torch_extensions/<arch>/
+MultiScaleDeformableAttention/` (`lock`/`.ninja_lock`) to serialize
+concurrent builds — if a PREVIOUS process was killed (e.g. Ctrl+C) while
+that compile was in progress, the lock is left held forever with no
+process left to release it, and every subsequent attempt to construct a
+`FrameTagger` blocks waiting on it with zero further output — indistinguishable
+from a genuine hang without checking for the lock specifically. Confirmed
+via a direct, timed reproduction (`timeout 60 python3 -c
+"AutoModelForZeroShotObjectDetection.from_pretrained(...)"` hung past the
+timeout with the stale lock present; after `rm -rf
+~/.cache/torch_extensions/*/MultiScaleDeformableAttention/`, the same call
+completed in ~35s, failing to compile exactly as already documented above
+and falling back correctly). **Fix when this recurs**: check for and
+remove that lock directory — same class of gotcha, and same fix
+(delete-and-retry), as a stale HuggingFace Hub `.lock` file under
+`~/.cache/huggingface/hub/.locks/` causing an analogous hang in
+`from_pretrained(..., local_files_only=True)` itself. Not something this
+codebase can fix in its own source (the lock lives in a shared, per-machine
+torch cache, not anything this repo controls) — a comment pointing here
+was added directly above the `from_pretrained` call in `tagging.py` so a
+future hang investigation finds this immediately instead of re-deriving it.
+
 ## Pixie HRTF Test Harness (offline tool, `test_module/pixie_hrtf_app/`)
 
 Standalone, throwaway test harness — not part of the main client/server
@@ -7667,8 +7866,13 @@ head orientation instead of position-on-a-path.
 Docker: `docker build -f server/Dockerfile -t tracking-server .` (repo-root
 context — see `server/Dockerfile.dockerignore`). The image bakes in only
 the heavy, rarely-changing pieces (CUDA/Python/pip deps, `DA3METRIC-LARGE.onnx`
-at `DA3_ONNX_PATH=/opt/models/DA3METRIC-LARGE.onnx`) — **no application code
-is copied in at build time at all**. `server/entrypoint.sh` runs on every
+at `DA3_ONNX_PATH=/opt/models/DA3METRIC-LARGE.onnx`, and `IDEA-Research/
+grounding-dino-base` — `GroundingDINODetector`'s default model, used by
+`TrackingService`/`PerceptionService.AnalyzeFrame`'s DETECT op — pre-cached
+into the image's HF cache at build time via a `from_pretrained` warm-up RUN
+step, same "no network needed at container start" precedent as the DA3
+weights) — **no application code is copied in at build time at all**.
+`server/entrypoint.sh` runs on every
 `docker run` instead: clones `${REPO_REF}` (default `vi-slam`) fresh into
 `/app` if it isn't already a checkout there, or `git fetch --depth 1` +
 `git reset --hard` to update it if it is (the `/app/.git` check supports

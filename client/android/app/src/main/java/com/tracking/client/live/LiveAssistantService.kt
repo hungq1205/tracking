@@ -125,6 +125,54 @@ class LiveAssistantService : LifecycleService() {
             Log.w(TAG, "voice-sent cue tone failed: ${e.message}")
         }
     }
+    // Bundled beep.mp3 asset — the obstacle-ahead alert (ToolDispatcher's
+    // pollObstacleAheadOnce()) switched from a synthesized ToneGenerator
+    // tone to this per direct user feedback ("not that lightly beep sound,
+    // but a like a warning beep" — the ToneGenerator tone wasn't audible at
+    // all in practice). SoundPool (not MediaPlayer) — short one-shot SFX,
+    // low playback latency, loaded once and replayed on every trigger
+    // rather than re-decoding the file per call.
+    // USAGE_MEDIA (not USAGE_ASSISTANCE_SONIFICATION) — routes through
+    // STREAM_MUSIC, the SAME stream every other audible sound in this app
+    // uses (streamingPlayer/pixieController/readingTts/ToneGenerator calls
+    // elsewhere all use STREAM_MUSIC) and is controlled by the media volume
+    // slider. USAGE_ASSISTANCE_SONIFICATION routes through a system/
+    // notification-adjacent stream on many OEMs, which can be silenced
+    // independently of media volume (e.g. "touch sounds" off) — the
+    // likeliest reason this was silent the first time.
+    private val obstacleBeepSoundPool: android.media.SoundPool by lazy {
+        android.media.SoundPool.Builder()
+            .setMaxStreams(1)
+            .setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+            )
+            .build()
+            .apply {
+                setOnLoadCompleteListener { _, sampleId, status ->
+                    Log.d(TAG, "obstacle beep asset load complete: sampleId=$sampleId status=$status")
+                    if (status == 0) obstacleBeepLoaded = true
+                }
+            }
+    }
+    private var obstacleBeepSoundId: Int = 0
+    @Volatile private var obstacleBeepLoaded = false
+
+    private fun playObstacleBeep() {
+        try {
+            if (!obstacleBeepLoaded) {
+                Log.w(TAG, "obstacle beep asset not loaded yet — skipping this trigger")
+                return
+            }
+            val streamId = obstacleBeepSoundPool.play(obstacleBeepSoundId, 1f, 1f, 1, 0, 1f)
+            if (streamId == 0) Log.w(TAG, "obstacle beep SoundPool.play() returned 0 (failed to play)")
+        } catch (e: Exception) {
+            Log.w(TAG, "obstacle beep asset playback failed: ${e.message}")
+        }
+    }
+
     private val trackingBackend by lazy { TrackingBackend(grpcManager) }
     private val handTracker by lazy { HandTracker(this) }
     // On-device TextToSpeech for reading mode — see ReadingTtsPlayer.kt's
@@ -220,6 +268,17 @@ class LiveAssistantService : LifecycleService() {
         // nothing when a remote device isn't in use.
         pixieController.onRenderedChunk = { chunk -> audioMixer.feedPixie(chunk) }
         cameraManager.bind(this)
+        // Preload here rather than lazily on first playObstacleBeep() call —
+        // SoundPool.load() decodes asynchronously, so a sample requested for
+        // the first time right as an alert fires could silently no-op
+        // (play() on a not-yet-loaded sound is a documented no-op).
+        try {
+            assets.openFd("beep.mp3").use { afd ->
+                obstacleBeepSoundId = obstacleBeepSoundPool.load(afd, 1)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "obstacle beep asset preload failed: ${e.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -430,6 +489,8 @@ class LiveAssistantService : LifecycleService() {
             youtubeSearchClient = youtubeSearchClient,
             onPlayYoutubeVideo = { videoId -> _pendingYoutubeVideoId.value = videoId },
             onStopYoutubeVideo = { _pendingYoutubeVideoId.value = null; _isYoutubePlaying.value = false },
+            reportModeToEdge = { mode -> edgeDevice.reportMode(mode) },
+            playObstacleBeep = { playObstacleBeep() },
         )
         // Fresh connection — tell the server to drop any scan/mapping state
         // left over from a previous connection (see ToolDispatcher.
@@ -599,15 +660,29 @@ class LiveAssistantService : LifecycleService() {
                     // doc comment for why this matters (a real reported bug:
                     // tracking mode is meant to guide the hand to the
                     // object, not the view/camera direction).
-                    val handResult = try { handTracker.detect(jpegBytes) } catch (e: Exception) { null }
+                    // Only actually run MediaPipe hand detection while tracking
+                    // mode is active -- every consumer of handBox/handLmX/handLmY
+                    // below (TrackingBackend's occlusion check, updateTrackingPixie(),
+                    // the one-shot position announcement) is tracking-mode-only,
+                    // and the UI overlay that used to display this data was
+                    // already removed from MainScreen.kt (see CLAUDE.md's "UI
+                    // simplified" note) -- so running an ML inference pass on
+                    // EVERY incoming frame regardless of mode was pure wasted
+                    // CPU, a real contributor to reported lag outside tracking
+                    // mode (Q&A/idle), found via a live device report.
                     val handLmX: List<List<Float>>
                     val handLmY: List<List<Float>>
                     val handBox: List<Float>
-                    if (handResult != null && handResult.hands.isNotEmpty() && frameWidth > 0 && frameHeight > 0) {
-                        handLmX = handResult.hands.map { hand -> hand.map { it.first * frameWidth } }
-                        handLmY = handResult.hands.map { hand -> hand.map { it.second * frameHeight } }
-                        val allX = handLmX.flatten(); val allY = handLmY.flatten()
-                        handBox = listOf(allX.min(), allY.min(), allX.max(), allY.max())
+                    if (isLocalTrackingActive) {
+                        val handResult = try { handTracker.detect(jpegBytes) } catch (e: Exception) { null }
+                        if (handResult != null && handResult.hands.isNotEmpty() && frameWidth > 0 && frameHeight > 0) {
+                            handLmX = handResult.hands.map { hand -> hand.map { it.first * frameWidth } }
+                            handLmY = handResult.hands.map { hand -> hand.map { it.second * frameHeight } }
+                            val allX = handLmX.flatten(); val allY = handLmY.flatten()
+                            handBox = listOf(allX.min(), allY.min(), allX.max(), allY.max())
+                        } else {
+                            handLmX = emptyList(); handLmY = emptyList(); handBox = emptyList()
+                        }
                     } else {
                         handLmX = emptyList(); handLmY = emptyList(); handBox = emptyList()
                     }
@@ -922,6 +997,7 @@ class LiveAssistantService : LifecycleService() {
         releaseWakeLock()
         voiceSentToneGenerator?.release()
         voiceSentToneGenerator = null
+        obstacleBeepSoundPool.release()
         super.onDestroy()
     }
 

@@ -116,6 +116,18 @@ class ToolDispatcher(
     private val youtubeSearchClient: YouTubeSearchClient? = null,
     private val onPlayYoutubeVideo: (videoId: String) -> Unit = {},
     private val onStopYoutubeVideo: () -> Unit = {},
+    // Piggybacked on reportMode()'s own existing call sites (every mode
+    // transition) -- wired to edgeDevice.reportMode() so a remote Pi can
+    // skip capturing/sending luma_out outside walking/guiding, its only
+    // real consumer (see EdgeDevice.reportMode()'s own doc comment).
+    // No-op default -- LocalEdgeDevice needs no equivalent.
+    private val reportModeToEdge: (String) -> Unit = {},
+    // Obstacle-ahead alert (pollObstacleAheadOnce()) — plays the bundled
+    // assets/beep.mp3 asset via a Service-owned SoundPool. A callback
+    // (not a raw Context/SoundPool field here) to keep this class free of
+    // Android framework audio plumbing, same convention as
+    // onPlayYoutubeVideo/reportModeToEdge above.
+    private val playObstacleBeep: () -> Unit = {},
 ) {
     // News/radio — both keyless, no-config 3rd-party APIs hardcoded to
     // Vietnam/Vietnamese (see NewsClient.kt/RadioClient.kt's own doc
@@ -128,6 +140,7 @@ class ToolDispatcher(
     private var mappingJob: Job? = null
     private var mappingChunkChannel: Channel<Tracking.MappingChunk>? = null
     private var avoidanceJob: Job? = null
+    private var obstacleAheadJob: Job? = null
     private var guidingArrivalAnnounced = false
     // One-shot per WALKING/GUIDING session — see the mapping-stream
     // collector's own comment (announces the first main-path joint's clock
@@ -238,6 +251,17 @@ class ToolDispatcher(
     // this cadence.
     private var lastPeriodicAlertAtMs = 0L
 
+    // Depth-map-based obstacle-directly-ahead alert (see
+    // checkAndWarnObstacleAhead()) — its own independent rate limit,
+    // separate from lastPeriodicAlertAtMs above (different trigger,
+    // different urgency).
+    private var lastObstacleAheadWarnedAtMs = 0L
+    // Trend tracking for pollObstacleAheadOnce()'s "getting closer" check —
+    // null means either no reading yet this session, or the obstacle was
+    // last seen out of range (reset there so a later encounter starts its
+    // own fresh trend instead of comparing against a stale distance).
+    private var lastObstacleDistanceM: Float? = null
+
     // Ambient WALKING-only frame feed (see sendWalkingAmbientFrame()) — gives
     // Gemini continuous, up-to-date visual context of what's ahead while
     // walking, independent of the hazard alert path below. Sent as a plain
@@ -269,6 +293,7 @@ class ToolDispatcher(
         // here, not in-progress TTS.
         readingTts.stop()
         stopLocalAvoidanceTicks()
+        stopObstacleAheadPolling()
         pixieController.stop()
         pdrStepEstimator.stop()
         pdrStepEstimator.resetAccumulator()
@@ -311,6 +336,7 @@ class ToolDispatcher(
      * report only means the dashboard falls back to inference for a
      * moment, never something the tool-call flow itself should fail over. */
     private fun reportMode(mode: String, target: String = "") {
+        reportModeToEdge(mode)
         val stub = grpc.statusStub ?: return
         scope.launch(Dispatchers.IO) {
             try {
@@ -1309,7 +1335,15 @@ class ToolDispatcher(
                     continue
                 }
                 for (label in labels) {
-                    if (!memoryStore.hasObjectEmbeddings(label)) continue
+                    // NOTE: previously required hasObjectEmbeddings(label) here,
+                    // which silently dropped any label whose remember_object()
+                    // call never captured a visual reference (e.g. detectAll()
+                    // found nothing at save time — see toolRememberObject()'s
+                    // visual_captured flag) — the label was found by
+                    // findLabelsMatching() but then vanished with no result and
+                    // no notInMemory entry either. bestSearchObjectMatch() now
+                    // falls back to a description-only (unconfirmed) match when
+                    // there's no stored embedding to re-ID against.
                     val description = memoryStore.getFullText(label)
                     if (description.isBlank()) continue
                     val verdict = bestSearchObjectMatch(label, description, frame)
@@ -1319,7 +1353,6 @@ class ToolDispatcher(
         } else {
             data class Candidate(val label: String, val description: String)
             val candidates = memoryStore.listLabels()
-                .filter { memoryStore.hasObjectEmbeddings(it) }
                 .mapNotNull { label ->
                     val text = memoryStore.getFullText(label)
                     if (text.isBlank()) null else Candidate(label, text)
@@ -1334,14 +1367,18 @@ class ToolDispatcher(
                         detLabel.isNotEmpty() && (desc.contains(detLabel) || detLabel.contains(desc))
                     }
                     if (matches.isEmpty()) continue
-                    var bestSim = -1f
-                    var bestBox: List<Float>? = null
-                    for (d in matches) {
-                        val vec = embedBox(d.boxXyxyList, frame) ?: continue
-                        val sim = memoryStore.bestObjectSimilarity(candidate.label, vec)
-                        if (sim > bestSim) { bestSim = sim; bestBox = d.boxXyxyList }
+                    val verdict = if (memoryStore.hasObjectEmbeddings(candidate.label)) {
+                        var bestSim = -1f
+                        var bestBox: List<Float>? = null
+                        for (d in matches) {
+                            val vec = embedBox(d.boxXyxyList, frame) ?: continue
+                            val sim = memoryStore.bestObjectSimilarity(candidate.label, vec)
+                            if (sim > bestSim) { bestSim = sim; bestBox = d.boxXyxyList }
+                        }
+                        classifySearchObjectMatch(candidate.label, bestSim, bestBox)
+                    } else {
+                        unconfirmedMatch(candidate.label, matches)
                     }
-                    val verdict = classifySearchObjectMatch(candidate.label, bestSim, bestBox)
                     if (verdict != null) results.put(verdict)
                 }
             }
@@ -1359,6 +1396,7 @@ class ToolDispatcher(
     private suspend fun bestSearchObjectMatch(label: String, description: String, frame: ByteArray): JSONObject? {
         val detections = detectAll(description, frame)
         if (detections.isEmpty()) return null
+        if (!memoryStore.hasObjectEmbeddings(label)) return unconfirmedMatch(label, detections)
         var bestSim = -1f
         var bestBox: List<Float>? = null
         for (d in detections) {
@@ -1376,6 +1414,18 @@ class ToolDispatcher(
         val match = if (sim >= SEARCH_OBJECTS_CONFIRM_SIM) "found" else "resembles"
         return JSONObject().put("label", label).put("match", match)
             .put("similarity", sim).put("box_xyxy", org.json.JSONArray(box))
+    }
+
+    /** Fallback for a label with a stored text description but no DINOv2
+     * visual reference to re-ID against (remember_object() never captured
+     * one) — reports the best-scoring GroundingDINO detection matching the
+     * label's own description as an unconfirmed "found" rather than
+     * silently dropping the label from every search_objects() result. */
+    private fun unconfirmedMatch(label: String, detections: List<Tracking.Detection>): JSONObject? {
+        val best = detections.maxByOrNull { it.score } ?: return null
+        return JSONObject().put("label", label).put("match", "found")
+            .put("box_xyxy", org.json.JSONArray(best.boxXyxyList))
+            .put("note", "no stored visual reference for this label; matched by description only, not re-ID confirmed")
     }
 
     // ── Memory ───────────────────────────────────────────────────────────
@@ -1512,6 +1562,7 @@ class ToolDispatcher(
         pdrStepEstimator.start()
         startMappingStream()  // server-planned route + pose, via RTAB-Map — see UpdateMapping's collector
         startLocalAvoidanceTicks()  // path-pursuit beacon steering — see runUnifiedAvoidanceTick()
+        startObstacleAheadPolling()  // own fixed-rate depth beep, independent of the mapping stream above
         pixieController.start()
         onGuidanceUpdate("guiding", state.plannedPath)
         reportMode("guiding", destination)
@@ -1522,6 +1573,7 @@ class ToolDispatcher(
     private fun toolStopGuiding(): JSONObject {
         stopMappingStream()
         stopLocalAvoidanceTicks()
+        stopObstacleAheadPolling()
         pixieController.stop()
         pdrStepEstimator.stop()
         state.mode = "idle"; state.guidingDestinationLabel = ""; state.guidingGoalXz = null
@@ -1884,18 +1936,112 @@ class ToolDispatcher(
             runPeriodicVisionCheck(frame)
         }
 
+        // Fetched once per tick, for steerAlongMainPath()'s own local dodge
+        // only now — the obstacle-ahead beep runs on its own separate,
+        // fixed-rate poll (startObstacleAheadPolling()) instead of piggy-
+        // backing on this tick, so it isn't held hostage by anything else
+        // this tick does.
+        val trav = fetchTraversability(frame)
+
         val authoritative = state.lastMappingPose ?: return
         val pose = HrtfBeacon.extrapolate(
             authoritative, angleTracker.accumulatedRotation(), pdrStepEstimator.distanceSinceReset(),
         )
-        steerAlongMainPath(pose, frame)
+        steerAlongMainPath(pose, trav)
+    }
+
+    /** Depth-map-based "obstacle directly ahead, close range, AND getting
+     * closer" alert — requested directly by the user, refined per direct
+     * follow-up feedback ("it alert too much... anyway to detect if the
+     * obstacle within 1.5m is getting closer") — a static-but-close
+     * obstacle (a wall the user is standing near but not approaching, a
+     * table off to the side that just happens to sit in the middle
+     * corridor) used to re-beep on every single poll once inside range,
+     * which was the actual source of the "too much" complaint, not the
+     * range itself. Deliberately NOT tied to Gemini Live at all (no
+     * sendVideoFrame/sendSystemNote, no check_obstacle tool) — a plain fast
+     * RPC (PerceptionService.AnalyzeFrame's DEPTH op, a single DA3 call + a
+     * percentile check over the middle-width corridor server-side, no
+     * RANSAC ground-plane fit). Runs on its OWN fixed-rate poll
+     * (startObstacleAheadPolling()), decoupled from the much slower
+     * MappingService stream and from avoidanceIntervalMs. No movement gate.
+     *
+     * lastObstacleDistanceM tracks the previous poll's reading so this poll
+     * can compare against it: only counts as "approaching" when the new
+     * reading is at least OBSTACLE_AHEAD_CLOSING_MARGIN_M closer than the
+     * last one (a flat/oscillating reading near the noise floor shouldn't
+     * count), OR there was no previous in-range reading at all (the very
+     * first poll that finds something close still deserves a warning, since
+     * there's nothing yet to compare a trend against). Reset to null the
+     * instant the obstacle leaves range (obstacle.detected false, or beyond
+     * OBSTACLE_THRESHOLD_M server-side) so a later, fresh approach starts
+     * its own trend from scratch rather than comparing against a stale
+     * reading from a completely different encounter. Still rate-limited
+     * (OBSTACLE_AHEAD_COOLDOWN_MS) on top of the trend check. */
+    private suspend fun pollObstacleAheadOnce() {
+        val frame = latestFrame() ?: return
+        val obstacle = fetchObstacleInfo(frame) ?: return
+        if (!obstacle.detected) {
+            lastObstacleDistanceM = null
+            return
+        }
+
+        val distance = obstacle.distanceM
+        val previous = lastObstacleDistanceM
+        lastObstacleDistanceM = distance
+        val approaching = previous == null || (previous - distance) >= OBSTACLE_AHEAD_CLOSING_MARGIN_M
+        if (!approaching) return
+
+        val now = System.currentTimeMillis()
+        if (now - lastObstacleAheadWarnedAtMs < OBSTACLE_AHEAD_COOLDOWN_MS) return
+        lastObstacleAheadWarnedAtMs = now
+
+        playObstacleAheadBeep()
+    }
+
+    /** PerceptionService.AnalyzeFrame(DEPTH) — a fast, unary, mapping-
+     * stream-independent call; see pollObstacleAheadOnce()'s doc comment. */
+    private suspend fun fetchObstacleInfo(frame: ByteArray): Tracking.ObstacleInfo? {
+        val stub = grpc.perceptionStub ?: return null
+        return try {
+            stub.analyzeFrame(
+                Tracking.AnalyzeFrameRequest.newBuilder()
+                    .setImageData(com.google.protobuf.ByteString.copyFrom(frame))
+                    .addOps(Tracking.AnalysisOp.DEPTH)
+                    .build()
+            ).obstacle
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchObstacleInfo failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun startObstacleAheadPolling() {
+        stopObstacleAheadPolling()
+        // Fixed 2fps (500ms) per the user's explicit spec — independent of
+        // avoidanceIntervalMs and, critically, started immediately in
+        // toolStartWalking()/toolStartGuiding() rather than deferred behind
+        // activateWalkingOnceReady() — this alert has nothing to do with
+        // the mapper and shouldn't wait on its cold-start lag.
+        obstacleAheadJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                pollObstacleAheadOnce()
+                delay(OBSTACLE_AHEAD_POLL_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun stopObstacleAheadPolling() {
+        obstacleAheadJob?.cancel(); obstacleAheadJob = null
+        lastObstacleDistanceM = null
     }
 
     /** Plans a fresh local sub-path toward the current main-path joint,
      * steers Pixie toward its first point, and advances mainPathIdx on
      * arrival — see the section-level doc comment above for the full
-     * design. */
-    private suspend fun steerAlongMainPath(pose: Tracking.Pose, frame: ByteArray) {
+     * design. [trav] is the SAME per-tick traversability fan
+     * runUnifiedAvoidanceTick() already fetched for checkAndWarnObstacleAhead(). */
+    private fun steerAlongMainPath(pose: Tracking.Pose, trav: Tracking.TraversabilityInfo?) {
         val mainPath = state.plannedPath
         if (mainPath.isEmpty() || state.mainPathIdx >= mainPath.size) {
             pixieController.mute()
@@ -1903,7 +2049,6 @@ class ToolDispatcher(
             return
         }
         val target = mainPath[state.mainPathIdx]
-        val trav = fetchTraversability(frame)
         val subPath = computeSubPath(pose, target, trav)
         val steerTarget = subPath.first()
 
@@ -2078,6 +2223,11 @@ class ToolDispatcher(
         walkingReady = false
         walkingFirstFrameSent = false
         startMappingStream()       // RTAB-Map pose + live local grid, same stream guiding uses
+        // Started immediately, NOT deferred to activateWalkingOnceReady() —
+        // this alert has nothing to do with the mapper (see
+        // pollObstacleAheadOnce()'s own doc comment) and shouldn't wait on
+        // its cold-start lag.
+        startObstacleAheadPolling()
         return JSONObject().put("status", "walking_starting")
             .put("note", "Warming up — wait for the ready [SYSTEM] note before describing walking as active.")
     }
@@ -2085,6 +2235,7 @@ class ToolDispatcher(
     private fun toolStopWalking(): JSONObject {
         stopMappingStream()
         stopLocalAvoidanceTicks()
+        stopObstacleAheadPolling()
         pixieController.stop()
         pdrStepEstimator.stop()
         walkingReady = false
@@ -2173,6 +2324,22 @@ class ToolDispatcher(
         }
     }
 
+    /** Instant obstacle-ahead beep — a plain RPC signal (server-side depth
+     * check), no Gemini involved. Rate-limiting already happened in the
+     * caller via lastObstacleAheadWarnedAtMs, so this just triggers the
+     * sound. Plays the bundled assets/beep.mp3 asset (via the Service-owned
+     * playObstacleBeep callback) instead of a synthesized ToneGenerator
+     * tone — changed per direct user feedback ("not that lightly beep
+     * sound, but a like a warning beep"; a prior TONE_CDMA_ALERT_CALL_GUARD
+     * attempt still wasn't audible in practice). */
+    private fun playObstacleAheadBeep() {
+        try {
+            playObstacleBeep()
+        } catch (e: Exception) {
+            Log.w(TAG, "obstacle-ahead beep failed: ${e.message}")
+        }
+    }
+
     /** A short "pop" confirmation tone, played once a reading-mode scan's
      * FULL pipeline — OCR, correction (when configured), and storage — has
      * actually finished for one capture, not just when the frame was
@@ -2223,6 +2390,7 @@ class ToolDispatcher(
         stopMappingStream()
         stopLiveReadingPipeline()
         stopLocalAvoidanceTicks()
+        stopObstacleAheadPolling()
         pixieController.stop()
         pdrStepEstimator.stop()
         toneGenerator?.release(); toneGenerator = null
@@ -2281,6 +2449,30 @@ class ToolDispatcher(
         // WALKING only (see sendWalkingAmbientFrame()) — how often a plain
         // context frame (no forced response) is fed to Gemini Live.
         private const val WALKING_AMBIENT_FRAME_INTERVAL_MS = 1000L
+
+        // Depth-map obstacle-ahead beep (pollObstacleAheadOnce()) — a plain
+        // RPC signal (PerceptionService.AnalyzeFrame's DEPTH op), NOT the
+        // Gemini Live-invoked check_obstacle tool and NOT wired to Gemini at
+        // all — the server thresholds range against
+        // DA3DepthDetector.OBSTACLE_THRESHOLD_M (1.0m) over the middle-width
+        // corridor (server/tools/depth.py's check_obstacle()); the client
+        // has no range constant of its own to keep in sync — it just reads
+        // ObstacleInfo.detected.
+        //
+        // Fixed 2fps poll — decoupled entirely from avoidanceIntervalMs and
+        // from MappingService's own (much slower) update cadence, per the
+        // user's explicit spec: the mapper's latency shouldn't gate how
+        // quickly this alert can fire.
+        private const val OBSTACLE_AHEAD_POLL_INTERVAL_MS = 500L
+        private const val OBSTACLE_AHEAD_COOLDOWN_MS = 2000L
+        // How much closer (metres) the current poll's reading must be than
+        // the previous poll's for the obstacle to count as "approaching" —
+        // see pollObstacleAheadOnce()'s own doc comment for why this exists
+        // (a static-but-close obstacle used to re-beep every poll). Small
+        // enough to catch a real, if slow, approach; large enough to not
+        // fire on ordinary depth-estimate noise between two consecutive
+        // 500ms-apart readings of the same still object.
+        private const val OBSTACLE_AHEAD_CLOSING_MARGIN_M = 0.1f
 
         // Reading-mode blur skip/retry (see acquireSharpFrame()) — a blurry
         // frame is a wasted OCR call, so before spending one, re-sample by

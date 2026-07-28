@@ -35,7 +35,7 @@ PAYLOAD FORMATS
        bytes 12-15 int32  rotationDegrees (0/90/180/270)
    followed by height*rowStride bytes of 8-bit grayscale, row-major,
    RAW (not rotated -- Android's AngleTracker rotates it itself using the
-   rotationDegrees field). 480px long edge, ~15 fps.
+   rotationDegrees field). 360px long edge, ~15 fps.
 
 3. mic_out (PUSH, port 5601, us -> Android)
    Raw PCM16 little-endian, mono, 16000 Hz. Recommended 512-sample
@@ -46,6 +46,16 @@ PAYLOAD FORMATS
    sizes; arrival is bursty (silence = no messages at all), so playback
    pads with digital silence rather than blocking/gapping when nothing has
    arrived recently.
+
+5. control (PULL, port 5605, Android -> us) -- NOT part of the original
+   fixed 4-socket spec; added so the phone can report its current mode
+   (piggybacked on the same reportMode() call already fired on every mode
+   change, see RemoteEdgeDevice.kt). Payload is just a UTF-8 mode string
+   ("walking"/"guiding"/"idle"/etc, same 16-byte header framing as the other
+   4 sockets). Only ever used to gate luma_out sending -- see
+   control_recv_thread's own docstring. Silence here (an older Android
+   build that never sends anything) degrades to today's always-on luma_out
+   behavior, not silent data loss.
 
 ROTATION NOTE
 -------------
@@ -317,7 +327,7 @@ class MicResampler:
 # Camera: one capture thread feeding two send threads
 # ---------------------------------------------------------------------------
 
-def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_frame_cap, stats_luma_cap):
+def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_frame_cap, stats_luma_cap, luma_enabled):
     """Owns the single Picamera2 instance. Configures a dual stream --
     "main" (RGB888, for frame_out's JPEG) and "lores" (YUV420, for
     luma_out's raw Y-plane) -- and pulls both from the same capture request
@@ -325,6 +335,17 @@ def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_f
     software resize on this box's weak CPU. Never touches a ZMQ socket
     itself; just distributes frames into two drop-oldest queues for the
     sender threads below to encode/send at their own pace.
+
+    [luma_enabled] (a threading.Event, see control_recv_thread) gates only
+    the lores buffer copy + queue put below, NOT the dual-stream capture
+    config itself -- picamera2/libcamera still produces both streams every
+    request regardless, since dropping a stream requires a stop/reconfigure/
+    start cycle that would glitch every mode transition. This still saves
+    the per-frame buffer copy and, more importantly, the actual network
+    send (luma_out's only real consumer is AngleTracker, walking/guiding-
+    only -- see ToolDispatcher.feedAngleLumaFrame() -- so every other mode
+    was paying full 15fps/~130KB-per-frame network cost for data the phone
+    just discarded).
     """
     try:
         from picamera2 import Picamera2
@@ -372,14 +393,15 @@ def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_f
                     put_drop_oldest(frame_raw_queue, (main_arr, capture_ts))
                     stats_frame_cap.record()
 
-                    # make_buffer gives the raw, stride-padded plane bytes --
-                    # exactly what the wire format wants (height*rowStride
-                    # bytes, row-major, padding included), so no reshape is
-                    # needed: the Y-plane is simply the first stride*height
-                    # bytes of a planar YUV420 buffer.
-                    lores_buf = bytes(request.make_buffer("lores"))[: stride * height]
-                    put_drop_oldest(luma_queue, (lores_buf, width, height, stride, args.rotation_degrees))
-                    stats_luma_cap.record()
+                    if luma_enabled.is_set():
+                        # make_buffer gives the raw, stride-padded plane bytes
+                        # -- exactly what the wire format wants (height*
+                        # rowStride bytes, row-major, padding included), so no
+                        # reshape is needed: the Y-plane is simply the first
+                        # stride*height bytes of a planar YUV420 buffer.
+                        lores_buf = bytes(request.make_buffer("lores"))[: stride * height]
+                        put_drop_oldest(luma_queue, (lores_buf, width, height, stride, args.rotation_degrees))
+                        stats_luma_cap.record()
                 finally:
                     request.release()
         except Exception:
@@ -477,6 +499,55 @@ def luma_sender_thread(ctx, luma_queue, stop_event, port, stats):
             except Exception:
                 logging.exception("luma_out send failed")
                 time.sleep(0.1)
+    finally:
+        sock.close(0)
+
+
+# ---------------------------------------------------------------------------
+# Control channel: the phone reports its current mode, we gate luma_out
+# ---------------------------------------------------------------------------
+
+def control_recv_thread(ctx, luma_enabled, stop_event, port):
+    """Owns the control PULL socket. The phone pushes its current mode
+    string here on every transition (see RemoteEdgeDevice.kt's reportMode(),
+    piggybacked on the same reportMode() call ToolDispatcher.kt already made
+    on every mode change for the dashboard) -- this closes the gap
+    RemoteEdgeDevice.kt's own docstring flagged ("No dynamic frame-rate/
+    resolution control channel yet"). Only ever flips [luma_enabled] (a
+    threading.Event shared with camera_capture_thread): luma_out's only real
+    consumer is AngleTracker, active only during walking/guiding (see
+    ToolDispatcher.feedAngleLumaFrame()) -- every other mode doesn't need it
+    sent at all.
+
+    [luma_enabled] starts SET (see main()) so an older Android build that
+    never sends a mode report here degrades to today's always-on behavior,
+    not silent data loss -- same backward-compatible-by-default precedent
+    this wire protocol already uses elsewhere (e.g. rtabmap_client.py's
+    node_id/inlier_fraction fallback).
+    """
+    sock = ctx.socket(zmq.PULL)
+    sock.setsockopt(zmq.RCVHWM, 8)
+    sock.setsockopt(zmq.RCVTIMEO, 500)
+    sock.bind(f"tcp://0.0.0.0:{port}")
+    logging.info("control PULL bound on 0.0.0.0:%d", port)
+
+    try:
+        while not stop_event.is_set():
+            try:
+                _header, payload = sock.recv_multipart()
+            except zmq.Again:
+                continue
+            except Exception:
+                logging.exception("control recv failed")
+                continue
+            mode = payload.decode("utf-8", errors="replace")
+            wants_luma = mode in ("walking", "guiding")
+            if wants_luma and not luma_enabled.is_set():
+                luma_enabled.set()
+                logging.info("control: mode='%s' -> luma_out ENABLED", mode)
+            elif not wants_luma and luma_enabled.is_set():
+                luma_enabled.clear()
+                logging.info("control: mode='%s' -> luma_out DISABLED (camera capture continues, just not sent)", mode)
     finally:
         sock.close(0)
 
@@ -760,12 +831,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--luma-port", type=int, default=5604)
     p.add_argument("--mic-port", type=int, default=5601)
     p.add_argument("--audio-in-port", type=int, default=5603)
+    p.add_argument("--control-port", type=int, default=5605,
+                    help="Phone -> Pi mode reports, used only to gate luma_out sending (see control_recv_thread).")
 
     p.add_argument("--frame-long-edge", type=int, default=640)
     p.add_argument("--frame-quality", type=int, default=50)
     p.add_argument("--frame-fps", type=float, default=2.0)
 
-    p.add_argument("--luma-long-edge", type=int, default=480)
+    p.add_argument("--luma-long-edge", type=int, default=360)
     p.add_argument("--luma-fps", type=float, default=15.0)
 
     p.add_argument("--rotation-degrees", type=int, default=90, choices=[0, 90, 180, 270],
@@ -819,6 +892,8 @@ def main() -> None:
     frame_raw_queue: "queue.Queue" = queue.Queue(maxsize=1)
     luma_queue: "queue.Queue" = queue.Queue(maxsize=1)
     mic_queue: "queue.Queue" = queue.Queue(maxsize=MIC_QUEUE_MAXSIZE)
+    luma_enabled = threading.Event()
+    luma_enabled.set()  # default on -- see control_recv_thread's own docstring for why
     bytes_per_ms = args.audio_in_sample_rate * args.audio_in_channels * 2 / 1000.0
     playback_buffer = PlaybackBuffer(
         max_bytes=int(args.audio_in_sample_rate * args.audio_in_channels * 2 * PLAYBACK_BUFFER_SECONDS),
@@ -836,8 +911,13 @@ def main() -> None:
     threads = [
         threading.Thread(
             target=camera_capture_thread,
-            args=(frame_raw_queue, luma_queue, stop_event, args, stats["frame_cap"], stats["luma_cap"]),
+            args=(frame_raw_queue, luma_queue, stop_event, args, stats["frame_cap"], stats["luma_cap"], luma_enabled),
             name="camera-capture", daemon=True,
+        ),
+        threading.Thread(
+            target=control_recv_thread,
+            args=(ctx, luma_enabled, stop_event, args.control_port),
+            name="control-recv", daemon=True,
         ),
         threading.Thread(
             target=frame_sender_thread,
@@ -875,8 +955,8 @@ def main() -> None:
     for t in threads:
         t.start()
     logging.info(
-        "all threads started -- frame_out:%d luma_out:%d mic_out:%d audio_in:%d",
-        args.frame_port, args.luma_port, args.mic_port, args.audio_in_port,
+        "all threads started -- frame_out:%d luma_out:%d mic_out:%d audio_in:%d control:%d",
+        args.frame_port, args.luma_port, args.mic_port, args.audio_in_port, args.control_port,
     )
 
     try:

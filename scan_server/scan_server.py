@@ -21,6 +21,12 @@ import os
 import sys
 from pathlib import Path
 
+# See server/grpc_server.py's own comment on this — Depth-Anything-3's own
+# logger prints a per-stage INFO line on every depth call, which floods the
+# console under live polling. Set before da3_wrapper/depth_anything_3 is
+# ever imported.
+os.environ.setdefault("DA3_LOG_LEVEL", "WARN")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Add server/ to sys.path so scan_server modules can import server/tools/*

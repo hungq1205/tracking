@@ -1,7 +1,8 @@
 # Pi edge server
 
 Raspberry Pi Zero 2 W-side server: streams camera (JPEG + raw luma) and mic
-audio to the Android app over 4 fixed ZMQ sockets, and plays back whatever
+audio to the Android app over ZMQ (4 fixed media sockets + 1 small control
+socket the phone uses to report its current mode), and plays back whatever
 audio the app sends. The wire protocol is fixed to match the already-built
 Android client
 (`client/android/app/src/main/java/com/tracking/client/edge/RemoteEdgeDevice.kt`
@@ -138,6 +139,17 @@ first if this repo isn't checked out at `/home/pi/tracking`.
 - Mic capture tries to open the USB audio adapter directly at 16kHz; if it
   only offers e.g. 44.1/48kHz (common on cheap dongles), falls back to the
   device's native rate and resamples down in software.
+- `luma_out` is only actually needed by AngleTracker during walking/guiding
+  (see `ToolDispatcher.feedAngleLumaFrame()` on the Android side) — every
+  other mode was paying the full 15fps camera/network cost for data the
+  phone just discarded. The phone now reports its current mode over a
+  small 5th control socket (port 5605), and `main.py` skips capturing/
+  sending `luma_out` unless the mode is walking or guiding. Defaults to
+  enabled if nothing's ever reported (an older Android build), so this
+  degrades safely rather than silently losing data. Note this does NOT
+  reduce the camera's own dual-stream capture cost (picamera2/libcamera
+  still produce both streams every request regardless) — only the
+  per-frame buffer copy and the network send.
 - `audio_in` playback uses an adaptive jitter buffer (`--audio-in-jitter-ms`,
   default 100ms): it waits for that much audio to be queued before the
   speaker starts pulling real audio, absorbing normal network jitter that

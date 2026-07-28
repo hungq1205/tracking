@@ -56,6 +56,21 @@ interface EdgeDevice {
     /** Deliver a rendered PCM chunk to be played on this device's speaker. */
     fun emitAudio(pcm: ByteArray)
 
+    /**
+     * Tells the edge device which mode the app is currently in, so it can
+     * skip capturing/sending [lumaFlow] when nothing will consume it --
+     * only walking/guiding actually process luma client-side (see
+     * ToolDispatcher.feedAngleLumaFrame()), so every other mode was paying
+     * the Pi's full 15fps camera/network cost for data the phone just
+     * discarded. Piggybacked on the same call site ToolDispatcher's
+     * existing reportMode() already fires on every mode change (for the
+     * server dashboard), no new call sites needed. No-op default --
+     * [LocalEdgeDevice] needs no equivalent, since local capture already
+     * gates lumaFlow emission via CameraManager.mappingMode without any
+     * network round trip.
+     */
+    fun reportMode(mode: String) {}
+
     fun connect()
     fun disconnect()
 }

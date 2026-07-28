@@ -57,6 +57,8 @@ class PerceptionServiceServicer(tracking_pb2_grpc.PerceptionServiceServicer):
 
             if tracking_pb2.DEPTH in ops and self.depth_detector is not None:
                 detected, value = self.depth_detector.check_obstacle(frame)
+                if detected:
+                    print(f"[obstacle-ahead] depth {value:.2f}m < {self.depth_detector.OBSTACLE_THRESHOLD_M}m in middle corridor")
                 response.obstacle.CopyFrom(
                     tracking_pb2.ObstacleInfo(
                         detected=bool(detected),

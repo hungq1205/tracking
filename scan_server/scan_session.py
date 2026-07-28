@@ -14,6 +14,7 @@ Pipeline (called per dataset segment):
 
 import json
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -758,6 +759,29 @@ class ScanSession:
         # nothing about a frame itself is kept around afterward.
         self._tag_pending: List[_PendingTagFrame] = []
 
+        # _flush_tag_pending() hands a ready batch off to this queue instead
+        # of running SemanticMapper.tag_and_backproject_batch() (a Gemini API
+        # round trip + GroundingDINO-tiny inference) inline — process_frames_
+        # batch() holds self._lock for its whole body and used to block that
+        # entire scan pipeline (point cloud, occupancy update, everything)
+        # once every IMAGES_PER_PROMPT frames waiting on the network call.
+        # _tag_worker_loop (below) drains this ONE batch at a time on its own
+        # background thread, same "strictly sequential, never concurrent"
+        # convention the Android app's own correction-queue uses. This
+        # thread lives for the whole ScanSession lifetime (started once
+        # here, NOT restarted per stream — ScanSessionManager reuses the
+        # same ScanSession across streams for one location_id).
+        # _tag_generation lets a batch that was still in flight across a
+        # reset_cloud() call be silently discarded instead of writing stale
+        # landmarks into a freshly-reset session (bumped in
+        # _reset_cloud_locked()).
+        self._tag_queue: "queue.Queue[tuple[int, List[_PendingTagFrame]]]" = queue.Queue()
+        self._tag_generation = 0
+        self._tag_worker = threading.Thread(
+            target=self._tag_worker_loop, name=f"tag-worker-{location_id}", daemon=True,
+        )
+        self._tag_worker.start()
+
         self.tracker = FeatureTracker(n_features=2000)
         self.pose_graph = PoseGraph()
         # Bayesian/height tuning knobs (occupancy_map.OccupancyMap.set_params'
@@ -991,30 +1015,54 @@ class ScanSession:
         return accepted, sharpness, reject_reason
 
     def _flush_tag_pending(self) -> None:
-        """Runs SemanticMapper.tag_and_backproject_batch() across whatever's
-        currently buffered in self._tag_pending (a full IMAGES_PER_PROMPT
-        batch, or a partial leftover at finalize time) and appends every
-        resolved Landmark straight into self._raw_landmarks — immediate,
-        not deferred (see semantic_mapper.py's module docstring for why this
-        replaced the old VLM-tag-then-defer-GroundingDINO design). No-op if
-        semantic_mapper isn't configured or nothing's pending."""
+        """Hands whatever's currently buffered in self._tag_pending (a full
+        IMAGES_PER_PROMPT batch, or a partial leftover at finalize time) off
+        to the background _tag_worker_loop — does NOT run
+        SemanticMapper.tag_and_backproject_batch() (a Gemini API round trip
+        + GroundingDINO-tiny inference) inline any more. This is called from
+        inside process_frames_batch()'s own `with self._lock:` block, so it
+        must stay non-blocking — queue.Queue.put() never blocks (unbounded)
+        and never touches self._lock itself, so scanning keeps processing
+        new frames/point-cloud/occupancy-map updates immediately instead of
+        stalling on the network call every IMAGES_PER_PROMPT frames.
+        Resolved landmarks land in self._raw_landmarks once the worker
+        actually finishes (see _tag_worker_loop). No-op if semantic_mapper
+        isn't configured or nothing's pending."""
         if not self._tag_pending or self.semantic_mapper is None:
             return
         batch = self._tag_pending
         self._tag_pending = []
-        try:
-            landmark_lists = self.semantic_mapper.tag_and_backproject_batch(
-                [pf.frame_bgr for pf in batch],
-                [pf.depth_map for pf in batch],
-                [pf.world_pose for pf in batch],
-                [pf.K for pf in batch],
-                [pf.frame_idx for pf in batch],
-            )
-        except Exception as e:
-            print(f"[ScanSession:{self.location_id}] tag_and_backproject_batch failed: {e}")
-            return
-        for landmarks in landmark_lists:
-            self._raw_landmarks.extend(landmarks)
+        self._tag_queue.put((self._tag_generation, batch))
+
+    def _tag_worker_loop(self) -> None:
+        """Background thread body (started once in __init__, lives for the
+        whole ScanSession lifetime) — drains self._tag_queue ONE batch at a
+        time, never concurrently, running the actual
+        SemanticMapper.tag_and_backproject_batch() network/inference call
+        outside of self._lock and outside of process_frames_batch()
+        entirely. A batch whose generation no longer matches
+        self._tag_generation (a reset_cloud() happened while it was queued
+        or in flight) is silently discarded rather than writing landmarks
+        into a session that's since moved on — see _reset_cloud_locked()."""
+        while True:
+            generation, batch = self._tag_queue.get()
+            try:
+                if generation == self._tag_generation and self.semantic_mapper is not None:
+                    landmark_lists = self.semantic_mapper.tag_and_backproject_batch(
+                        [pf.frame_bgr for pf in batch],
+                        [pf.depth_map for pf in batch],
+                        [pf.world_pose for pf in batch],
+                        [pf.K for pf in batch],
+                        [pf.frame_idx for pf in batch],
+                    )
+                    with self._lock:
+                        if generation == self._tag_generation:
+                            for landmarks in landmark_lists:
+                                self._raw_landmarks.extend(landmarks)
+            except Exception as e:
+                print(f"[ScanSession:{self.location_id}] tag_and_backproject_batch failed: {e}")
+            finally:
+                self._tag_queue.task_done()
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -1200,14 +1248,11 @@ class ScanSession:
                 depth_frames = [active_estimator.estimate(f) for f in frames_rgb]
             infer_ms = (time.perf_counter() - _t0) * 1000
             _estimator_device = getattr(active_estimator, "device", "unknown")
-            if walking_lite:
-                # Debug prints trimmed to walking/guiding only — confirmed
-                # with the user; scan mode's own console output was getting
-                # too noisy to read through during live debugging.
-                print(
-                    f"[timing] depth estimation ({len(frames_rgb)} frames, "
-                    f"{type(active_estimator).__name__}, device={_estimator_device}): {infer_ms:.1f} ms"
-                )
+            _estimator_name = type(active_estimator).__name__
+            # Printed as ONE combined [timing] line at the end of this pass
+            # (see the back-projection step below) rather than three
+            # separate lines — depth estimation/pose/back-projection are one
+            # pipeline pass per mini-batch, not independent events.
 
             # Cache intrinsics from first available depth frame
             if self._camera_K is None:
@@ -1502,8 +1547,7 @@ class ScanSession:
                 "RTAB-Map" if use_rtabmap_pose
                 else "IMU+VO" if imu_poses is not None else "VO"
             )
-            if walking_lite:
-                print(f"[timing] pose computation ({len(frames_rgb)} frames, {_pose_src_label}): {_pose_ms:.1f} ms")
+            # Printed as part of the ONE combined [timing] line below.
 
             # World-space output remap (see process_frames_batch docstring) —
             # applied after all pose sources/anchoring above, before anything
@@ -1649,9 +1693,16 @@ class ScanSession:
 
             _bp_ms = (time.perf_counter() - _t0_bp) * 1000
             if walking_lite:
+                # One combined line for the whole pipeline pass (depth
+                # estimation -> pose -> back-projection) — these three used
+                # to print as separate [timing] lines, but they're one
+                # pass per mini-batch, not independent events.
                 print(
-                    f"[timing] back-projection + frame-store tagging "
-                    f"({len(frames_rgb)} frames, {sum(_bp_counts):,} raw pts): {_bp_ms:.1f} ms"
+                    f"[timing] pipeline ({len(frames_rgb)} frames): "
+                    f"depth={infer_ms:.1f}ms ({_estimator_name}, device={_estimator_device}) + "
+                    f"pose={_pose_ms:.1f}ms ({_pose_src_label}) + "
+                    f"back-proj={_bp_ms:.1f}ms ({sum(_bp_counts):,} raw pts) "
+                    f"= {infer_ms + _pose_ms + _bp_ms:.1f}ms total"
                 )
 
             self.last_pose_source = (
@@ -2169,6 +2220,10 @@ class ScanSession:
         self._raw_landmarks = []
         self.novelty_gate = OrbNoveltyGate(**self._gate_ctor_kwargs())
         self._tag_pending = []
+        # Bumped so any batch still queued/in-flight on _tag_worker_loop
+        # from before this reset gets silently discarded instead of writing
+        # landmarks into the freshly-reset session (see _tag_worker_loop).
+        self._tag_generation += 1
         self._walking_lost_streak_start = None
 
     def configure_occupancy_map(self, **kwargs) -> None:
@@ -2282,11 +2337,23 @@ class ScanSession:
         "office chair" landing at nearly the same spot), not run any new
         detection. Must NOT be called while the caller already holds
         self._lock — this acquires it internally.
+
+        Finalize is the ONE place allowed to actually WAIT for
+        _tag_worker_loop's queue to fully drain (ordinary per-frame
+        processing, via process_frames_batch's own _flush_tag_pending call,
+        never waits — see that method's docstring) — otherwise the very
+        last, still-in-flight batch's landmarks could be missing from the
+        export. self._tag_queue.join() is called OUTSIDE self._lock
+        deliberately: the worker needs to briefly acquire self._lock itself
+        to append its results once a batch finishes, so waiting for it
+        while already holding self._lock here would deadlock.
         """
         if self.semantic_mapper is None:
             return []
         with self._lock:
             self._flush_tag_pending()
+        self._tag_queue.join()
+        with self._lock:
             raw_snapshot = list(self._raw_landmarks)
         if not raw_snapshot:
             return []

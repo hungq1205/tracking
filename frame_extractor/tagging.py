@@ -169,6 +169,19 @@ class FrameTagger:
         self._gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else genai.Client()
         self._gemini_model_id = gemini_model_id
 
+        # A one-time, unavoidable ~30s cost lives inside the next call: this
+        # model's custom CUDA deformable-attention kernel fails to JIT-
+        # compile against this environment's torch/CUDA combination (a real,
+        # already-known incompatibility — the vendored kernel source uses
+        # Tensor.type(), removed/changed in newer PyTorch) and falls back to
+        # the pure-PyTorch implementation. Not fixed here (patching vendored
+        # transformers kernel source is out of scope) — see CLAUDE.md's
+        # Frame Extractor section for the accepted tradeoff. A STALE lock
+        # under ~/.cache/torch_extensions/*/MultiScaleDeformableAttention/
+        # left behind by a previously killed process can make this HANG
+        # indefinitely instead of just taking ~30s and failing — if this
+        # call never returns, check for and remove that lock directory
+        # before assuming there's a new bug here.
         print(f"[frame_tagger] Loading GroundingDINO tiny ({gdino_model_id})...")
         self.gdino_processor = AutoProcessor.from_pretrained(gdino_model_id, use_fast=True, local_files_only=True)
         self.gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(

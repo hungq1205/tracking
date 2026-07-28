@@ -186,18 +186,6 @@ def _pose_heading_rad(pose_mat: np.ndarray) -> float:
     return float(np.arctan2(forward_world[0], forward_world[2]))
 
 
-def _bearing_rad(from_xz: "tuple[float, float]", to_xz: "tuple[float, float]") -> float:
-    """World-frame bearing from `from_xz` to `to_xz`, same 0=world+Z/
-    positive-toward-world+X convention as `_pose_heading_rad()`/
-    `HrtfBeacon.kt` — used as WALKING's replan reference direction when a
-    previous route exists (bearing toward its own first joint) instead of
-    the user's raw live heading, see the path-stability note where this is
-    called."""
-    dx = to_xz[0] - from_xz[0]
-    dz = to_xz[1] - from_xz[1]
-    return float(np.arctan2(dx, dz))
-
-
 def _planned_path_to_proto(result) -> tracking_pb2.PlannedPath:
     """`result` is whatever LiveGridPathPlanner.find_path()/
     find_natural_path() returned — None (no walkable path at all) or
@@ -454,47 +442,45 @@ class MappingServiceServicer(tracking_pb2_grpc.MappingServiceServicer):
                     # find_natural_path() searches fresh off the (slightly
                     # noisy) live heading every time. Fixed two ways,
                     # requested directly by the user:
-                    #   1. If a previous route exists and its very next
-                    #      segment (from the CURRENT pose) isn't blocked in
-                    #      the fresh grid, REUSE it unchanged — no new
-                    #      search at all this update. Only the near-term
-                    #      portion is checked (path_blocked_ahead()) — a
-                    #      blockage further along doesn't matter yet; it'll
-                    #      be re-checked (and, if still blocked once
-                    #      actually close to it, trigger a real replan
-                    #      then) on a later update as the user gets nearer.
-                    #   2. Otherwise (no previous route, or it's now blocked
-                    #      near-term), replan — but instead of the user's
-                    #      raw live heading, find_natural_path()'s
-                    #      "keep going this way" reference direction becomes
-                    #      the bearing toward the OLD route's own first
-                    #      joint (falling back to the real heading only
-                    #      when there's no previous route to reference at
-                    #      all) — "incentivize the path that was previously
-                    #      planned, especially the first joint," per the
-                    #      user's own framing. Since find_natural_path()'s
-                    #      whole cost model already rewards continuing
-                    #      straight in its reference direction over
-                    #      turning, this alone reproduces a highly similar
-                    #      route to the old one whenever nothing material
-                    #      changed, without a separate distance-to-old-path
-                    #      cost term (which GUIDING's own planner, below,
-                    #      DOES need — find_path()'s A* has no heading
-                    #      concept to redirect this way).
+                    #   1. If a previous route exists, isn't near its own
+                    #      end, and its very next segment (from the CURRENT
+                    #      pose) isn't blocked in the fresh grid, REUSE it
+                    #      unchanged — no new search at all this update.
+                    #      Only the near-term portion is checked
+                    #      (path_blocked_ahead()) — a blockage further along
+                    #      doesn't matter yet; it'll be re-checked (and, if
+                    #      still blocked once actually close to it, trigger
+                    #      a real replan then) on a later update as the user
+                    #      gets nearer.
+                    #   2. Otherwise (no previous route, it's now blocked
+                    #      near-term, or it's nearly exhausted), replan —
+                    #      ALWAYS off the user's real live heading (an
+                    #      earlier version of this fix instead swapped in
+                    #      the bearing toward the old route's first joint as
+                    #      the search's WHOLE reference direction, biasing
+                    #      the entire ~5m planning horizon toward the old
+                    #      route — narrowed per direct follow-up feedback:
+                    #      only the final 1.5m approach into the old
+                    #      route's first joint should be biased, "the
+                    #      remaining path to the joint... can be freely
+                    #      adjust"). find_natural_path()'s own
+                    #      previous_path_xz param now supplies that bounded
+                    #      bias directly (see _prev_path_bias()'s
+                    #      docstring) — same mechanism GUIDING's planner
+                    #      uses below, just applied on top of
+                    #      find_natural_path()'s own heading-biased search
+                    #      instead of find_path()'s plain A*.
                     planner = LiveGridPathPlanner(grid_for_planning)
                     prev_waypoints = prev_entry[0] if prev_entry is not None else None
                     can_reuse = bool(prev_waypoints) and not planner.path_blocked_ahead(prev_waypoints, pose_xz)
                     if can_reuse:
                         path_result = prev_entry
                     else:
-                        if prev_waypoints:
-                            reference_heading_rad = _bearing_rad(pose_xz, prev_waypoints[0])
-                        else:
-                            reference_heading_rad = heading_rad
                         path_result = planner.find_natural_path(
-                            pose_xz, reference_heading_rad,
+                            pose_xz, heading_rad,
                             max_distance_m=_WALKING_MAX_PLANNING_DISTANCE_M,
                             safe_clearance_m=_WALKING_SAFE_CLEARANCE_M,
+                            previous_path_xz=prev_waypoints,
                         )
                     self._prev_path[location_id] = path_result
 
@@ -675,6 +661,14 @@ class MappingServiceServicer(tracking_pb2_grpc.MappingServiceServicer):
                     frame_timestamp_ns=chunk.frame_timestamp_ns,
                     planned_path=planned_path_proto,
                 )
+        except grpc.RpcError:
+            # The client closed/disconnected the stream (e.g. switching
+            # modes, backgrounding the app) — _latest_only_chunks()'s reader
+            # thread hit this reading request_iterator and re-raised it here
+            # (see its own docstring). This is a normal, expected way for a
+            # bidi stream to end, not a server-side failure — no traceback,
+            # no INTERNAL status.
+            pass
         except Exception as e:
             traceback.print_exc()
             context.set_code(grpc.StatusCode.INTERNAL)
