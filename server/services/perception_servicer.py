@@ -90,8 +90,18 @@ class PerceptionServiceServicer(tracking_pb2_grpc.PerceptionServiceServicer):
 
         if self.activity_monitor is not None:
             obstacle = response.obstacle if response.HasField("obstacle") else None
+            # These two ops are driven by fixed-rate background polls, not
+            # a discrete tool call — WALKING/GUIDING's obstacle-ahead check
+            # (DEPTH, ~2Hz) and local-avoidance traversability fetch
+            # (TRAVERSABILITY, ~2-3Hz). Logging every single one flooded the
+            # shared Activity Log (see ActivityMonitor._record()'s own
+            # comment) — the bucket (this tab's live frame/detail) still
+            # updates every call regardless, only the log entry is skipped.
+            background_poll_ops = {"DEPTH"}, {"TRAVERSABILITY"}
+            log_entry = set(ops_names) not in background_poll_ops
             self.activity_monitor.record_perception(
                 f"AnalyzeFrame ops={ops_names} detections={len(response.detections)}",
+                log_entry=log_entry,
                 op="AnalyzeFrame", frame_bgr=frame, ops=ops_names, prompt=request.prompt,
                 detections=[
                     {"box_xyxy": list(d.box_xyxy), "score": d.score, "label": d.label}

@@ -615,7 +615,21 @@ def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_f
                     pass
 
 
-def frame_sender_thread(ctx, frame_raw_queue, stop_event, port, quality, fps, rotation_degrees, stats, stream_pause):
+def _downscale_long_edge(frame_bgr, max_long_edge):
+    """Aspect-preserving downscale, no crop -- same convention CameraManager.
+    kt's streamJpeg() uses client-side. max_long_edge<=0 disables (frame is
+    returned as-is, whatever resolution `main` was captured at)."""
+    if max_long_edge <= 0:
+        return frame_bgr
+    h, w = frame_bgr.shape[:2]
+    long_edge = max(h, w)
+    if long_edge <= max_long_edge:
+        return frame_bgr
+    scale = max_long_edge / long_edge
+    return cv2.resize(frame_bgr, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+
+
+def frame_sender_thread(ctx, frame_raw_queue, stop_event, port, quality, fps, rotation_degrees, stats, stream_pause, frame_long_edge=480):
     """Owns the frame_out PUSH socket. Pulls the latest captured main-stream
     array, throttles to ~fps, rotates (see ROTATION NOTE in the module
     docstring), JPEG-encodes, and sends.
@@ -656,6 +670,16 @@ def frame_sender_thread(ctx, frame_raw_queue, stop_event, port, quality, fps, ro
             try:
                 if rotate_code is not None:
                     frame_bgr = cv2.rotate(frame_bgr, rotate_code)
+                # main is still CAPTURED at the sensor's own full native
+                # resolution (see camera_capture_thread's own comment on why
+                # -- requesting anything smaller there risks libcamera
+                # picking a narrower, cropped-FOV sensor mode instead).
+                # Downscaling here, only for what actually gets JPEG-encoded
+                # and sent, keeps full-FOV capture while cutting frame_out's
+                # real bandwidth/encode cost -- independent of OCR's own
+                # still-capture path (ocr_frame_out), which always requests
+                # true full sensor resolution regardless of this.
+                frame_bgr = _downscale_long_edge(frame_bgr, frame_long_edge)
                 ok, jpg = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
                 if not ok:
                     logging.warning("JPEG encode failed, skipping this frame")
@@ -1145,9 +1169,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # (lores, only consumed locally by AngleTracker's ORB tracking) -- see
     # camera_capture_thread's own comment on why these were un-tied again
     # after a previous round briefly merged them.
-    # No --frame-long-edge any more: frame_out's (main) resolution is always
-    # the sensor's own full native resolution now -- see
-    # camera_capture_thread's own comment.
+    # main is still CAPTURED at the sensor's own full native resolution
+    # (see camera_capture_thread's own comment on why -- forces full-FOV
+    # sensor-mode selection) -- --frame-long-edge only caps what
+    # frame_sender_thread actually JPEG-encodes/sends for frame_out,
+    # downscaled from that full-res capture (aspect-preserving, no crop).
+    # Re-added (was removed outright in an earlier round) per direct
+    # request to cut frame_out's bandwidth/encode cost back down; <=0
+    # disables and sends the full captured resolution, unchanged from
+    # before this flag existed.
+    p.add_argument("--frame-long-edge", type=int, default=480,
+                    help="Long-edge cap (px) for frame_out's JPEG -- main is still captured at full "
+                         "sensor resolution regardless (see camera_capture_thread), this only "
+                         "downscales what's actually sent. <=0 sends the full captured resolution.")
     p.add_argument("--frame-quality", type=int, default=50)
     p.add_argument("--frame-fps", type=float, default=2.0)
 
@@ -1252,7 +1286,8 @@ def main() -> None:
         threading.Thread(
             target=frame_sender_thread,
             args=(ctx, frame_raw_queue, stop_event, args.frame_port, args.frame_quality,
-                  args.frame_fps, args.rotation_degrees, stats["frame_out"], stream_pause),
+                  args.frame_fps, args.rotation_degrees, stats["frame_out"], stream_pause,
+                  args.frame_long_edge),
             name="frame-sender", daemon=True,
         ),
         threading.Thread(

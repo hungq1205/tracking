@@ -3,12 +3,10 @@ package com.tracking.client.ui
 import android.graphics.BitmapFactory
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
@@ -90,11 +88,14 @@ fun MainScreen(
         }
 
         // OCR scan preview — whatever frame was just sent to OCR.space
-        // (scan_current_view()/live-reading), so a scan is visible on
-        // screen instead of happening invisibly. Small corner thumbnail,
-        // not full-screen, since it's feedback about a background scan,
-        // not the primary camera feed; auto-hides a few seconds after the
-        // last scan so it doesn't linger once reading mode has moved on.
+        // (scan_current_view()/live-reading), REPLACING the normal preview
+        // full-screen for a few seconds after each scan (same "cover the
+        // live preview" precedent as the remote-edge-device Image above),
+        // so a sighted companion looking at the screen can see exactly
+        // what got scanned at full resolution — full sensor res/quality,
+        // see CameraManager.captureFullResFrame(), not the downscaled
+        // 640px/quality-50 JPEG the live preview otherwise implies. Then
+        // auto-reverts back to the live camera feed once the scan is stale.
         var showOcrPreview by remember { mutableStateOf(false) }
         LaunchedEffect(ocrFrame) {
             if (ocrFrame != null) {
@@ -110,13 +111,9 @@ fun MainScreen(
             if (ocrBitmap != null) {
                 Image(
                     bitmap = ocrBitmap.asImageBitmap(),
-                    contentDescription = "Last OCR scan",
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(start = 8.dp, bottom = 8.dp)
-                        .size(width = 96.dp, height = 128.dp)
-                        .border(2.dp, Color.White, androidx.compose.foundation.shape.RoundedCornerShape(4.dp)),
+                    contentDescription = "Last OCR scan (full resolution)",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize(),
                 )
             }
         }

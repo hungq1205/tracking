@@ -515,37 +515,23 @@ def _client_mode_text(snap: dict) -> str:
 
 
 def create_ui(activity_monitor) -> gr.Blocks:
+    # Auto tab-switching was tried (both "always prefer client_mode" and
+    # "prefer whichever of client_mode/last_category is more recent") and
+    # dropped per direct user feedback: ANY auto-switch — even one gated
+    # to only fire on a real transition — still fights manual tab
+    # navigation the instant a new transition happens to land while the
+    # user is looking at a different tab (e.g. WALKING's local-avoidance
+    # tick calls AnalyzeFrame(TRAVERSABILITY) every ~300ms, which keeps
+    # "transitioning" last_category to perception on almost every poll).
+    # The dashboard no longer ever forces a tab selection — the user picks
+    # a tab and it stays picked; each tab already only reflects genuinely
+    # relevant traffic for whichever RPC category it covers.
     def _poll():
         snap = activity_monitor.snapshot() if activity_monitor is not None else {
             "tracking": {}, "perception": {}, "mapping": {}, "last_category": "",
             "client_mode": "", "client_mode_target": "", "client_mode_at": 0.0, "log": [],
         }
-        # Two competing signals, pick whichever is more RECENT rather than
-        # always preferring client_mode outright:
-        #  - client_mode (ReportMode) — authoritative for which mode the
-        #    client is in, but some modes (reading, idle) generate no
-        #    server RPCs of their own, and ad-hoc queries (run_detection/
-        #    check_obstacle via the Perception tab) can fire in ANY mode
-        #    without a matching ReportMode call.
-        #  - last_category — whichever RPC bucket most recently got real
-        #    traffic; correct in the moment an ad-hoc query lands, but
-        #    goes stale (keeps pointing at an old tab) once that traffic
-        #    stops and the client has since moved to a different mode.
-        # Always preferring client_mode (a prior version of this) hid
-        # perception activity entirely once ANY mode had ever been
-        # reported; always preferring last_category is what originally
-        # left the dashboard stuck on a stale tab during modes with no
-        # RPCs of their own. Comparing timestamps gets both right: a
-        # fresh perception call after the last mode report shows
-        # Perception; once that traffic goes quiet, the next poll (no new
-        # RPC, same last_at) falls back to whatever mode was reported,
-        # even if that report itself is old.
-        mode_tab = _TAB_BY_CLIENT_MODE.get(snap["client_mode"]) if snap["client_mode"] else None
-        category_tab = _TAB_BY_CATEGORY.get(snap["last_category"])
-        if mode_tab and category_tab and snap.get("last_at", 0.0) > snap.get("client_mode_at", 0.0):
-            tab_id = category_tab
-        else:
-            tab_id = mode_tab or category_tab or "tab_log"
+        tabs_update = gr.update()
 
         # Broad, deliberate try/except around every render call — found
         # investigating a real "dashboard freezes during a long WALKING
@@ -568,7 +554,7 @@ def create_ui(activity_monitor) -> gr.Blocks:
             occupancy_fig = gr.update()
 
         return (
-            gr.update(selected=tab_id),
+            tabs_update,
             _client_mode_text(snap),
             _annotate_tracking(snap["tracking"]),
             _tracking_status(snap["tracking"]),

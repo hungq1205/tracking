@@ -44,7 +44,7 @@ class ActivityMonitor:
         self.beacon_muted: bool = True
         self.beacon_at: float = 0.0
 
-    def _record(self, category: str, bucket: Dict[str, Any], fields: Dict[str, Any], log_text: str) -> None:
+    def _record(self, category: str, bucket: Dict[str, Any], fields: Dict[str, Any], log_text: str, log_entry: bool = True) -> None:
         with self._lock:
             # Merge, not clear+set — a bucket can be fed by several distinct
             # RPCs (e.g. mapping's UpdateMapping vs FindLandmark); clearing
@@ -57,13 +57,25 @@ class ActivityMonitor:
             bucket["at"] = time.time()
             self.last_category = category
             self.last_at = bucket["at"]
-            self.log.appendleft({"at": bucket["at"], "category": category, "text": log_text})
+            # log_entry=False (background per-tick polls: PerceptionService.
+            # AnalyzeFrame's DEPTH obstacle-ahead check at ~2Hz, TRAVERSABILITY
+            # local-avoidance fetch at ~2-3Hz) skips the shared Activity Log
+            # deque entirely — the BUCKET itself still updates every call
+            # (so the Perception tab's own frame/detail always reflects the
+            # latest poll), only the log line is suppressed. Without this,
+            # these two alone flood the maxlen=200 log fast enough to push
+            # every genuinely rare event (walking/mapping updates, ~1Hz;
+            # real ad-hoc DETECT/EMBED calls) out within well under a
+            # minute — same "dashboard-only, no log spam" precedent this
+            # codebase already uses for ReportBeaconDirection.
+            if log_entry:
+                self.log.appendleft({"at": bucket["at"], "category": category, "text": log_text})
 
     def record_tracking(self, log_text: str, **fields: Any) -> None:
         self._record("tracking", self.tracking, fields, log_text)
 
-    def record_perception(self, log_text: str, **fields: Any) -> None:
-        self._record("perception", self.perception, fields, log_text)
+    def record_perception(self, log_text: str, log_entry: bool = True, **fields: Any) -> None:
+        self._record("perception", self.perception, fields, log_text, log_entry=log_entry)
 
     def record_mapping(self, log_text: str, **fields: Any) -> None:
         self._record("mapping", self.mapping, fields, log_text)
