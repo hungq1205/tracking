@@ -23,11 +23,13 @@ import kotlin.concurrent.thread
  * existing PUSH/PULL precedent in this codebase — no REQ/REP handshake,
  * no polling either direction):
  *
- *   frame_out (edge PUSHes, this PULLs) -> [frameFlow]  — JPEG, 640px long-edge, q50
- *   luma_out  (edge PUSHes, this PULLs) -> [lumaFlow]   — raw Y-plane, 360px long-edge, 15fps
- *   mic_out   (edge PUSHes, this PULLs) -> [micFlow]    — 16kHz mono PCM16, 512-sample chunks
- *   audio_in  (edge PULLs,  this PUSHes) <- [emitAudio] — rendered PCM to play on the edge speaker
- *   control   (edge PULLs,  this PUSHes) <- [reportMode] — current mode string, gates luma_out only
+ *   frame_out    (edge PUSHes, this PULLs) -> [frameFlow]    — JPEG, same size as luma_out, q50
+ *   luma_out     (edge PUSHes, this PULLs) -> [lumaFlow]     — raw Y-plane, 360px long-edge, 13fps
+ *   mic_out      (edge PUSHes, this PULLs) -> [micFlow]      — 16kHz mono PCM16, 512-sample chunks
+ *   audio_in     (edge PULLs,  this PUSHes) <- [emitAudio]   — rendered PCM to play on the edge speaker
+ *   control      (edge PULLs,  this PUSHes) <- [reportMode]  — current mode string, gates luma_out only
+ *   ocr_request  (edge PULLs,  this PUSHes) <- [requestOcrFrame] — trigger a one-shot full-res still
+ *   ocr_frame_out(edge PUSHes, this PULLs) -> [ocrFrameFlow] — JPEG, full sensor resolution
  *
  * Each ZMQ message is a 2-frame multipart: [8-byte LE seq][8-byte LE double
  * unix-seconds timestamp], then the raw payload — identical framing to
@@ -47,6 +49,21 @@ import kotlin.concurrent.thread
  * frame_interval_ms/frame_quality/etc, matching frameIntervalMs/
  * scanIntervalMs/walkingIntervalMs's per-mode cadence) is still a real,
  * separate follow-up, not attempted here.
+ *
+ * [requestOcrFrame]/[ocrFrameFlow] are a SEPARATE one-shot request/response
+ * pair, not part of the original fixed streaming sockets — OCR wants real
+ * detail a live-preview-resolution frame (frame_out, now tied to luma_out's
+ * own low resolution) can't give it, but running the continuous streams at
+ * OCR-quality resolution/fps all the time would be wasteful bandwidth for
+ * every OTHER consumer (tracking, mapping, hazard checks) that only needs a
+ * quick low-res look. [requestOcrFrame] fires a trigger (empty payload,
+ * same 16-byte header framing as everything else); the Pi does a full-
+ * sensor-resolution still capture (pausing frame_out/luma_out sending for
+ * that window — see main.py's StreamPauseGate) and pushes the JPEG back on
+ * ocr_frame_out, which surfaces on [ocrFrameFlow]. This is fire-and-forget
+ * on this end too — a caller awaits the next [ocrFrameFlow] emission with
+ * its own timeout (see ToolDispatcher.acquireSharpFrame()); a lost
+ * request/response degrades to that timeout firing, not a hang.
  */
 class RemoteEdgeDevice(
     private val host: String,
@@ -55,6 +72,8 @@ class RemoteEdgeDevice(
     private val micPort: Int = 5601,
     private val audioInPort: Int = 5603,
     private val controlPort: Int = 5605,
+    private val ocrRequestPort: Int = 5606,
+    private val ocrFramePort: Int = 5607,
 ) : EdgeDevice {
 
     private val _frameFlow = MutableSharedFlow<ByteArray>(
@@ -77,15 +96,29 @@ class RemoteEdgeDevice(
     )
     override val audioFlow: SharedFlow<ByteArray> = _audioFlow
 
+    // Capacity 1, not the usual small-drop-oldest buffer: a stale full-res
+    // frame from a PREVIOUS request has no business being delivered to a
+    // caller awaiting the CURRENT one, and only one request is ever really
+    // in flight at a time (ToolDispatcher.acquireSharpFrame() is one call
+    // site, awaited synchronously) — DROP_OLDEST here just means "the
+    // newest wins if somehow more than one arrives before being collected."
+    private val _ocrFrameFlow = MutableSharedFlow<ByteArray>(
+        extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    override val ocrFrameFlow: SharedFlow<ByteArray> = _ocrFrameFlow
+
     private var ctx: ZMQ.Context? = null
     private var framePull: ZMQ.Socket? = null
     private var lumaPull: ZMQ.Socket? = null
     private var micPull: ZMQ.Socket? = null
     private var audioPush: ZMQ.Socket? = null
     private var controlPush: ZMQ.Socket? = null
+    private var ocrRequestPush: ZMQ.Socket? = null
+    private var ocrFramePull: ZMQ.Socket? = null
     @Volatile private var running = false
     private var audioSeq = 0L
     private var controlSeq = 0L
+    private var ocrRequestSeq = 0L
 
     override fun connect() {
         if (running) return
@@ -103,6 +136,13 @@ class RemoteEdgeDevice(
         audioPush = audioOut
         val control = context.socket(SocketType.PUSH).apply { sndHWM = 8; connect("tcp://$host:$controlPort") }
         controlPush = control
+        val ocrReqOut = context.socket(SocketType.PUSH).apply { sndHWM = 4; connect("tcp://$host:$ocrRequestPort") }
+        ocrRequestPush = ocrReqOut
+        // rcvHWM=1: a full-res still is only ever meaningful as "the answer
+        // to whatever request is currently outstanding" — no benefit to
+        // buffering more than the latest one.
+        val ocrFrame = context.socket(SocketType.PULL).apply { rcvHWM = 1; connect("tcp://$host:$ocrFramePort") }
+        ocrFramePull = ocrFrame
 
         thread(name = "remote-edge-frame", isDaemon = true) {
             recvLoop(frame) { payload -> _frameFlow.tryEmit(payload) }
@@ -113,13 +153,18 @@ class RemoteEdgeDevice(
         thread(name = "remote-edge-mic", isDaemon = true) {
             recvLoop(mic) { payload -> _micFlow.tryEmit(payload) }
         }
+        thread(name = "remote-edge-ocr-frame", isDaemon = true) {
+            recvLoop(ocrFrame) { payload -> _ocrFrameFlow.tryEmit(payload) }
+        }
     }
 
     override fun disconnect() {
         running = false
         framePull?.close(); lumaPull?.close(); micPull?.close(); audioPush?.close(); controlPush?.close()
+        ocrRequestPush?.close(); ocrFramePull?.close()
         ctx?.term()
         framePull = null; lumaPull = null; micPull = null; audioPush = null; controlPush = null
+        ocrRequestPush = null; ocrFramePull = null
         ctx = null
     }
 
@@ -149,6 +194,23 @@ class RemoteEdgeDevice(
             push.sendMore(header)
             push.send(mode.toByteArray(Charsets.UTF_8), 0)
             controlSeq++
+        } catch (_: ZMQException) {
+            // socket torn down mid-send during disconnect(); harmless
+        }
+    }
+
+    override fun requestOcrFrame() {
+        val push = ocrRequestPush ?: return
+        val header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(ocrRequestSeq)
+            .putDouble(System.currentTimeMillis() / 1000.0)
+            .array()
+        try {
+            // Empty payload -- this is a pure trigger, nothing to parametrize
+            // yet (see main.py's ocr_request_thread).
+            push.sendMore(header)
+            push.send(ByteArray(0), 0)
+            ocrRequestSeq++
         } catch (_: ZMQException) {
             // socket torn down mid-send during disconnect(); harmless
         }

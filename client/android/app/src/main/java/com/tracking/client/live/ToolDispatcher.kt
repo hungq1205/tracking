@@ -14,10 +14,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import tracking.Tracking
 import java.util.concurrent.TimeUnit
@@ -85,6 +88,15 @@ class ToolDispatcher(
     // check entirely (acquireSharpFrame() falls back to latestFrame()).
     private val latestFrameWithSharpness: () -> Pair<ByteArray, Double>? = { null },
     private val blurSharpnessThreshold: Double = 40.0,
+    // Full-resolution, one-shot OCR capture channel — a remote edge device's
+    // continuous frameFlow/lumaFlow are deliberately low-res (see
+    // CLAUDE.md's "Full-resolution OCR capture channel" note), so OCR asks
+    // for a dedicated full-res still instead. null (the default, and always
+    // the case for the phone's own local camera) means "no such channel" —
+    // acquireSharpFrame() then falls straight through to the existing
+    // latestFrame()/latestFrameWithSharpness() path, unchanged.
+    private val ocrFrameFlow: SharedFlow<ByteArray>? = null,
+    private val requestOcrFrame: () -> Unit = {},
     // Debug-only: when non-null, toolScanCurrentView() draws each OCR
     // line's kept/dropped box onto the frame (see DebugFrameStore.kt) and
     // hands the annotated JPEG to this callback — MainViewModel wires it to
@@ -110,12 +122,11 @@ class ToolDispatcher(
     // YouTube search/metadata — direct 3rd-party call (see
     // YouTubeSearchClient.kt), null when no API key is configured (degrades
     // to a clear "not configured" error, same convention as
-    // geminiCorrectionClient above). Playback itself is signaled via the two
-    // callbacks below rather than a stream URL — the official IFrame player
-    // only needs a video id (see CLAUDE.md's YouTube playback note).
+    // geminiCorrectionClient above). Playback itself no longer goes through
+    // a callback into an on-screen player — toolPlayYoutubeVideo() resolves
+    // a real stream URL (YouTubeStreamResolver.kt) and dispatches straight
+    // to play_video/PlaybackService, same as radio/music.
     private val youtubeSearchClient: YouTubeSearchClient? = null,
-    private val onPlayYoutubeVideo: (videoId: String) -> Unit = {},
-    private val onStopYoutubeVideo: () -> Unit = {},
     // Piggybacked on reportMode()'s own existing call sites (every mode
     // transition) -- wired to edgeDevice.reportMode() so a remote Pi can
     // skip capturing/sending luma_out outside walking/guiding, its only
@@ -126,7 +137,7 @@ class ToolDispatcher(
     // assets/beep.mp3 asset via a Service-owned SoundPool. A callback
     // (not a raw Context/SoundPool field here) to keep this class free of
     // Android framework audio plumbing, same convention as
-    // onPlayYoutubeVideo/reportModeToEdge above.
+    // reportModeToEdge above.
     private val playObstacleBeep: () -> Unit = {},
 ) {
     // News/radio — both keyless, no-config 3rd-party APIs hardcoded to
@@ -490,25 +501,31 @@ class ToolDispatcher(
         return JSONObject().put("results", array)
     }
 
-    private fun toolPlayYoutubeVideo(videoId: String): JSONObject {
+    /** Resolves [videoId] to a direct audio stream URL via
+     * YouTubeStreamResolver (NewPipeExtractor), then dispatches to the SAME
+     * play_video/PlaybackService path radio/music already use — replaces
+     * the old WebView-based IFrame player entirely (removed outright) per
+     * direct user request, so YouTube audio reaches a remote edge device
+     * through PlaybackService's own PCM tap (TeeRenderersFactory) instead
+     * of the unreliable MediaProjection system-audio-capture path a WebView
+     * player left as the only option. See YouTubeStreamResolver.kt's own
+     * doc comment for the accepted ToS tradeoff. */
+    private suspend fun toolPlayYoutubeVideo(videoId: String): JSONObject {
         Log.d(TAG, "play_youtube_video(video_id='$videoId')")
         if (videoId.isBlank()) return JSONObject().put("error", "video_id required")
-        onPlayYoutubeVideo(videoId)
-        // NOTE: "playing" here only means the request was dispatched to the
-        // IFrame player overlay (MainScreen.kt) — it does NOT confirm actual
-        // playback started. Check logcat tag "YouTubePlayerOverlay" for the
-        // real onReady/onStateChange/onError callbacks from the player itself.
+        val streamUrl = YouTubeStreamResolver.resolveAudioStreamUrl(videoId)
+            ?: return JSONObject().put("error", "Could not resolve a playable stream for that video (it may be age-restricted, region-blocked, or removed).")
+        dispatchDeviceTool(
+            "play_video",
+            JSONObject().put("stream_url", streamUrl).put("video_id", videoId)
+        )
         return JSONObject().put("status", "playing").put("video_id", videoId)
     }
 
-    /** Stops BOTH playback surfaces — the resolved-stream ExoPlayer path
-     * (play_video/PlaybackService) and the YouTube IFrame player — since
-     * from the user's perspective "stop the music" should stop whichever
-     * is actually playing, regardless of which tool started it. */
-    private suspend fun toolStopMusic(args: JSONObject): JSONObject {
-        onStopYoutubeVideo()
-        return dispatchDeviceTool("stop_music", args)
-    }
+    /** Stops playback (play_video/play_radio/play_youtube_video all funnel
+     * through the same PlaybackService now, so one stop covers all of
+     * them). */
+    private suspend fun toolStopMusic(args: JSONObject): JSONObject = dispatchDeviceTool("stop_music", args)
 
     // ── News / Radio (Vietnam only, hardcoded — see NewsClient.kt/RadioClient.kt) ──
 
@@ -821,6 +838,23 @@ class ToolDispatcher(
     private data class SharpFrameResult(val jpeg: ByteArray?, val sharpness: Double?, val attempts: Int, val skipped: Boolean)
 
     private suspend fun acquireSharpFrame(): SharpFrameResult {
+        // Full-resolution edge-device path, tried first when available — a
+        // real still capture is worth waiting a bit for; OCR_FULL_RES_
+        // TIMEOUT_MS bounds how long, so a lost request/response (or a
+        // Local/non-edge session, where ocrFrameFlow is always null) falls
+        // straight through to the existing live-stream-frame path below
+        // instead of hanging.
+        if (ocrFrameFlow != null) {
+            requestOcrFrame()
+            val fullRes = try {
+                withTimeoutOrNull(OCR_FULL_RES_TIMEOUT_MS) { ocrFrameFlow.first() }
+            } catch (e: Exception) {
+                Log.w(TAG, "[reading] full-res OCR frame request failed: ${e.message}")
+                null
+            }
+            if (fullRes != null) return SharpFrameResult(fullRes, null, 0, false)
+            Log.w(TAG, "[reading] full-res OCR frame request timed out after ${OCR_FULL_RES_TIMEOUT_MS}ms, falling back to live-stream frame")
+        }
         if (blurSharpnessThreshold <= 0.0) {
             val f = latestFrame() ?: return SharpFrameResult(null, null, 0, false)
             return SharpFrameResult(f, null, 0, false)
@@ -2480,6 +2514,15 @@ class ToolDispatcher(
         // up to BLUR_MAX_RETRIES times, before giving up on this cycle.
         private const val BLUR_RETRY_WAIT_MS = 500L
         private const val BLUR_MAX_RETRIES = 2
+
+        // Full-resolution edge-device OCR capture (acquireSharpFrame()) —
+        // a still capture + network round trip is inherently slower than
+        // pulling an already-buffered live-stream frame, and main.py's own
+        // StreamPauseGate auto-expires at 8s as a server-side safety net —
+        // this client-side timeout stays comfortably above that so a
+        // healthy-but-slow capture isn't cut off right as the server-side
+        // safety net would otherwise resolve it on its own.
+        private const val OCR_FULL_RES_TIMEOUT_MS = 10_000L
 
         // Live reading (startLiveReadingPipeline()) — real-time playback
         // pacing, same single-control simplification gt.py's own Live

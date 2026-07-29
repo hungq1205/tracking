@@ -21,11 +21,17 @@ Every message is a 2-part ZMQ multipart send:
 PAYLOAD FORMATS
 ---------------
 1. frame_out (PUSH, port 5602, us -> Android)
-   Raw JPEG bytes. 640px long edge, quality ~50, ~2 fps. Physically rotated
-   (see ROTATION NOTE below) -- NOT just tagged with rotation metadata,
-   because unlike luma_out this channel carries no rotation field at all,
-   and the Android side decodes it straight into a Bitmap with no
-   compensation applied anywhere downstream.
+   Raw JPEG bytes, at the SENSOR'S OWN FULL NATIVE RESOLUTION (e.g. 4608x2592
+   for the IMX708 -- picam2.sensor_resolution, see camera_capture_thread),
+   quality ~50, ~2 fps. Independent of luma_out's own (much smaller)
+   resolution. Physically rotated (see ROTATION NOTE below) -- NOT just
+   tagged with rotation metadata, because unlike luma_out this channel
+   carries no rotation field at all, and the Android side decodes it
+   straight into a Bitmap with no compensation applied anywhere
+   downstream. NOTE: the Android device's own screen aspect ratio is very
+   unlikely to match the sensor's (e.g. 16:9 vs. a phone's own aspect) --
+   see MainScreen.kt's ContentScale.Fit, which shows the WHOLE frame
+   letterboxed rather than cropping any of it away.
 
 2. luma_out (PUSH, port 5604, us -> Android)
    16-byte sub-header + raw Y-plane bytes:
@@ -39,7 +45,9 @@ PAYLOAD FORMATS
 
 3. mic_out (PUSH, port 5601, us -> Android)
    Raw PCM16 little-endian, mono, 16000 Hz. Recommended 512-sample
-   (1024-byte) chunks, continuous.
+   (1024-byte) chunks, continuous. Digital gain (--mic-gain, default 4.0x)
+   is applied before sending -- see mic_capture_thread's docstring for why
+   (raw ALSA capture has no AGC, unlike the phone's own local mic path).
 
 4. audio_in (PULL, port 5603, Android -> us)
    Raw PCM16 little-endian, STEREO interleaved, 44100 Hz. Variable chunk
@@ -56,6 +64,29 @@ PAYLOAD FORMATS
    control_recv_thread's own docstring. Silence here (an older Android
    build that never sends anything) degrades to today's always-on luma_out
    behavior, not silent data loss.
+
+6. ocr_request (PULL, port 5606, Android -> us) -- triggers a one-shot
+   FULL-RESOLUTION still capture, for OCR specifically. Payload is empty
+   (a pure trigger, same 16-byte header framing as everything else) --
+   see RemoteEdgeDevice.kt's requestOcrFrame(). frame_out/luma_out are
+   deliberately low-res (tied to --luma-long-edge) for bandwidth/latency's
+   sake on every OTHER consumer (tracking, mapping, hazard checks); OCR
+   needs real detail that resolution can't give it, so it gets its own
+   on-demand channel instead of raising the continuous streams' resolution
+   for everyone.
+
+7. ocr_frame_out (PUSH, port 5607, us -> Android) -- the JPEG result of
+   the ocr_request above, at the sensor's own FULL native resolution
+   (picam2.sensor_resolution -- NOT --luma-long-edge), same rotation
+   handling as frame_out. While a request is being handled,
+   frame_out/luma_out sending is PAUSED (see StreamPauseGate,
+   ocr_request_thread, camera_capture_thread's OCR branch, and
+   ocr_frame_sender_thread) -- both to give the still capture the camera's
+   full attention (Picamera2 can't do two capture-mode things at once) and
+   to keep the full-res JPEG's own send from competing for bandwidth with
+   the continuous streams. Auto-resumes even if something goes wrong
+   (encode failure, no Android peer connected, an unexpected exception) --
+   see StreamPauseGate's own docstring for the hard timeout backstop.
 
 ROTATION NOTE
 -------------
@@ -180,6 +211,47 @@ def cv2_rotate_code(rotation_degrees: int):
         180: cv2.ROTATE_180,
         270: cv2.ROTATE_90_COUNTERCLOCKWISE,
     }.get(rotation_degrees % 360)
+
+
+class StreamPauseGate:
+    """Pauses frame_out/luma_out SENDING while a full-resolution OCR still
+    capture (ocr_request -> ocr_frame_out) is in flight -- see
+    camera_capture_thread's OCR branch (which calls pause()) and
+    ocr_frame_sender_thread (which calls resume() once the JPEG has
+    actually been pushed onto the wire, success or failure). frame_sender_
+    thread/luma_sender_thread check is_paused() at the top of their loop
+    and simply skip sending while it's true (their queues are already
+    drop-oldest, so nothing backs up -- they just resume with whatever's
+    freshest once unpaused).
+
+    Auto-expires after `max_pause_s` regardless of whether resume() was
+    ever called, so an unexpected crash/hang while handling one OCR
+    request can't permanently stall the live video stream -- a live view
+    resuming (possibly slightly early, mid-send) is far preferable to it
+    silently dying for good.
+    """
+
+    def __init__(self, max_pause_s: float = 8.0):
+        self._max_pause_s = max_pause_s
+        self._paused_since: float | None = None
+        self._lock = threading.Lock()
+
+    def pause(self) -> None:
+        with self._lock:
+            self._paused_since = time.monotonic()
+
+    def resume(self) -> None:
+        with self._lock:
+            self._paused_since = None
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            started = self._paused_since
+        if started is None:
+            return False
+        if time.monotonic() - started > self._max_pause_s:
+            return False
+        return True
 
 
 class RateStats:
@@ -327,7 +399,8 @@ class MicResampler:
 # Camera: one capture thread feeding two send threads
 # ---------------------------------------------------------------------------
 
-def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_frame_cap, stats_luma_cap, luma_enabled):
+def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_frame_cap, stats_luma_cap, luma_enabled,
+                           ocr_request_queue, ocr_result_queue, stream_pause):
     """Owns the single Picamera2 instance. Configures a dual stream --
     "main" (RGB888, for frame_out's JPEG) and "lores" (YUV420, for
     luma_out's raw Y-plane) -- and pulls both from the same capture request
@@ -346,9 +419,18 @@ def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_f
     only -- see ToolDispatcher.feedAngleLumaFrame() -- so every other mode
     was paying full 15fps/~130KB-per-frame network cost for data the phone
     just discarded).
+
+    Also owns the OCR full-resolution still capture (see ocr_request_thread/
+    ocr_frame_sender_thread) -- MUST happen on this same thread, not a
+    separate one, since concurrent capture_request()/switch_mode calls
+    against one Picamera2 instance from two different threads is not a
+    pattern picamera2 supports (see the module docstring's threading
+    model). Checked non-blockingly once per normal video-capture iteration,
+    so it interleaves with (rather than interrupts) the regular loop below.
     """
     try:
         from picamera2 import Picamera2
+        from libcamera import controls as libcamera_controls
     except ImportError as e:
         logging.error(
             "picamera2 is not importable. On Raspberry Pi OS install it via "
@@ -358,16 +440,60 @@ def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_f
         stop_event.set()
         return
 
-    main_size = (args.frame_long_edge, round(args.frame_long_edge * CAMERA_ASPECT_H / CAMERA_ASPECT_W))
+    # lores (luma_out, only consumed locally by AngleTracker's ORB rotation
+    # tracking) keeps its own modest resolution -- more pixels there is more
+    # ORB-detection work per frame with no benefit to what's displayed.
     lores_size = (args.luma_long_edge, round(args.luma_long_edge * CAMERA_ASPECT_H / CAMERA_ASPECT_W))
     frame_duration_us = int(1_000_000 / args.luma_fps) if args.luma_fps > 0 else 0
+    # Same rotation this thread applies to nothing itself normally (that's
+    # frame_sender_thread's job for the continuous stream) -- needed here
+    # too for the OCR still branch below, since that JPEG is built directly
+    # in THIS thread, not handed off to frame_sender_thread.
+    rotate_code = cv2_rotate_code(args.rotation_degrees)
 
     backoff = 1.0
     while not stop_event.is_set():
         picam2 = None
         try:
             picam2 = Picamera2()
-            controls = {"FrameDurationLimits": (frame_duration_us, frame_duration_us)} if frame_duration_us else {}
+            # Continuous AF for the normal video stream -- the IMX708 (Camera
+            # Module 3) has autofocus hardware, but picamera2 doesn't drive it
+            # at all unless AfMode is explicitly set. Without this, the lens
+            # sits wherever it last was (often a default/hyperfocal distance),
+            # which is exactly why a document held close for OCR came back
+            # genuinely out of focus regardless of how steady it was held --
+            # steadiness only helps with motion blur, not wrong focus
+            # distance. This keeps the lens tracking whatever's in frame
+            # during ordinary streaming; the OCR still branch below ALSO
+            # explicitly triggers+waits for a fresh autofocus_cycle() of its
+            # own, since switch_mode() resets into a fresh capture session and
+            # continuous AF may not have re-converged yet at the instant of
+            # that mode switch.
+            controls = {
+                "FrameDurationLimits": (frame_duration_us, frame_duration_us),
+                "AfMode": libcamera_controls.AfModeEnum.Continuous,
+            } if frame_duration_us else {"AfMode": libcamera_controls.AfModeEnum.Continuous}
+            # main (frame_out, what the Android client displays) is
+            # requested at the SENSOR'S OWN FULL NATIVE RESOLUTION directly
+            # (e.g. 4608x2592 for the IMX708) -- --frame-long-edge is gone;
+            # there's no separate "raw" stream pin any more either (an
+            # earlier round used one purely to steer libcamera's sensor-
+            # mode selection toward full-FOV while `main` itself stayed
+            # small -- now that `main` IS the full-resolution request,
+            # nothing else needs to be pinned: requesting the sensor's own
+            # native size for `main` already forces the full-FOV mode by
+            # construction, no separate hint required). `main` and `lores`
+            # no longer share one aspect-locked pair either, since `main`'s
+            # size now comes straight from the sensor, not
+            # CAMERA_ASPECT_W/H arithmetic.
+            try:
+                main_size = picam2.sensor_resolution
+            except Exception:
+                # Fallback only if the sensor's own resolution can't be
+                # queried at all (shouldn't happen on real hardware) --
+                # matches CAMERA_ASPECT_W/H's assumed 16:9 at a size that's
+                # at least still a real request, not a crash.
+                main_size = (args.luma_long_edge * 4, round(args.luma_long_edge * 4 * CAMERA_ASPECT_H / CAMERA_ASPECT_W))
             config = picam2.create_video_configuration(
                 # picamera2's "RGB888" format is stored in BGR byte order on
                 # purpose, specifically so arrays can be handed to OpenCV
@@ -382,10 +508,77 @@ def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_f
             lores_cfg = picam2.camera_configuration()["lores"]
             stride = lores_cfg["stride"]
             width, height = lores_cfg["size"]
-            logging.info("camera started: main=%s lores=%s stride=%d", main_size, lores_size, stride)
+            logging.info("camera started: main=%s (sensor full res) lores=%s stride=%d", main_size, lores_size, stride)
             backoff = 1.0
 
             while not stop_event.is_set():
+                try:
+                    ocr_req = ocr_request_queue.get_nowait()
+                except queue.Empty:
+                    ocr_req = None
+                if ocr_req is not None:
+                    # Manually split what switch_mode_and_capture_array() would
+                    # otherwise do in one call (switch -> capture -> switch
+                    # back), specifically to insert a blocking autofocus_cycle()
+                    # in between the mode switch and the actual capture. This
+                    # is the fix for a real reported bug: an OCR still of a
+                    # document held close up came back genuinely blurry even
+                    # when held perfectly steady -- switch_mode() starts a
+                    # fresh capture session, and continuous AF (see the
+                    # AfMode control set above) has no guarantee of having
+                    # already re-converged for the new distance at the exact
+                    # instant a bare capture would otherwise fire. Captures
+                    # ONE still at the still config's own resolution (full
+                    # sensor resolution here -- no "size" key means picamera2
+                    # defaults to the sensor's max). Normal main/lores CAPTURE
+                    # is naturally paused for this whole window since it's the
+                    # same camera/thread; the stream_pause gate below
+                    # additionally blocks SENDING any already-queued main/lores
+                    # frame while this is in flight.
+                    stream_pause.pause()
+                    try:
+                        logging.info("OCR full-res capture requested -- switching camera mode")
+                        still_config = picam2.create_still_configuration(main={"format": "RGB888"})
+                        picam2.switch_mode(still_config)
+                        try:
+                            try:
+                                focused = picam2.autofocus_cycle()
+                                if not focused:
+                                    logging.warning("OCR still: autofocus_cycle() did not converge -- capturing anyway")
+                            except Exception:
+                                logging.exception("OCR still: autofocus_cycle() failed -- capturing anyway")
+                            still_arr = picam2.capture_array("main")
+                        finally:
+                            # Always restore the video config, even if autofocus
+                            # or the capture itself raised -- leaving picam2
+                            # parked in still mode would silently break every
+                            # subsequent frame_out/lores capture for the rest
+                            # of this camera session.
+                            picam2.switch_mode(config)
+                        if rotate_code is not None:
+                            still_arr = cv2.rotate(still_arr, rotate_code)
+                        ok, jpg = cv2.imencode(
+                            ".jpg", still_arr, [int(cv2.IMWRITE_JPEG_QUALITY), args.ocr_frame_quality],
+                        )
+                        if ok:
+                            put_drop_oldest(ocr_result_queue, jpg.tobytes())
+                            logging.info(
+                                "OCR full-res capture done: %s -> %d JPEG bytes",
+                                still_arr.shape, len(jpg.tobytes()),
+                            )
+                            # stream_pause.resume() is NOT called here on
+                            # success -- ocr_frame_sender_thread owns clearing
+                            # it, once the JPEG has actually been sent (not
+                            # merely captured/encoded) -- see that thread's
+                            # own docstring for why "done" means "sent."
+                        else:
+                            logging.warning("OCR full-res JPEG encode failed")
+                            stream_pause.resume()
+                    except Exception:
+                        logging.exception("OCR full-res capture failed")
+                        stream_pause.resume()
+                    continue
+
                 request = picam2.capture_request()
                 try:
                     capture_ts = time.time()
@@ -422,10 +615,15 @@ def camera_capture_thread(frame_raw_queue, luma_queue, stop_event, args, stats_f
                     pass
 
 
-def frame_sender_thread(ctx, frame_raw_queue, stop_event, port, quality, fps, rotation_degrees, stats):
+def frame_sender_thread(ctx, frame_raw_queue, stop_event, port, quality, fps, rotation_degrees, stats, stream_pause):
     """Owns the frame_out PUSH socket. Pulls the latest captured main-stream
     array, throttles to ~fps, rotates (see ROTATION NOTE in the module
     docstring), JPEG-encodes, and sends.
+
+    Skips sending entirely while `stream_pause.is_paused()` (a full-res OCR
+    still capture is in flight, see StreamPauseGate/ocr_request_thread) --
+    frame_raw_queue is drop-oldest anyway, so nothing backs up; it just
+    resumes with whatever's freshest once unpaused.
     """
     sock = ctx.socket(zmq.PUSH)
     sock.setsockopt(zmq.SNDHWM, 2)
@@ -444,6 +642,9 @@ def frame_sender_thread(ctx, frame_raw_queue, stop_event, port, quality, fps, ro
     seq = 0
     try:
         while not stop_event.is_set():
+            if stream_pause.is_paused():
+                time.sleep(0.02)
+                continue
             try:
                 frame_bgr, _capture_ts = frame_raw_queue.get(timeout=0.5)
             except queue.Empty:
@@ -471,10 +672,13 @@ def frame_sender_thread(ctx, frame_raw_queue, stop_event, port, quality, fps, ro
         sock.close(0)
 
 
-def luma_sender_thread(ctx, luma_queue, stop_event, port, stats):
+def luma_sender_thread(ctx, luma_queue, stop_event, port, stats, stream_pause):
     """Owns the luma_out PUSH socket. Packs the 16-byte sub-header ahead of
     the raw Y-plane bytes and forwards essentially every captured luma frame
     (already rate-limited upstream by the camera's FrameDurationLimits).
+
+    Skips sending entirely while `stream_pause.is_paused()` -- see
+    frame_sender_thread's own comment on why.
     """
     sock = ctx.socket(zmq.PUSH)
     sock.setsockopt(zmq.SNDHWM, 4)
@@ -485,6 +689,9 @@ def luma_sender_thread(ctx, luma_queue, stop_event, port, stats):
     seq = 0
     try:
         while not stop_event.is_set():
+            if stream_pause.is_paused():
+                time.sleep(0.02)
+                continue
             try:
                 luma_bytes, width, height, stride, rotation = luma_queue.get(timeout=0.5)
             except queue.Empty:
@@ -553,6 +760,77 @@ def control_recv_thread(ctx, luma_enabled, stop_event, port):
 
 
 # ---------------------------------------------------------------------------
+# Full-resolution OCR capture: ocr_request -> (camera_capture_thread) -> ocr_frame_out
+# ---------------------------------------------------------------------------
+
+def ocr_request_thread(ctx, ocr_request_queue, stop_event, port):
+    """Owns the ocr_request PULL socket. Payload is empty -- this is a pure
+    trigger (see RemoteEdgeDevice.kt's requestOcrFrame()), nothing to parse.
+    Hands the request off to camera_capture_thread (the only thread allowed
+    to touch the Picamera2 instance -- see the module docstring's threading
+    model) via a maxsize=1 drop-oldest queue: a second request arriving
+    before the first has been picked up just coalesces into "handle one full-
+    res capture soon," not two queued captures back to back.
+    """
+    sock = ctx.socket(zmq.PULL)
+    sock.setsockopt(zmq.RCVHWM, 4)
+    sock.setsockopt(zmq.RCVTIMEO, 500)
+    sock.bind(f"tcp://0.0.0.0:{port}")
+    logging.info("ocr_request PULL bound on 0.0.0.0:%d", port)
+
+    try:
+        while not stop_event.is_set():
+            try:
+                sock.recv_multipart()
+            except zmq.Again:
+                continue
+            except Exception:
+                logging.exception("ocr_request recv failed")
+                continue
+            put_drop_oldest(ocr_request_queue, True)
+            logging.info("ocr_request received -- queued for camera_capture_thread")
+    finally:
+        sock.close(0)
+
+
+def ocr_frame_sender_thread(ctx, ocr_result_queue, stop_event, port, stats, stream_pause):
+    """Owns the ocr_frame_out PUSH socket. Pulls a completed full-res JPEG
+    (put there by camera_capture_thread's OCR branch) and sends it -- a
+    LONGER SNDTIMEO than the continuous streams (this is a rare, important,
+    already-paced-by-request payload, not a droppable video frame) and
+    always calls stream_pause.resume() in `finally`, success or failure, so
+    a send that fails (no Android peer connected, etc.) can't leave
+    frame_out/luma_out paused until StreamPauseGate's own hard timeout.
+    """
+    sock = ctx.socket(zmq.PUSH)
+    sock.setsockopt(zmq.SNDHWM, 2)
+    sock.setsockopt(zmq.SNDTIMEO, 5000)
+    sock.bind(f"tcp://0.0.0.0:{port}")
+    logging.info("ocr_frame_out PUSH bound on 0.0.0.0:%d", port)
+
+    seq = 0
+    try:
+        while not stop_event.is_set():
+            try:
+                jpg_bytes = ocr_result_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                send_framed(sock, seq, jpg_bytes)
+                seq += 1
+                stats.record()
+                logging.info("ocr_frame_out sent (%d bytes)", len(jpg_bytes))
+            except zmq.Again:
+                logging.warning("ocr_frame_out send timed out (no Android peer connected?) -- dropping this capture")
+            except Exception:
+                logging.exception("ocr_frame_out send failed")
+            finally:
+                stream_pause.resume()
+    finally:
+        sock.close(0)
+
+
+# ---------------------------------------------------------------------------
 # Mic capture -> mic_out
 # ---------------------------------------------------------------------------
 
@@ -564,14 +842,33 @@ def mic_capture_thread(mic_queue, stop_event, args, stats_cap):
     (a hard real-time constraint) -- pushes onto mic_queue non-blocking and
     only drops-oldest as a last resort if ~30s has backed up, which should
     never happen under normal load on this light a workload.
+
+    Applies a fixed digital gain (--mic-gain, default 4.0) before anything
+    else touches the samples. Real, confirmed cause behind "have to shout
+    for the edge device to hear me": the phone's own local mic path
+    (ContinuousVadRecorder.kt) captures via AudioSource.VOICE_COMMUNICATION,
+    which most Android hardware boosts with HAL/driver-level AGC before the
+    app ever sees a sample -- the VAD thresholds in Settings (default
+    noiseGate=0.012/startThreshold=0.018) were tuned against THAT already-
+    boosted level. A bare ALSA capture here (plain sounddevice.InputStream,
+    no AGC at all -- cheap USB/HAT mic capsules in particular run quiet) has
+    no equivalent boost, so the identical thresholds effectively require
+    much louder real-world speech to cross. Gain is applied here (source),
+    not client-side, so it also benefits mic_out's actual audio quality/
+    intelligibility for Gemini, not just the VAD's amplitude reading.
     """
     device = resolve_input_device(args.input_device)
     resampler_box = {}
+    gain = args.mic_gain
 
     def callback(indata, frames, time_info, status):
         if status:
             logging.warning("mic input status: %s", status)
-        mono = indata[:, 0].copy()
+        mono = indata[:, 0]
+        if gain != 1.0:
+            mono = np.clip(mono.astype(np.int32) * gain, -32768, 32767).astype(np.int16)
+        else:
+            mono = mono.copy()
         resampler = resampler_box.get("resampler")
         if resampler is None:
             return
@@ -833,13 +1130,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--audio-in-port", type=int, default=5603)
     p.add_argument("--control-port", type=int, default=5605,
                     help="Phone -> Pi mode reports, used only to gate luma_out sending (see control_recv_thread).")
+    p.add_argument("--ocr-request-port", type=int, default=5606,
+                    help="Phone -> Pi trigger for a one-shot full-resolution OCR still capture.")
+    p.add_argument("--ocr-frame-port", type=int, default=5607,
+                    help="Pi -> Phone JPEG result of --ocr-request-port's trigger, at full sensor resolution.")
+    p.add_argument("--ocr-frame-quality", type=int, default=85,
+                    help="JPEG quality for the full-resolution OCR still (higher than --frame-quality's "
+                         "50 -- OCR wants real detail, and this channel is on-demand/infrequent, not "
+                         "continuous, so the extra bytes-per-frame cost doesn't matter the way it would "
+                         "for frame_out/luma_out.")
 
-    p.add_argument("--frame-long-edge", type=int, default=640)
+    # frame_out (main, RGB888/JPEG -- what the Android client actually
+    # displays) has its OWN resolution, separate from --luma-long-edge
+    # (lores, only consumed locally by AngleTracker's ORB tracking) -- see
+    # camera_capture_thread's own comment on why these were un-tied again
+    # after a previous round briefly merged them.
+    # No --frame-long-edge any more: frame_out's (main) resolution is always
+    # the sensor's own full native resolution now -- see
+    # camera_capture_thread's own comment.
     p.add_argument("--frame-quality", type=int, default=50)
     p.add_argument("--frame-fps", type=float, default=2.0)
 
-    p.add_argument("--luma-long-edge", type=int, default=360)
-    p.add_argument("--luma-fps", type=float, default=15.0)
+    p.add_argument("--luma-long-edge", type=int, default=360,
+                    help="Long-edge resolution for luma_out (Y-plane, AngleTracker's ORB rotation "
+                         "tracking input during walking/guiding only) -- independent of --frame-long-edge "
+                         "above. Kept modest on purpose: more pixels here means more ORB-detection work "
+                         "per frame with no benefit to what the Android client actually displays.")
+    p.add_argument("--luma-fps", type=float, default=13.0,
+                    help="Was 15.0 -- lowered to stay under the IMX708's own ~14fps full-FOV sensor "
+                         "mode ceiling. Above that, libcamera's automatic sensor-mode selection can "
+                         "silently switch to a narrower, cropped-FOV high-speed mode instead -- raise "
+                         "this only if you don't mind trading FOV for frame rate.")
 
     p.add_argument("--rotation-degrees", type=int, default=90, choices=[0, 90, 180, 270],
                     help="Physical camera mount rotation; drives frame_out's baked-in "
@@ -847,6 +1168,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--mic-sample-rate", type=int, default=16000)
     p.add_argument("--mic-chunk-samples", type=int, default=512)
+    p.add_argument("--mic-gain", type=float, default=4.0,
+                    help="Digital gain applied to captured mic samples before resampling/sending "
+                         "(1.0 = off). Raw ALSA capture has no AGC, unlike the phone's own local mic "
+                         "path -- see mic_capture_thread's docstring. Raise if the app still requires "
+                         "shouting; lower if audio sounds clipped/distorted.")
 
     p.add_argument("--audio-in-sample-rate", type=int, default=44100)
     p.add_argument("--audio-in-channels", type=int, default=2)
@@ -892,6 +1218,9 @@ def main() -> None:
     frame_raw_queue: "queue.Queue" = queue.Queue(maxsize=1)
     luma_queue: "queue.Queue" = queue.Queue(maxsize=1)
     mic_queue: "queue.Queue" = queue.Queue(maxsize=MIC_QUEUE_MAXSIZE)
+    ocr_request_queue: "queue.Queue" = queue.Queue(maxsize=1)
+    ocr_result_queue: "queue.Queue" = queue.Queue(maxsize=1)
+    stream_pause = StreamPauseGate()
     luma_enabled = threading.Event()
     luma_enabled.set()  # default on -- see control_recv_thread's own docstring for why
     bytes_per_ms = args.audio_in_sample_rate * args.audio_in_channels * 2 / 1000.0
@@ -905,13 +1234,14 @@ def main() -> None:
         shrink_after_s=JITTER_SHRINK_AFTER_S,
     )
 
-    stat_names = ("frame_cap", "luma_cap", "frame_out", "luma_out", "mic_cap", "mic_out", "audio_in")
+    stat_names = ("frame_cap", "luma_cap", "frame_out", "luma_out", "mic_cap", "mic_out", "audio_in", "ocr_frame_out")
     stats = {name: RateStats(name) for name in stat_names}
 
     threads = [
         threading.Thread(
             target=camera_capture_thread,
-            args=(frame_raw_queue, luma_queue, stop_event, args, stats["frame_cap"], stats["luma_cap"], luma_enabled),
+            args=(frame_raw_queue, luma_queue, stop_event, args, stats["frame_cap"], stats["luma_cap"], luma_enabled,
+                  ocr_request_queue, ocr_result_queue, stream_pause),
             name="camera-capture", daemon=True,
         ),
         threading.Thread(
@@ -922,12 +1252,12 @@ def main() -> None:
         threading.Thread(
             target=frame_sender_thread,
             args=(ctx, frame_raw_queue, stop_event, args.frame_port, args.frame_quality,
-                  args.frame_fps, args.rotation_degrees, stats["frame_out"]),
+                  args.frame_fps, args.rotation_degrees, stats["frame_out"], stream_pause),
             name="frame-sender", daemon=True,
         ),
         threading.Thread(
             target=luma_sender_thread,
-            args=(ctx, luma_queue, stop_event, args.luma_port, stats["luma_out"]),
+            args=(ctx, luma_queue, stop_event, args.luma_port, stats["luma_out"], stream_pause),
             name="luma-sender", daemon=True,
         ),
         threading.Thread(
@@ -950,13 +1280,25 @@ def main() -> None:
             args=(playback_buffer, stop_event, args),
             name="audio-playback", daemon=True,
         ),
+        threading.Thread(
+            target=ocr_request_thread,
+            args=(ctx, ocr_request_queue, stop_event, args.ocr_request_port),
+            name="ocr-request-recv", daemon=True,
+        ),
+        threading.Thread(
+            target=ocr_frame_sender_thread,
+            args=(ctx, ocr_result_queue, stop_event, args.ocr_frame_port, stats["ocr_frame_out"], stream_pause),
+            name="ocr-frame-sender", daemon=True,
+        ),
     ]
 
     for t in threads:
         t.start()
     logging.info(
-        "all threads started -- frame_out:%d luma_out:%d mic_out:%d audio_in:%d control:%d",
+        "all threads started -- frame_out:%d luma_out:%d mic_out:%d audio_in:%d control:%d "
+        "ocr_request:%d ocr_frame_out:%d",
         args.frame_port, args.luma_port, args.mic_port, args.audio_in_port, args.control_port,
+        args.ocr_request_port, args.ocr_frame_port,
     )
 
     try:

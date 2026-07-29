@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 
 /**
  * Thin bound-client facade over [LiveAssistantService], which now owns the
@@ -56,25 +57,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         .flatMapLatest { service -> service?.uiState ?: flowOf(AppUiState()) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, AppUiState())
 
-    /** Non-null video id means the UI should show/update the embedded
-     * YouTube IFrame player — see LiveAssistantService's own field doc and
-     * CLAUDE.md's YouTube playback note. */
+    /** Latest JPEG received from a remote edge device's camera (null unless
+     * "Use Remote Edge Device" is active) — MainScreen shows this in place
+     * of the phone's own CameraX preview when non-null. */
     @OptIn(ExperimentalCoroutinesApi::class)
-    val pendingYoutubeVideoId: StateFlow<String?> = _boundService
-        .flatMapLatest { service -> service?.pendingYoutubeVideoId ?: flowOf(null) }
+    val edgeFrame: StateFlow<ByteArray?> = _boundService
+        .flatMapLatest { service -> service?.edgeFrame ?: flowOf(null) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    /** Manual on-screen dismissal of the embedded YouTube player (distinct
-     * from the voice-driven `stop_music` tool, which also stops PlaybackService). */
-    fun dismissYoutubeVideo() { _boundService.value?.dismissYoutubeVideo() }
-
-    /** Reports the IFrame player's actual PLAYING/paused state up to the
-     * Service — see LiveAssistantService's own field doc (isOutputActive's
-     * VAD-gating signal) for why this must be the REAL playing state, not
-     * merely whether a video is loaded. */
-    fun reportYoutubePlaybackState(isPlaying: Boolean) {
-        _boundService.value?.reportYoutubePlaybackState(isPlaying)
-    }
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val isRemoteEdgeActive: StateFlow<Boolean> = _boundService
+        .flatMapLatest { service -> service?.isRemoteEdgeActive ?: flowOf(false) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     /** Exposed only for [attachCameraPreview]'s reuse of CameraManager's own
      * pending-attach fallback — not read directly by the UI layer any more. */

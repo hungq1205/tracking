@@ -47,6 +47,29 @@ interface EdgeDevice {
     val micFlow: SharedFlow<ByteArray>
 
     /**
+     * JPEG frames from a one-shot FULL-RESOLUTION still capture, requested
+     * via [requestOcrFrame] -- distinct from [frameFlow]'s continuous,
+     * lower-resolution (same size as [lumaFlow] now) video stream. OCR needs
+     * real detail a live-preview-resolution frame can't give it; the
+     * continuous streams stay low-res for bandwidth/latency's sake. See
+     * CLAUDE.md's "Full-resolution OCR capture channel" note for the wire
+     * protocol (ocr_request/ocr_frame_out) and why frame_out/luma_out are
+     * paused server-side for the duration of a still capture+send.
+     */
+    val ocrFrameFlow: SharedFlow<ByteArray>
+
+    /**
+     * Requests one full-resolution capture (fire-and-forget -- the result
+     * arrives asynchronously on [ocrFrameFlow], or never if the device
+     * doesn't support this or the request/response is lost; callers must
+     * time out on their own). No-op default: [LocalEdgeDevice] doesn't need
+     * this at all -- the phone's own camera already provides a
+     * full-resolution frame on demand via [CameraManager] with no separate
+     * request/response round trip needed.
+     */
+    fun requestOcrFrame() {}
+
+    /**
      * Raw PCM audio chunks to be played back on the edge device's speaker.
      * Populated as a side effect of [emitAudio] — collect this, or just call
      * [emitAudio] directly; both exist for symmetry with the other flows.

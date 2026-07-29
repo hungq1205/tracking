@@ -5496,7 +5496,10 @@ Not a full audit, just what surfaced incidentally:
   Reading-mode TTS (`ReadingTtsPlayer`, native Android `TextToSpeech`)
   still only plays on the phone regardless of the toggle — never wired
   into the mixer/edge path. Not rewritten in this pass — flagged for a
-  dedicated cleanup, offered to the user, not yet actioned.
+  dedicated cleanup, offered to the user, not yet actioned. **Since
+  addressed for the camera-preview half and the YouTube-audio half — see
+  "Remote edge device: camera preview + system-audio (YouTube) capture"
+  below** — reading-mode TTS itself is still unaddressed.
 - **The step-down/obstacle hazard warning.** The "Hazard warnings —
   step-down frames fed to Gemini Live" section below still describes a
   local-depth-heuristic design (`checkAndWarnHazard()`, `dropoff_m`/
@@ -5648,6 +5651,259 @@ actually resolve the reported Pixie-silence symptom (the AngleTracker
 large-rotation-matching-failure suspect noted in #1 was NOT changed this
 round), and whether `OBSTACLE_AHEAD_RANGE_M`/`OBSTACLE_AHEAD_CONE_HALF_DEG`/
 `MOVING_WINDOW_MS`/`REPLAN_NEAR_END_M` need real-world tuning.
+
+### Remote edge device: camera preview + system-audio (YouTube) capture
+
+Two direct user requests, closing the two remaining gaps the
+"Documentation drift" note above flagged for `EdgeDevice`: (1) when a
+remote edge device supplies the camera, the on-screen preview should show
+ITS frames, not the phone's own; (2) YouTube's audio (the one output
+source that never reached `AudioMixer`, see CLAUDE.md's YouTube playback
+note on the IFrame player exposing no PCM callback) should also reach the
+edge device's speaker.
+
+**1. Camera preview.** `LiveAssistantService` gained `_edgeFrame:
+MutableStateFlow<ByteArray?>` / `edgeFrame` and `_isRemoteEdgeActive`/
+`isRemoteEdgeActive` — `startLocalProcessing()`'s existing
+`edgeDevice.frameFlow` collector (already updates `lastEdgeFrame` for
+on-demand pulls) now also sets `_edgeFrame.value = jpegBytes`, but ONLY
+when `remoteEdgeActive` — `LocalEdgeDevice.frameFlow` is literally
+`cameraManager.frameFlow` (the phone's own camera), so gating avoids
+pointlessly mirroring the same bytes the `PreviewView` is already showing.
+`configureEdgeDevice()` sets `_isRemoteEdgeActive`/clears `_edgeFrame` on
+every toggle/reconnect. `MainViewModel` re-exposes both via the same
+`flatMapLatest` pattern every other bound-service StateFlow already uses.
+`MainScreen.kt` keeps the CameraX `PreviewView` mounted unconditionally
+(so `attachCameraPreview()`'s Preview use case stays bound regardless —
+unrelated to which frames are actually shown) and draws a `Image`
+decoding `edgeFrame` (JPEG -> `Bitmap` via `BitmapFactory`, `remember`ed
+per-frame) on top of it whenever `isRemoteEdgeActive` is true. A plain
+per-frame `BitmapFactory.decodeByteArray` — no attempt to reuse a mutable
+Bitmap/pool, matching this codebase's existing "not a mastered path, good
+enough for its frame rate" tolerance elsewhere (e.g. AudioMixer's own
+per-chunk resample).
+
+**2. YouTube (and any other USAGE_MEDIA) audio -> edge device speaker.**
+Confirmed with the user before implementing: the YouTube IFrame player is
+a WebView with no PCM callback (per CLAUDE.md's own YouTube playback
+note), so the only way to intercept its output at all is Android's
+`MediaProjection`/`AudioPlaybackCaptureConfiguration` (API 29+) system-
+audio-capture API — chosen over the alternative (dropping the IFrame
+player for a resolved-stream ExoPlayer path) specifically to avoid
+reintroducing the YouTube ToS risk the IFrame player was chosen to avoid
+in the first place.
+- **`minSdk` bumped 26 -> 29** (`app/build.gradle.kts`) —
+  `AudioPlaybackCaptureConfiguration` requires it; no code elsewhere in
+  this app depended on 26-28 specifically.
+- **Manifest**: `FOREGROUND_SERVICE_MEDIA_PROJECTION` permission added;
+  `LiveAssistantService`'s `android:foregroundServiceType` extended to
+  `"microphone|camera|mediaProjection"` — the plain two-arg
+  `startForeground()` call already in `onCreate()`/`onStartCommand()`
+  derives its active type set from the manifest automatically, so no
+  Kotlin-side `startForeground()` signature change was needed.
+- **`AudioMixer.kt`** gained a third source, `systemQueue`/
+  `feedSystemAudio(pcm: ByteArray)` — stereo 16-bit PCM @44.1kHz, same
+  native rate as `feedPixie`'s already-rendered chunks, so (like Pixie,
+  unlike Gemini's 24kHz voice) it needs no resample on ingest. `tickLoop()`
+  now sums all three sources per tick instead of two.
+- **`LiveAssistantService.startSystemAudioCapture(resultCode: Int, data:
+  Intent)`** (new, public — called from `MainViewModel`, which itself is
+  called from `MainActivity`'s new `mediaProjectionLauncher` result
+  callback): builds a `MediaProjection` from the granted consent result,
+  registers a `MediaProjection.Callback` (`onStop()` -> tears capture down
+  if the OS/user revokes consent mid-session), builds an `AudioRecord`
+  with `AudioPlaybackCaptureConfiguration.Builder(projection)
+  .addMatchingUsage(AudioAttributes.USAGE_MEDIA)` (matches YouTube's own
+  playback attributes; would also pick up any other USAGE_MEDIA source,
+  not YouTube-specific), and a background coroutine reading fixed-size
+  chunks into `audioMixer.feedSystemAudio()`. No-ops if
+  `remoteEdgeActive` is false (nothing to forward captured audio to).
+  `stopSystemAudioCapture()` tears the `AudioRecord`/`MediaProjection`
+  down — called from `configureEdgeDevice()` (before reassigning
+  `edgeDevice`), `disconnect()`, and `onDestroy()`.
+- **Consent flow (`MainActivity.kt`)**: the system consent dialog can only
+  be shown from an Activity, so `LiveAssistantService` can never request
+  it itself — only ever receive an already-granted `(resultCode, data)`
+  pair. `mediaProjectionLauncher` (`registerForActivityResult(
+  StartActivityForResult())`, new) is launched from `SettingsScreen`'s
+  `onConnect` callback whenever `useRemoteEdgeDevice` is true (right after
+  `mainViewModel.connect(...)`, not gating it — connecting doesn't need to
+  wait on this consent, capture just starts forwarding once/if it's
+  granted); `activeViewModel` (a plain class-level var, set from
+  `setContent`'s composition) is what the launcher's later-arriving result
+  callback calls `startSystemAudioCapture()` on, since it can't close over
+  a ViewModel instance at registration time.
+- Local playback (both the WebView's own audio output AND every other
+  existing local sound — `StreamingAudioPlayer`/`PixieController`/
+  `ReadingTtsPlayer`) is completely untouched — capture only taps a COPY
+  via `AudioPlaybackCaptureConfiguration`, it doesn't redirect or silence
+  anything.
+- **Known, accepted limitations**: the consent dialog reappears once per
+  `connect()` call while `useRemoteEdgeDevice` is on (no way to make
+  `MediaProjection` grants persistent across sessions) — an accepted
+  UX cost of this API, not a bug. Reading-mode TTS
+  (`ReadingTtsPlayer`, native `TextToSpeech`) still isn't captured —
+  `AudioPlaybackCaptureConfiguration` can only match by `AudioAttributes`
+  usage/session, and extending `.addMatchingUsage()` to also catch TTS's
+  own usage was considered out of scope for this pass (not requested);
+  worth revisiting together with the still-flagged reading-mode/edge-audio
+  gap above if that's ever wanted too. Verified via
+  `./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no new warnings)
+  — not verified end-to-end on a real device/edge rig from this
+  environment, same standing caveat as the rest of this project's Android
+  work — specifically unverified: whether `AudioPlaybackCaptureConfiguration`
+  actually captures the IFrame WebView player's audio in practice (some
+  OEMs/WebView versions are known to be inconsistent about which
+  `AudioAttributes` a WebView's internal player actually uses).
+
+### Remote edge device follow-up round — crash fix, consent-launch race, Pi FOV/mic-gain bugs
+
+Four issues reported directly by the user from a real device right after
+the section above shipped — all now fixed, verified live against the
+actual connected device/repo (not just compile-checked, unlike most of
+this project's other Android rounds).
+
+**1. App crashed on open — real bug, root-caused via `adb logcat`.**
+Declaring `mediaProjection` in `LiveAssistantService`'s manifest
+`android:foregroundServiceType` made Android 14+ validate **every**
+manifest-declared type on the plain 2-arg `startForeground(id,
+notification)` call — including the very first one, at service startup,
+long before any `MediaProjection` consent had ever been requested.
+`mediaProjection` isn't backed by anything at that point, so the OS threw
+`SecurityException: ... requires permissions: ... android:project_media`
+immediately — a hard, unconditional crash on every launch while `"Use
+Remote Edge Device"` was toggled on (confirmed live: `adb logcat` showed
+`FATAL EXCEPTION: main` at `LiveAssistantService.onStartCommand`). Fixed
+by using the 3-arg `startForeground(id, notification, type)` overload with
+an EXPLICIT type everywhere: the initial call in `onStartCommand()` only
+requests `FOREGROUND_SERVICE_TYPE_MICROPHONE or
+FOREGROUND_SERVICE_TYPE_CAMERA` (never `mediaProjection`); a second
+`startForeground()` call inside `startSystemAudioCapture()`, right after a
+real `MediaProjection` has actually been granted, promotes the running
+service to also cover `FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION`. The
+manifest's declared type list (`microphone|camera|mediaProjection`) is
+unchanged — it's still an allow-list of what the service is EVER permitted
+to claim, just no longer all claimed unconditionally at once.
+
+**2. YouTube audio still didn't reach the edge speaker — a real launch-
+order race.** `MainActivity`'s `onConnect` calls `mainViewModel.connect(...)`
+then unconditionally launches the `MediaProjection` consent dialog when
+`useRemoteEdgeDevice` is true — but `MainViewModel.connect()` is a
+null-safe `_boundService.value?.connect(...)`, and `_boundService` is only
+populated asynchronously once `ServiceConnection.onServiceConnected` fires
+(bound in `init{}`). On a cold app start, hitting Connect before that
+binding callback lands means `connect()` — and therefore
+`configureEdgeDevice()`, which is what sets `remoteEdgeActive = true` —
+silently never runs; when the consent result later arrives,
+`startSystemAudioCapture()` no-ops (`if (!remoteEdgeActive) return`) with
+only a `Log.w`, so the failure was invisible. Fixed:
+`MainViewModel.startSystemAudioCapture()` now `viewModelScope.launch`es a
+wait — `withTimeoutOrNull(10_000) { isRemoteEdgeActive.first { it };
+_boundService.value }` — before forwarding the granted `(resultCode,
+data)` into the Service, instead of reading `_boundService.value`
+immediately. A real capture failure (rather than a timing race) still
+degrades to a logged no-op, same as before — this only closes the race,
+not the theoretical "remote edge device toggle was actually off" case
+(which is correctly still a no-op).
+
+**3. Edge camera's field of view was much narrower than expected — a real
+picamera2 sensor-mode bug, root-caused by reading `client/pi_edge/main.py`
+directly (this repo DOES ship the Pi-side server, contrary to what might
+be assumed).** `camera_capture_thread`'s `create_video_configuration()`
+call never constrained which sensor mode libcamera picks to satisfy
+`main`/`lores`/`FrameDurationLimits` — and the IMX708 (Camera Module 3) has
+more than one candidate: a full-FOV binned mode capped around ~14fps, and
+a narrower, cropped-FOV mode used to reach higher frame rates. `--luma-fps`
+defaulted to 15 — just past that ~14fps full-FOV ceiling — so libcamera
+would silently pick the CROPPED mode to satisfy it. This has nothing to do
+with `main`/`lores`'s own requested sizes (both are just the ISP's OUTPUT
+scaling, downstream of whichever sensor mode gets selected) — confirming
+the user's own framing was right: the intent was always "downscale the
+full FOV," never crop, and the code already agreed on paper
+(`frame_sender_thread`/`camera_capture_thread` never crop anything
+themselves) — the actual crop was happening one layer down, inside
+libcamera's own automatic sensor-mode selection.
+
+**First fix attempt (tried, removed, then RE-ADDED once real hardware
+proved the removal wrong)**: explicitly pinning a `raw` stream at
+`picam2.sensor_resolution` alongside `main`/`lores`, to force the full-FOV
+sensor mode regardless of requested fps. Removed once per a direct user
+follow-up favoring simplicity — the working theory was that `--luma-fps`'s
+own default, lowered 15 -> 13 (safely under the IMX708's ~14fps full-FOV
+ceiling), would make libcamera's normal automatic sensor-mode choice land
+on full-FOV on its own, no pin needed. **That theory was falsified by a
+real device log**: with `--luma-fps=13` AND `main`/`lores` both already
+tied to the same small 360x202 size (see the "Second simplification" note
+below), a live run still logged `Selected sensor format:
+1536x864-SBGGR10_1X10/RAW` — the cropped mode, not full-FOV — confirmed via
+direct SSH access to the running Pi (`hikari@192.168.1.221`) rather than
+guessed at. Root cause: libcamera's automatic sensor-mode selection is
+ALSO driven by the requested OUTPUT resolution, not just the fps ceiling —
+a small `main`/`lores` request made the cheaper, narrower-FOV mode look
+preferable to libcamera regardless of fps. The `raw` pin is the one thing
+that reliably overrides this, so it's back, unconditionally (not just a
+fallback-only safeguard) — `--luma-fps` stays at its 13 default anyway
+(harmless, was the user's own stated preference), it just isn't sufficient
+on its own the way the removal assumed. Falls back to an unpinned config
+(logged as a warning) if pinning that exact size fails on a given
+picamera2/libcamera version, same as the original first-attempt fallback
+design.
+
+**Second simplification (tried), then reverted per a further direct user
+follow-up**: `main` (`frame_out`, what the Android client actually
+displays) was briefly tied to the SAME resolution as `lores` (`luma_out`)
+— `main_size = lores_size`, one shared `--luma-long-edge` knob,
+`--frame-long-edge` removed outright. **Un-done**: the user pointed out
+this conflated two different concerns — display quality (what Android
+shows) vs. AngleTracker's own ORB-tracking input resolution — and asked
+for `frame_out` to get its own, HIGHER resolution independent of
+`luma_out`. `camera_capture_thread` now computes `main_size` and
+`lores_size` separately again; `--frame-long-edge` is back (default 960,
+was 640 before the brief merge) and `--luma-long-edge` reverted to its
+original default (360) — raising `luma_out`'s resolution has a real cost
+(more ORB-detection work per frame during walking/guiding) with zero
+benefit to what's actually displayed, so it's kept modest on purpose while
+`frame_out` gets the higher-resolution knob. The `raw` stream pin (both
+attempts above) is unrelated to either of these and unaffected — it's
+never sent to Android at all, purely a local hint to libcamera about which
+sensor mode to select; a real point of confusion raised directly by the
+user and clarified in the docs here and in `main.py`'s own comments.
+
+**4. Had to speak very loudly for the edge device's mic to register —
+root-caused, not just tuned around.** The phone's own LOCAL mic path
+(`ContinuousVadRecorder.kt`) captures via `AudioSource.VOICE_COMMUNICATION`,
+which most Android hardware boosts with driver/HAL-level AGC before the
+app ever sees a sample — the VAD's default thresholds
+(`noiseGate=0.012`/`startThreshold=0.018`, `SettingsViewModel.kt`) were
+tuned against that already-boosted level. `RemoteEdgeDevice.kt`'s
+`micFlow` feeds the SAME `ContinuousVadRecorder` state machine/thresholds
+(`externalLoop()`, `ContinuousVadRecorder.kt`) with NO equivalent gain —
+`client/pi_edge/main.py`'s `mic_capture_thread` used a bare
+`sounddevice.InputStream` with zero AGC/gain applied anywhere, and cheap
+USB/HAT mic capsules commonly run quiet to begin with. Same identical
+absolute thresholds against a systematically quieter signal meant
+real-world speech had to be much louder to cross them. Fixed
+Pi-side (source), not by loosening the Android thresholds: `mic_capture_thread`
+now applies a fixed digital gain (`--mic-gain`, default `4.0`, `1.0` =
+off) to every captured sample before it's resampled/queued —
+`np.clip(mono.astype(np.int32) * gain, -32768, 32767).astype(np.int16)`.
+Fixing at the source also improves `mic_out`'s actual audio
+intelligibility for Gemini, not just the VAD's amplitude reading (a
+client-side-only threshold tweak would not have helped the former).
+Tunable per-device via the new CLI flag since real gain need depends on
+the specific mic hardware.
+
+**Verified**: `python3 -m py_compile client/pi_edge/main.py` (syntax);
+`./gradlew :app:compileDebugKotlin` (BUILD SUCCESSFUL, no new warnings);
+installed and launched on the user's actual connected device via `adb`
+from this environment — confirmed the crash (issue 1) no longer
+reproduces (previously an immediate `FATAL EXCEPTION` on every launch
+with the remote-edge toggle on; now launches and reaches the foreground
+UI cleanly). Issues 2-4 are logically root-caused and fixed but **not
+independently re-verified against real audio/camera hardware from this
+environment** (no live Pi rig or YouTube-playback-through-edge-speaker
+test was run here) — worth a real end-to-end check on the next live
+session.
 
 ---
 

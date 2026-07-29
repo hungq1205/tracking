@@ -2,9 +2,10 @@
 
 Raspberry Pi Zero 2 W-side server: streams camera (JPEG + raw luma) and mic
 audio to the Android app over ZMQ (4 fixed media sockets + 1 small control
-socket the phone uses to report its current mode), and plays back whatever
-audio the app sends. The wire protocol is fixed to match the already-built
-Android client
+socket the phone uses to report its current mode + 1 request/response pair
+for a full-resolution OCR still capture), and plays back whatever audio the
+app sends. The wire protocol is fixed to match the already-built Android
+client
 (`client/android/app/src/main/java/com/tracking/client/edge/RemoteEdgeDevice.kt`
 + `AudioMixer.kt`) — see `main.py`'s module docstring for the full
 byte-level format and rationale.
@@ -97,7 +98,7 @@ plugging it in.
 
 ```bash
 python main.py --list-audio-devices     # see what ALSA/PortAudio sees
-python main.py                          # binds 0.0.0.0:5601-5604, auto-picks mic/speaker
+python main.py                          # binds 0.0.0.0:5601-5607, auto-picks mic/speaker
 python main.py --input-device 1 --output-device 1 --log-level DEBUG
 python main.py --audio-in-jitter-ms 150   # bump the speaker's prebuffer if playback still stutters
 ```
@@ -139,9 +140,36 @@ first if this repo isn't checked out at `/home/pi/tracking`.
 - Mic capture tries to open the USB audio adapter directly at 16kHz; if it
   only offers e.g. 44.1/48kHz (common on cheap dongles), falls back to the
   device's native rate and resamples down in software.
+- Mic capture applies a fixed digital gain (`--mic-gain`, default 4.0x)
+  before sending — raw ALSA capture has no AGC, unlike the phone's own
+  local mic path (which uses `AudioSource.VOICE_COMMUNICATION`, boosted by
+  most Android hardware's driver-level AGC before the app ever sees a
+  sample). Without this, the same VAD volume thresholds in the Android
+  app's Settings screen require noticeably louder speech to trigger.
+  Raise if you still have to shout; lower if audio sounds clipped/harsh.
+- Camera capture explicitly pins a `raw` stream at the sensor's full native
+  resolution (`picam2.sensor_resolution`, e.g. 4608x2592 for the IMX708/
+  Camera Module 3) — this stream's pixel data is NEVER sent to Android at
+  all, it exists purely to force libcamera's sensor-mode selection to the
+  full-FOV mode. Confirmed via a real device log that BOTH a lowered
+  `--luma-fps` (13, under the sensor's ~14fps full-FOV-mode ceiling) AND
+  small `main`/`lores` output sizes were NOT enough on their own —
+  libcamera's automatic sensor-mode choice is also driven by the requested
+  OUTPUT resolution, so a small request made it prefer the cheaper,
+  cropped-FOV mode regardless of the fps ceiling. The startup log line
+  reports which sensor mode was actually used (`camera started: ...
+  raw(sensor mode)=...`) — falls back to `unpinned (fallback)` (narrower
+  FOV) only if pinning the exact size fails on your picamera2/libcamera
+  version.
+- `frame_out` (what the Android client displays, `--frame-long-edge`,
+  default 960) and `luma_out` (AngleTracker's own ORB rotation-tracking
+  input, `--luma-long-edge`, default 360) are INDEPENDENT resolutions —
+  raising one doesn't affect the other. Keep `--luma-long-edge` modest on
+  purpose: more pixels there is more ORB-detection work per frame during
+  walking/guiding, with zero benefit to what's actually displayed.
 - `luma_out` is only actually needed by AngleTracker during walking/guiding
   (see `ToolDispatcher.feedAngleLumaFrame()` on the Android side) — every
-  other mode was paying the full 15fps camera/network cost for data the
+  other mode was paying the full 13fps camera/network cost for data the
   phone just discarded. The phone now reports its current mode over a
   small 5th control socket (port 5605), and `main.py` skips capturing/
   sending `luma_out` unless the mode is walking or guiding. Defaults to
@@ -150,6 +178,20 @@ first if this repo isn't checked out at `/home/pi/tracking`.
   reduce the camera's own dual-stream capture cost (picamera2/libcamera
   still produce both streams every request regardless) — only the
   per-frame buffer copy and the network send.
+- **Full-resolution OCR capture** (`ocr_request` port 5606 in,
+  `ocr_frame_out` port 5607 out): even `frame_out`'s own resolution
+  (`--frame-long-edge`, 960 by default) is still a live-preview compromise,
+  not real detail — OCR gets its own on-demand channel instead, a genuine
+  full-sensor-resolution still capture
+  (`--ocr-frame-quality`, default 85, higher than `--frame-quality`'s 50,
+  since this is infrequent/on-demand, not continuous). Triggered by the
+  Android app whenever it needs a sharp frame for OCR; `frame_out`/
+  `luma_out` sending is automatically paused for the duration (both the
+  capture itself, since Picamera2 can't do two things at once, and the
+  network send, so the big still JPEG isn't competing for bandwidth) — see
+  `StreamPauseGate` in `main.py`, which also auto-resumes after 8s
+  regardless, so a failed/lost request can't permanently stall the live
+  view.
 - `audio_in` playback uses an adaptive jitter buffer (`--audio-in-jitter-ms`,
   default 100ms): it waits for that much audio to be queued before the
   speaker starts pulling real audio, absorbing normal network jitter that

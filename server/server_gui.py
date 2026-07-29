@@ -46,6 +46,15 @@ _TAB_BY_CLIENT_MODE = {
     # client was actually doing), now closed.
     "walking": "tab_mapping",
     "scanning": "tab_mapping",
+    # Modes with no server-side RPC activity of their own (reading is
+    # entirely on-device OCR/TTS now, idle has no traffic at all) — map
+    # them explicitly to the Activity Log instead of falling through to
+    # last_category, which used to leave the dashboard stuck showing
+    # whatever tab/frame was last active from an EARLIER session (e.g. a
+    # stale mapping frame from a prior walking session) even though the
+    # client had since switched to a mode with nothing to show.
+    "reading": "tab_log",
+    "idle": "tab_log",
 }
 
 
@@ -511,10 +520,17 @@ def create_ui(activity_monitor) -> gr.Blocks:
             "tracking": {}, "perception": {}, "mapping": {}, "last_category": "",
             "client_mode": "", "client_mode_target": "", "client_mode_at": 0.0, "log": [],
         }
-        tab_id = (
-            _TAB_BY_CLIENT_MODE.get(snap["client_mode"])
-            or _TAB_BY_CATEGORY.get(snap["last_category"], "tab_log")
-        )
+        # Once the client has reported ANY mode via ReportMode, that report
+        # is authoritative and final — never fall back to inferring from
+        # last_category, which can be stale (left over from a differently-
+        # moded earlier session) and would otherwise leave the dashboard
+        # stuck on the wrong tab. Only a client that has never called
+        # ReportMode at all (older build, or no report yet this session)
+        # falls back to the RPC-category inference.
+        if snap["client_mode"]:
+            tab_id = _TAB_BY_CLIENT_MODE.get(snap["client_mode"], "tab_log")
+        else:
+            tab_id = _TAB_BY_CATEGORY.get(snap["last_category"], "tab_log")
 
         # Broad, deliberate try/except around every render call — found
         # investigating a real "dashboard freezes during a long WALKING

@@ -9,7 +9,9 @@ import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -23,6 +25,7 @@ import com.tracking.client.audio.StreamingAudioPlayer
 import com.tracking.client.camera.CameraManager
 import com.tracking.client.device.AndroidDeviceToolHandler
 import com.tracking.client.device.DeviceToolHandler
+import com.tracking.client.device.PlaybackService
 import com.tracking.client.edge.EdgeDevice
 import com.tracking.client.edge.LocalEdgeDevice
 import com.tracking.client.edge.RemoteEdgeDevice
@@ -95,6 +98,15 @@ class LiveAssistantService : LifecycleService() {
     // and the closures below/startLocalTracking() now prefer it whenever
     // remoteEdgeActive, instead of ever touching cameraManager in that case.
     @Volatile private var lastEdgeFrame: ByteArray? = null
+
+    // UI-facing mirror of lastEdgeFrame, populated ONLY while remoteEdgeActive
+    // — MainScreen shows this in place of the phone's own CameraX preview
+    // when a remote edge device supplies the camera. Local mode leaves this
+    // null so MainScreen falls back to the normal PreviewView.
+    private val _edgeFrame = MutableStateFlow<ByteArray?>(null)
+    val edgeFrame: StateFlow<ByteArray?> = _edgeFrame
+    private val _isRemoteEdgeActive = MutableStateFlow(false)
+    val isRemoteEdgeActive: StateFlow<Boolean> = _isRemoteEdgeActive
 
     // Voice-message-sent confirmation cue — a synthesized ToneGenerator
     // tone, not a bundled audio asset, same "works with no sound file
@@ -202,28 +214,6 @@ class LiveAssistantService : LifecycleService() {
     private val _uiState = MutableStateFlow(AppUiState())
     val uiState: StateFlow<AppUiState> = _uiState
 
-    // Non-null video id means "show/update the embedded YouTube IFrame
-    // player with this video" (MainScreen observes this via MainViewModel);
-    // null means no YouTube video is currently requested to play. See
-    // ToolDispatcher's onPlayYoutubeVideo/onStopYoutubeVideo callbacks and
-    // CLAUDE.md's YouTube playback note (the IFrame player can only
-    // actually play while this UI is visible in the foreground — a real,
-    // accepted ToS-driven limitation, not a bug).
-    private val _pendingYoutubeVideoId = MutableStateFlow<String?>(null)
-    val pendingYoutubeVideoId: StateFlow<String?> = _pendingYoutubeVideoId
-
-    // Real IFrame player PLAYING/paused state, reported from MainScreen.kt's
-    // onStateChange (the actual YouTubePlayer instance lives in Compose, not
-    // reachable from here). Replaces "_pendingYoutubeVideoId != null" as the
-    // isOutputActive() signal below — a real bug found via user report: a
-    // loaded-but-PAUSED video (e.g. ducked while awaiting a response, or the
-    // user paused it via the on-screen controls) kept _pendingYoutubeVideoId
-    // non-null indefinitely, permanently engaging the 3x VAD threshold
-    // multiplier even with nothing actually audible — reported as "the VAD
-    // is too strong, I have to scream."
-    private val _isYoutubePlaying = MutableStateFlow(false)
-    fun reportYoutubePlaybackState(isPlaying: Boolean) { _isYoutubePlaying.value = isPlaying }
-
     private var isLocalTrackingActive = false
     private var lastTrackingUpdateMs = 0L
     private val trackingIntervalMs = 143L // cap local ORB tracking at ~7 fps
@@ -283,7 +273,11 @@ class LiveAssistantService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        startForeground(NOTIF_ID, buildNotification())
+        startForeground(
+            NOTIF_ID, buildNotification(),
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA,
+        )
         if (intent == null) {
             // A null Intent here specifically means the system restarted
             // this Service after the process was killed (START_STICKY) —
@@ -387,6 +381,8 @@ class LiveAssistantService : LifecycleService() {
         edgeDevice.disconnect()
         audioMixer.stop()
         remoteEdgeActive = useRemote && edgeHost.isNotBlank()
+        _isRemoteEdgeActive.value = remoteEdgeActive
+        _edgeFrame.value = null
         edgeDevice = if (remoteEdgeActive) {
             RemoteEdgeDevice(edgeHost)
         } else {
@@ -396,6 +392,21 @@ class LiveAssistantService : LifecycleService() {
         if (remoteEdgeActive) {
             audioMixer.onMixedChunk = { bytes -> edgeDevice.emitAudio(bytes) }
             audioMixer.start()
+            // Radio/music/resolved-YouTube-stream playback (PlaybackService's
+            // own ExoPlayer, including play_youtube_video now — see
+            // ToolDispatcher.toolPlayYoutubeVideo()/YouTubeStreamResolver.kt;
+            // the old WebView-based IFrame player, and the MediaProjection/
+            // AudioPlaybackCaptureConfiguration system-audio-capture path it
+            // needed, were both removed outright per direct user request)
+            // taps its PCM directly — a real, fully-controlled path, no OS
+            // consent dialog, no uncertainty about which AudioAttributes
+            // usage a capture filter needs to match. See PlaybackService.kt's
+            // TeeRenderersFactory.
+            PlaybackService.onPcmTapped = { pcm, rate, channels ->
+                audioMixer.feedExoAudio(pcm, rate, channels)
+            }
+        } else {
+            PlaybackService.onPcmTapped = null
         }
     }
 
@@ -474,6 +485,16 @@ class LiveAssistantService : LifecycleService() {
                 }
             },
             blurSharpnessThreshold = blurSharpnessThreshold.toDouble(),
+            // Full-resolution OCR capture channel — only meaningful (and
+            // only wired) for a remote edge device; the phone's own local
+            // camera already gives acquireSharpFrame() a real frame via
+            // latestFrame()/latestFrameWithSharpness() above with no
+            // separate request/response round trip needed. Passing null
+            // here for the local case means acquireSharpFrame() skips this
+            // path entirely rather than awaiting-and-timing-out on every
+            // single OCR call for nothing.
+            ocrFrameFlow = if (remoteEdgeActive) edgeDevice.ocrFrameFlow else null,
+            requestOcrFrame = { edgeDevice.requestOcrFrame() },
             saveDebugFrame = if (saveDebugOcrFrames) { jpeg ->
                 lifecycleScope.launch(Dispatchers.IO) {
                     try {
@@ -487,8 +508,6 @@ class LiveAssistantService : LifecycleService() {
             geminiCorrectionClient = geminiCorrectionClient,
             geminiObjectDescriptionClient = geminiObjectDescriptionClient,
             youtubeSearchClient = youtubeSearchClient,
-            onPlayYoutubeVideo = { videoId -> _pendingYoutubeVideoId.value = videoId },
-            onStopYoutubeVideo = { _pendingYoutubeVideoId.value = null; _isYoutubePlaying.value = false },
             reportModeToEdge = { mode -> edgeDevice.reportMode(mode) },
             playObstacleBeep = { playObstacleBeep() },
         )
@@ -523,20 +542,17 @@ class LiveAssistantService : LifecycleService() {
         // Output-aware VAD gating (defense-in-depth on top of the real
         // AEC ContinuousVadRecorder itself sets up) — covers every audio
         // output source in this app: Gemini's own spoken reply + reading
-        // TTS (streamingPlayer), Pixie's own audio cue, PlaybackService's
-        // music, and the YouTube overlay — the latter via _isYoutubePlaying
-        // (the actual IFrame player's PLAYING state, reported from
-        // MainScreen.kt's onStateChange), not merely whether a video is
-        // loaded — a loaded-but-paused video must NOT keep the 3x threshold
-        // multiplier engaged forever. See CLAUDE.md's "Self-echo / output-
-        // aware VAD gating" note.
+        // TTS (streamingPlayer), Pixie's own audio cue, and PlaybackService's
+        // music/radio/YouTube playback (the old separate _isYoutubePlaying
+        // signal is gone — YouTube now plays through PlaybackService like
+        // everything else, so PlaybackService.isPlaying already covers it).
+        // See CLAUDE.md's "Self-echo / output-aware VAD gating" note.
         vadRecorder.start(
             startThreshold, vadThreshold,
             isOutputActive = {
                 streamingPlayer.isPlaying.value ||
                     pixieController.isEmitting ||
-                    com.tracking.client.device.PlaybackService.isPlaying.value ||
-                    _isYoutubePlaying.value
+                    com.tracking.client.device.PlaybackService.isPlaying.value
             },
             // Remote edge device's mic replaces local AudioRecord capture
             // entirely when active — LocalEdgeDevice.micFlow is an unused
@@ -566,8 +582,8 @@ class LiveAssistantService : LifecycleService() {
         responseWaitJob?.cancel(); responseWaitJob = null
         grpcManager.disconnect()
         sessionState.reset()
-        _pendingYoutubeVideoId.value = null
-        _isYoutubePlaying.value = false
+        _edgeFrame.value = null
+        _isRemoteEdgeActive.value = false
         _uiState.update {
             it.copy(
                 isVadActive = false, isRecording = false, isAwaitingResponse = false,
@@ -640,6 +656,7 @@ class LiveAssistantService : LifecycleService() {
                 .catch { e -> appendSystemMessage("[Flow error] ${e.message}") }
                 .collect { jpegBytes ->
                     lastEdgeFrame = jpegBytes
+                    if (remoteEdgeActive) _edgeFrame.value = jpegBytes
                     val mappingModeActive = sessionState.mode == "guiding" || sessionState.mode == "walking" || sessionState.mode == "scanning"
                     cameraManager.mappingMode = if (mappingModeActive) sessionState.mode else ""
                     if (mappingModeActive) {
@@ -958,10 +975,6 @@ class LiveAssistantService : LifecycleService() {
 
     fun clearError() { _uiState.update { it.copy(error = null) } }
 
-    /** Manual on-screen dismissal of the embedded YouTube player — distinct
-     * from ToolDispatcher's onStopYoutubeVideo (voice-driven stop_music),
-     * but has the same effect on this StateFlow. */
-    fun dismissYoutubeVideo() { _pendingYoutubeVideoId.value = null; _isYoutubePlaying.value = false }
 
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return

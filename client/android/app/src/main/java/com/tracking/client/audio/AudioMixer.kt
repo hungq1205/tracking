@@ -5,12 +5,15 @@ import java.nio.ByteOrder
 import kotlin.math.min
 
 /**
- * Combines two independent PCM sources — Gemini Live's own spoken voice
- * (mono 16-bit @24kHz, irregular server-timed chunks, fed via [feedVoice])
- * and Pixie's rendered HRTF cue (stereo 16-bit @44.1kHz, fixed ~46ms
- * chunks, fed via [feedPixie]) — into one stereo 16-bit @44.1kHz stream for
- * [emitMixed], so a remote edge device's single speaker gets ONE combined
- * feed instead of two independently-timed ones. See CLAUDE.md's "Edge
+ * Combines up to three independent PCM sources — Gemini Live's own spoken
+ * voice (mono 16-bit @24kHz, irregular server-timed chunks, fed via
+ * [feedVoice]), Pixie's rendered HRTF cue (stereo 16-bit @44.1kHz, fixed
+ * ~46ms chunks, fed via [feedPixie]), and PlaybackService's ExoPlayer output
+ * — radio/music/YouTube, tapped directly off its own audio pipeline via a
+ * TeeAudioProcessor, fed via [feedExoAudio] — into one stereo 16-bit
+ * @44.1kHz stream for [emitMixed], so a remote edge device's
+ * single speaker gets ONE combined feed instead of several independently-
+ * timed ones. See CLAUDE.md's "Edge
  * device: local vs. remote (ZMQ)" note for why this exists — a real
  * Raspberry-Pi-class edge device only has one speaker, so the phone (which
  * already renders both sources for its own local dual-AudioTrack playback)
@@ -57,6 +60,11 @@ class AudioMixer {
     // feed() calls/sec, one drain/tick).
     private val voiceQueue = ArrayDeque<Short>()
     private val pixieQueue = ArrayDeque<Short>()
+    // System-audio capture (MediaProjection/AudioPlaybackCaptureConfiguration
+    // — e.g. YouTube's IFrame-player output, see LiveAssistantService's
+    // startSystemAudioCapture()). Already stereo @SAMPLE_RATE straight off
+    // the AudioRecord, so — like feedPixie — no resample needed on ingest.
+    private val systemQueue = ArrayDeque<Short>()
     private val lock = Any()
 
     @Volatile private var running = false
@@ -65,7 +73,7 @@ class AudioMixer {
     fun start() {
         if (running) return
         running = true
-        synchronized(lock) { voiceQueue.clear(); pixieQueue.clear() }
+        synchronized(lock) { voiceQueue.clear(); pixieQueue.clear(); systemQueue.clear() }
         thread = Thread({ tickLoop() }, "AudioMixer").also { it.isDaemon = true; it.start() }
     }
 
@@ -73,7 +81,7 @@ class AudioMixer {
         running = false
         thread?.join(300)
         thread = null
-        synchronized(lock) { voiceQueue.clear(); pixieQueue.clear() }
+        synchronized(lock) { voiceQueue.clear(); pixieQueue.clear(); systemQueue.clear() }
     }
 
     /** [pcm]: mono 16-bit LE PCM @[VOICE_SAMPLE_RATE] (Gemini's own voice chunk). */
@@ -96,6 +104,32 @@ class AudioMixer {
         }
     }
 
+    /** [pcm]: 16-bit LE PCM at an ARBITRARY [srcRate]/[channelCount] (mono or
+     * stereo) — the format PlaybackService's TeeAudioProcessor tap actually
+     * hands over, which is whatever ExoPlayer's sink negotiated for the
+     * current stream (often the source's own native rate, not [SAMPLE_RATE]).
+     * Every playback source that can reach a remote edge device — radio,
+     * music, and now YouTube (see PlaybackService.kt's TeeRenderersFactory
+     * and ToolDispatcher.toolPlayYoutubeVideo()) — funnels through
+     * PlaybackService's single ExoPlayer, so this is the only "other
+     * playback audio" feed this mixer needs; there is no separate system-
+     * wide capture path any more. */
+    fun feedExoAudio(pcm: ByteArray, srcRate: Int, channelCount: Int) {
+        if (!running) return
+        val stereo = if (srcRate == SAMPLE_RATE && channelCount == 2) {
+            val buf = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN)
+            ShortArray(pcm.size / 2) { buf.short }
+        } else if (channelCount == 1) {
+            resampleMonoToStereo(pcm, srcRate, SAMPLE_RATE)
+        } else {
+            resampleStereoToStereo(pcm, srcRate, SAMPLE_RATE)
+        }
+        synchronized(lock) {
+            for (s in stereo) systemQueue.addLast(s)
+            dropExcess(systemQueue)
+        }
+    }
+
     private fun dropExcess(q: ArrayDeque<Short>) {
         while (q.size > MAX_QUEUED_FRAMES * 2) q.removeFirst() // *2: interleaved stereo shorts
     }
@@ -106,11 +140,12 @@ class AudioMixer {
             val start = System.currentTimeMillis()
             val voice = drain(voiceQueue, framesPerTick)
             val pixie = drain(pixieQueue, framesPerTick)
+            val system = drain(systemQueue, framesPerTick)
 
             var anyNonZero = false
             val out = ByteBuffer.allocate(framesPerTick * 2).order(ByteOrder.LITTLE_ENDIAN)
             for (i in 0 until framesPerTick) {
-                val v = (voice.getOrElse(i) { 0 }) + (pixie.getOrElse(i) { 0 })
+                val v = (voice.getOrElse(i) { 0 }) + (pixie.getOrElse(i) { 0 }) + (system.getOrElse(i) { 0 })
                 if (v != 0) anyNonZero = true
                 out.putShort(v.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort())
             }
@@ -149,6 +184,32 @@ class AudioMixer {
             val v = (s0 + (s1 - s0) * frac).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
             out[2 * i] = v
             out[2 * i + 1] = v
+        }
+        return out
+    }
+
+    /** Interleaved stereo @[srcRate] -> stereo @[dstRate], linear interpolation
+     * per channel (same technique as [resampleMonoToStereo], just without the
+     * mono->stereo duplication step). */
+    private fun resampleStereoToStereo(pcm: ByteArray, srcRate: Int, dstRate: Int): ShortArray {
+        val inBuf = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN)
+        val inFrames = pcm.size / 4 // 2 channels * 16-bit
+        if (inFrames == 0) return ShortArray(0)
+        val left = ShortArray(inFrames)
+        val right = ShortArray(inFrames)
+        for (i in 0 until inFrames) { left[i] = inBuf.short; right[i] = inBuf.short }
+        val ratio = srcRate.toDouble() / dstRate
+        val outFrames = (inFrames / ratio).toInt().coerceAtLeast(0)
+        val out = ShortArray(outFrames * 2)
+        for (i in 0 until outFrames) {
+            val srcPos = i * ratio
+            val idx = srcPos.toInt().coerceIn(0, inFrames - 1)
+            val frac = srcPos - idx
+            val nextIdx = min(idx + 1, inFrames - 1)
+            val l = (left[idx] + (left[nextIdx] - left[idx]) * frac).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+            val r = (right[idx] + (right[nextIdx] - right[idx]) * frac).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+            out[2 * i] = l
+            out[2 * i + 1] = r
         }
         return out
     }

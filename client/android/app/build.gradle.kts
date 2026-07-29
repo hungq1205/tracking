@@ -10,7 +10,11 @@ android {
 
     defaultConfig {
         applicationId = "com.tracking.client"
-        minSdk = 26
+        // Bumped 26 -> 29: AudioPlaybackCaptureConfiguration/MediaProjection
+        // (system-audio capture, so YouTube's audio can reach a remote edge
+        // device's speaker) requires API 29+ — see LiveAssistantService's
+        // startSystemAudioCapture().
+        minSdk = 29
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
@@ -103,13 +107,17 @@ dependencies {
     // PUSH/PULL audio/frame link a real Pi-Zero-2 edge device would use.
     implementation("org.zeromq:jeromq:0.6.0")
 
-    // Official ToS-compliant YouTube IFrame player — play_youtube_video
-    // tool (see ToolDeclarations.kt/YouTubeSearchClient.kt). Deliberately
-    // NOT a raw stream-URL resolver: this needs a visible on-screen player
-    // (MainScreen.kt), a real, accepted limitation vs. play_video's
-    // headless PlaybackService/ExoPlayer path — see CLAUDE.md's YouTube
-    // playback note.
-    implementation("com.pierfrancescosoffritti.androidyoutubeplayer:core:12.1.0")
+    // Resolves a YouTube video id to a direct playable audio stream URL —
+    // play_youtube_video now plays through PlaybackService/ExoPlayer (the
+    // SAME headless path play_video/play_radio already use), not the
+    // official WebView-based IFrame player (removed outright) — per direct
+    // user request, accepting the ToS tradeoff the IFrame player was
+    // originally chosen to avoid, so YouTube audio is a real PCM tap
+    // (TeeRenderersFactory, see PlaybackService.kt) reaching a remote edge
+    // device instead of only ever being capturable via the unreliable
+    // MediaProjection/AudioPlaybackCaptureConfiguration system-audio path a
+    // WebView player left as the only option.
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.24.4")
 
     // Raw WebSocket client for GeminiLiveClient — grpc-okhttp shades its own
     // okhttp internally (doesn't expose okhttp3.* on the compile classpath),

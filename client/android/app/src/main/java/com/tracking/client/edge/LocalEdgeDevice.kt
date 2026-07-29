@@ -26,6 +26,11 @@ class LocalEdgeDevice(
     // actually populates this.
     override val micFlow: SharedFlow<ByteArray> = MutableSharedFlow()
 
+    // Unused/empty: local OCR just pulls a fresh frame from CameraManager on
+    // demand (see ToolDispatcher's acquireSharpFrame()) — no separate
+    // request/response round trip needed when the camera's already local.
+    override val ocrFrameFlow: SharedFlow<ByteArray> = MutableSharedFlow()
+
     private val _audioFlow = MutableSharedFlow<ByteArray>(
         extraBufferCapacity = 64,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,

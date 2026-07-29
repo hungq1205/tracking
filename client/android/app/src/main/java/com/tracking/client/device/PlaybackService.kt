@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
@@ -14,13 +15,60 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.TeeAudioProcessor
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import java.nio.ByteBuffer
 
 class PlaybackService : Service() {
 
     private var player: ExoPlayer? = null
+
+    /** Taps ExoPlayer's own decoded PCM output — bypasses the unreliable
+     * system-wide MediaProjection/AudioPlaybackCaptureConfiguration capture
+     * path entirely for THIS source (radio/music/resolved-YouTube-stream
+     * playback, all of which run through this Service's ExoPlayer). Real,
+     * fully-controlled tap point vs. capturing a copy of whatever the OS
+     * decides matches a USAGE filter system-wide — see LiveAssistantService's
+     * startSystemAudioCapture() for the (separate, still-needed-for-the-
+     * WebView-based-YouTube-IFrame-player) MediaProjection path, which has
+     * no equivalent direct tap since a WebView exposes no raw PCM callback. */
+    private inner class RemoteEdgeTeeSink : TeeAudioProcessor.AudioBufferSink {
+        private var rate = 0
+        private var channels = 0
+        override fun flush(sampleRateHz: Int, channelCount: Int, encoding: Int) {
+            rate = sampleRateHz
+            channels = channelCount
+        }
+        override fun handleBuffer(buffer: ByteBuffer) {
+            if (rate <= 0 || channels <= 0) return
+            val cb = onPcmTapped ?: return
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            cb(bytes, rate, channels)
+        }
+    }
+
+    private inner class TeeRenderersFactory : DefaultRenderersFactory(this) {
+        override fun buildAudioSink(
+            context: Context,
+            enableFloatOutput: Boolean,
+            enableAudioTrackPlaybackParams: Boolean,
+        ): AudioSink {
+            val tee = TeeAudioProcessor(RemoteEdgeTeeSink())
+            return DefaultAudioSink.Builder(context)
+                .setEnableFloatOutput(enableFloatOutput)
+                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                .setAudioProcessorChain(
+                    DefaultAudioSink.DefaultAudioProcessorChain(tee)
+                )
+                .build()
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Ducking while the user speaks (PTT held) — see
@@ -46,7 +94,7 @@ class PlaybackService : Service() {
         val channel   = intent.getStringExtra("channel") ?: ""
 
         player?.release()
-        val newPlayer = ExoPlayer.Builder(this)
+        val newPlayer = ExoPlayer.Builder(this, TeeRenderersFactory())
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
@@ -148,5 +196,11 @@ class PlaybackService : Service() {
         // doc comment) can check this without needing a bound connection.
         private val _isPlaying = MutableStateFlow(false)
         val isPlaying: StateFlow<Boolean> = _isPlaying
+
+        // Process-wide, same reasoning as _isPlaying above — set by
+        // LiveAssistantService.configureEdgeDevice() only while a remote
+        // edge device is active; (pcm, sampleRateHz, channelCount) straight
+        // off TeeRenderersFactory's tap, forwarded into AudioMixer.feedExoAudio().
+        @Volatile var onPcmTapped: ((ByteArray, Int, Int) -> Unit)? = null
     }
 }
