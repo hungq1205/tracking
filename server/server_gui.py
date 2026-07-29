@@ -515,6 +515,18 @@ def _client_mode_text(snap: dict) -> str:
 
 
 def create_ui(activity_monitor) -> gr.Blocks:
+    # Tracks the last AUTO-computed tab across polls (not necessarily what's
+    # actually selected — the user is free to click a different tab in
+    # between polls). Without this, every single 0.5s tick unconditionally
+    # sent gr.update(selected=tab_id) — even when tab_id hadn't changed at
+    # all — which fights any manual tab click: Gradio applies the update on
+    # its next poll regardless of what the user just clicked, snapping the
+    # UI back within half a second and making manual navigation impossible.
+    # Only pushing a selection update when the computed tab actually CHANGES
+    # (a real mode/activity transition) lets a user freely browse other tabs
+    # the rest of the time, while still auto-following real transitions.
+    last_auto_tab_id = ["tab_log"]
+
     def _poll():
         snap = activity_monitor.snapshot() if activity_monitor is not None else {
             "tracking": {}, "perception": {}, "mapping": {}, "last_category": "",
@@ -547,6 +559,15 @@ def create_ui(activity_monitor) -> gr.Blocks:
         else:
             tab_id = mode_tab or category_tab or "tab_log"
 
+        # Only emit a real tab-selection update on an actual transition —
+        # see last_auto_tab_id's own comment above for why. gr.update()
+        # (no args) leaves whatever tab the user currently has open alone.
+        if tab_id != last_auto_tab_id[0]:
+            last_auto_tab_id[0] = tab_id
+            tabs_update = gr.update(selected=tab_id)
+        else:
+            tabs_update = gr.update()
+
         # Broad, deliberate try/except around every render call — found
         # investigating a real "dashboard freezes during a long WALKING
         # session" report: _render_occupancy already guarded itself this
@@ -568,7 +589,7 @@ def create_ui(activity_monitor) -> gr.Blocks:
             occupancy_fig = gr.update()
 
         return (
-            gr.update(selected=tab_id),
+            tabs_update,
             _client_mode_text(snap),
             _annotate_tracking(snap["tracking"]),
             _tracking_status(snap["tracking"]),

@@ -97,6 +97,15 @@ class ToolDispatcher(
     // latestFrame()/latestFrameWithSharpness() path, unchanged.
     private val ocrFrameFlow: SharedFlow<ByteArray>? = null,
     private val requestOcrFrame: () -> Unit = {},
+    // Local-camera counterpart to ocrFrameFlow above — CameraManager keeps
+    // the latest full-sensor-resolution bitmap around and encodes it at
+    // high quality only on demand (CameraManager.captureFullResFrame()),
+    // instead of the 640px/quality-50 JPEG every other consumer
+    // (latestFrame()/latestFrameWithSharpness(), used for run_detection/
+    // hazard checks/tracking-init) gets. null (e.g. no camera bound yet)
+    // just falls through to the existing downscaled path, same degrade as
+    // ocrFrameFlow's own timeout/null case.
+    private val captureFullResFrame: (() -> ByteArray?)? = null,
     // Debug-only: when non-null, toolScanCurrentView() draws each OCR
     // line's kept/dropped box onto the frame (see DebugFrameStore.kt) and
     // hands the annotated JPEG to this callback — MainViewModel wires it to
@@ -868,7 +877,7 @@ class ToolDispatcher(
         }
         if (blurSharpnessThreshold <= 0.0) {
             val f = latestFrame() ?: return SharpFrameResult(null, null, 0, false)
-            return SharpFrameResult(f, null, 0, false)
+            return SharpFrameResult(fullResOrFallback(f), null, 0, false)
         }
         var sample = latestFrameWithSharpness() ?: return SharpFrameResult(null, null, 0, true)
         var attempts = 0
@@ -878,8 +887,20 @@ class ToolDispatcher(
             sample = latestFrameWithSharpness() ?: return SharpFrameResult(null, sample.second, attempts, true)
         }
         val skipped = sample.second < blurSharpnessThreshold
-        return SharpFrameResult(if (skipped) null else sample.first, sample.second, attempts, skipped)
+        val jpeg = if (skipped) null else fullResOrFallback(sample.first)
+        return SharpFrameResult(jpeg, sample.second, attempts, skipped)
     }
+
+    /** Swaps in a full-sensor-resolution capture of the CURRENT frame when
+     * one's available (local camera only — captureFullResFrame is null for
+     * a remote edge device, which already took the ocrFrameFlow branch
+     * above) instead of [downscaledFallback] (the 640px/quality-50 JPEG
+     * every other consumer gets). The full-res grab happens a beat after
+     * the sharpness sample above, from whatever CameraManager currently
+     * holds — a negligible, accepted timing gap, same class of looseness
+     * as this codebase's other "close enough" frame-freshness choices. */
+    private fun fullResOrFallback(downscaledFallback: ByteArray): ByteArray =
+        captureFullResFrame?.invoke() ?: downscaledFallback
 
     private suspend fun toolScanCurrentView(): JSONObject {
         ensureReadingMode()

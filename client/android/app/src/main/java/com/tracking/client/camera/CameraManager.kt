@@ -220,6 +220,38 @@ class CameraManager(private val context: Context) {
         if (toUnbind.isNotEmpty()) cameraProvider?.unbind(*toUnbind.toTypedArray())
         boundPreview = null
         boundAnalysis = null
+        synchronized(fullResLock) {
+            lastFullResBitmap?.recycle()
+            lastFullResBitmap = null
+        }
+    }
+
+    private val fullResLock = Any()
+    private var lastFullResBitmap: Bitmap? = null
+
+    private fun updateFullResBitmap(newBitmap: Bitmap) {
+        synchronized(fullResLock) {
+            lastFullResBitmap?.recycle()
+            lastFullResBitmap = newBitmap
+        }
+    }
+
+    /** Encodes the CURRENT frame at full sensor resolution and high quality
+     * (92, no downscale) — for OCR, which needs real text detail unlike the
+     * 640px/quality-50 encoding [streamJpeg] produces for every other
+     * consumer (frameFlow/recentBuffer/clearestRecentFrame). On-demand
+     * only — nothing encodes this per-frame, since it's only ever needed
+     * for the rare OCR capture, not every analyzed frame. Returns null if
+     * no frame has arrived yet or the held bitmap was concurrently
+     * recycled/replaced (unbind() racing this call). */
+    fun captureFullResFrame(): ByteArray? {
+        synchronized(fullResLock) {
+            val bmp = lastFullResBitmap ?: return null
+            if (bmp.isRecycled) return null
+            val baos = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, 92, baos)
+            return baos.toByteArray()
+        }
     }
 
     /**
@@ -289,6 +321,16 @@ class CameraManager(private val context: Context) {
             // this same object, when rotation was 0, or a freshly-created one).
             if (rotated !== bitmap) bitmap.recycle()
 
+            // Full sensor resolution, no downscale — kept around (replacing
+            // whichever was held before, recycled) so captureFullResFrame()
+            // can encode it on demand at high quality, for OCR — unlike
+            // streamJpeg() below, which downsamples EVERY frame to 640px/
+            // quality 50 for the mapping/tracking pipeline (real text
+            // detail would be lost at that size/quality). Cheap to hold: no
+            // extra JPEG encoding happens here, only on the rare on-demand
+            // captureFullResFrame() call.
+            updateFullResBitmap(rotated)
+
             if (doRecord) {
                 lastRecordFrameTimeMs = now
                 // imageInfo.timestamp is the sensor's boot-time nanosecond clock —
@@ -303,7 +345,10 @@ class CameraManager(private val context: Context) {
             // computed once and shared by both selection policies below.
             val sharpness = computeSharpness(rotated)
             val jpeg = streamJpeg(rotated)
-            rotated.recycle()
+            // rotated is NOT recycled here any more — updateFullResBitmap()
+            // above now owns it (recycled whenever the NEXT frame replaces
+            // it, or on shutdown), so captureFullResFrame() has something
+            // valid to encode from on demand.
             if (!loggedOnce) {
                 Log.d("CameraManager", "First frame encoded: ${jpeg.size} bytes (sharpness=$sharpness)")
                 loggedOnce = true

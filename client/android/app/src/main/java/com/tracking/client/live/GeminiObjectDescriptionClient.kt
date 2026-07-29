@@ -103,14 +103,17 @@ class GeminiObjectDescriptionClient(private val apiKey: String, private val mode
             "words as possible. This description is mainly used to compare objects to each other " +
             "via embeddings, not read verbatim to a user — so it only needs to be distinctive " +
             "enough for that, not exhaustive.\n\n" +
-            "Output EXACTLY one short phrase (3-6 words), covering ONLY:\n" +
-            "- object/entity type\n" +
+            "Output EXACTLY one short phrase (3-5 words), covering ONLY:\n" +
+            "- color(s)\n" +
             "- shape/size\n" +
-            "- color(s)\n\n" +
-            "Nothing else. Do NOT include material, pattern, logos/labels, pose/posture, " +
-            "background/setting, actions, or any sentence-level narration. Do NOT use the object's " +
-            "given name/label in the description. Two different objects of the same type/shape/color " +
-            "describing near-identically is fine and expected.\n\n" +
+            "- object/entity type\n\n" +
+            "Nothing else, ever. Do NOT include material, pattern, printed/illustrated imagery or " +
+            "content (e.g. what a picture/character/design ON the object depicts), text, logos/labels, " +
+            "pose/posture, background/setting, actions, or any sentence-level narration. Do NOT " +
+            "describe any sub-detail, decoration, or distinguishing feature beyond color+shape+type " +
+            "even if it seems visually salient. Do NOT use the object's given name/label in the " +
+            "description. Two different objects of the same type/shape/color describing " +
+            "near-identically is fine and expected — that is the desired behavior, not a failure.\n\n" +
             "Output only the phrase itself — no punctuation-only sentence wrapper, no explanations, " +
             "no markdown, no quotes."
         )

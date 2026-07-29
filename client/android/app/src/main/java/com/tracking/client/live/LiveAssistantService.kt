@@ -503,6 +503,7 @@ class LiveAssistantService : LifecycleService() {
             // single OCR call for nothing.
             ocrFrameFlow = if (remoteEdgeActive) edgeDevice.ocrFrameFlow else null,
             requestOcrFrame = { edgeDevice.requestOcrFrame() },
+            captureFullResFrame = if (remoteEdgeActive) null else ({ cameraManager.captureFullResFrame() }),
             saveDebugFrame = if (saveDebugOcrFrames) { jpeg ->
                 lifecycleScope.launch(Dispatchers.IO) {
                     try {
