@@ -108,6 +108,14 @@ class LiveAssistantService : LifecycleService() {
     private val _isRemoteEdgeActive = MutableStateFlow(false)
     val isRemoteEdgeActive: StateFlow<Boolean> = _isRemoteEdgeActive
 
+    // Live "what did OCR just look at" preview — every frame ToolDispatcher
+    // actually sends to OCR.space (scan_current_view()/live-reading) lands
+    // here so MainScreen can show it on the phone's own screen instead of
+    // the scan happening invisibly — same StateFlow-mirror pattern as
+    // edgeFrame above, just always-on rather than remote-edge-gated.
+    private val _ocrFrame = MutableStateFlow<ByteArray?>(null)
+    val ocrFrame: StateFlow<ByteArray?> = _ocrFrame
+
     // Voice-message-sent confirmation cue — a synthesized ToneGenerator
     // tone, not a bundled audio asset, same "works with no sound file
     // supplied" precedent as ToolDispatcher's playDeadEndAlert(). Played
@@ -505,6 +513,7 @@ class LiveAssistantService : LifecycleService() {
                     }
                 }
             } else null,
+            onOcrFrame = { jpeg -> _ocrFrame.value = jpeg },
             geminiCorrectionClient = geminiCorrectionClient,
             geminiObjectDescriptionClient = geminiObjectDescriptionClient,
             youtubeSearchClient = youtubeSearchClient,
@@ -583,6 +592,7 @@ class LiveAssistantService : LifecycleService() {
         grpcManager.disconnect()
         sessionState.reset()
         _edgeFrame.value = null
+        _ocrFrame.value = null
         _isRemoteEdgeActive.value = false
         _uiState.update {
             it.copy(

@@ -70,6 +70,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         .flatMapLatest { service -> service?.isRemoteEdgeActive ?: flowOf(false) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
+    /** Latest JPEG frame actually sent to OCR.space (scan_current_view()/
+     * live-reading) — null when nothing has been scanned yet this session.
+     * MainScreen overlays this so reading-mode scans are visible on screen
+     * instead of happening invisibly. */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val ocrFrame: StateFlow<ByteArray?> = _boundService
+        .flatMapLatest { service -> service?.ocrFrame ?: flowOf(null) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
     /** Exposed only for [attachCameraPreview]'s reuse of CameraManager's own
      * pending-attach fallback — not read directly by the UI layer any more. */
     private val cameraManager: CameraManager?

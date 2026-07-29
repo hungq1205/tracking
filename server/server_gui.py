@@ -520,17 +520,32 @@ def create_ui(activity_monitor) -> gr.Blocks:
             "tracking": {}, "perception": {}, "mapping": {}, "last_category": "",
             "client_mode": "", "client_mode_target": "", "client_mode_at": 0.0, "log": [],
         }
-        # Once the client has reported ANY mode via ReportMode, that report
-        # is authoritative and final — never fall back to inferring from
-        # last_category, which can be stale (left over from a differently-
-        # moded earlier session) and would otherwise leave the dashboard
-        # stuck on the wrong tab. Only a client that has never called
-        # ReportMode at all (older build, or no report yet this session)
-        # falls back to the RPC-category inference.
-        if snap["client_mode"]:
-            tab_id = _TAB_BY_CLIENT_MODE.get(snap["client_mode"], "tab_log")
+        # Two competing signals, pick whichever is more RECENT rather than
+        # always preferring client_mode outright:
+        #  - client_mode (ReportMode) — authoritative for which mode the
+        #    client is in, but some modes (reading, idle) generate no
+        #    server RPCs of their own, and ad-hoc queries (run_detection/
+        #    check_obstacle via the Perception tab) can fire in ANY mode
+        #    without a matching ReportMode call.
+        #  - last_category — whichever RPC bucket most recently got real
+        #    traffic; correct in the moment an ad-hoc query lands, but
+        #    goes stale (keeps pointing at an old tab) once that traffic
+        #    stops and the client has since moved to a different mode.
+        # Always preferring client_mode (a prior version of this) hid
+        # perception activity entirely once ANY mode had ever been
+        # reported; always preferring last_category is what originally
+        # left the dashboard stuck on a stale tab during modes with no
+        # RPCs of their own. Comparing timestamps gets both right: a
+        # fresh perception call after the last mode report shows
+        # Perception; once that traffic goes quiet, the next poll (no new
+        # RPC, same last_at) falls back to whatever mode was reported,
+        # even if that report itself is old.
+        mode_tab = _TAB_BY_CLIENT_MODE.get(snap["client_mode"]) if snap["client_mode"] else None
+        category_tab = _TAB_BY_CATEGORY.get(snap["last_category"])
+        if mode_tab and category_tab and snap.get("last_at", 0.0) > snap.get("client_mode_at", 0.0):
+            tab_id = category_tab
         else:
-            tab_id = _TAB_BY_CATEGORY.get(snap["last_category"], "tab_log")
+            tab_id = mode_tab or category_tab or "tab_log"
 
         # Broad, deliberate try/except around every render call — found
         # investigating a real "dashboard freezes during a long WALKING

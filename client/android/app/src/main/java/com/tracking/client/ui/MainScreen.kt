@@ -3,19 +3,24 @@ package com.tracking.client.ui
 import android.graphics.BitmapFactory
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -23,6 +28,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.delay
 
 @Composable
 fun MainScreen(
@@ -31,6 +37,7 @@ fun MainScreen(
 ) {
     val isRemoteEdgeActive by viewModel.isRemoteEdgeActive.collectAsState()
     val edgeFrame by viewModel.edgeFrame.collectAsState()
+    val ocrFrame by viewModel.ocrFrame.collectAsState()
 
     // Frame capture runs continuously against LiveAssistantService's own
     // lifecycle regardless (see CameraManager.bind()) — this only plugs/
@@ -78,6 +85,38 @@ fun MainScreen(
                     contentDescription = "Remote edge device camera",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+
+        // OCR scan preview — whatever frame was just sent to OCR.space
+        // (scan_current_view()/live-reading), so a scan is visible on
+        // screen instead of happening invisibly. Small corner thumbnail,
+        // not full-screen, since it's feedback about a background scan,
+        // not the primary camera feed; auto-hides a few seconds after the
+        // last scan so it doesn't linger once reading mode has moved on.
+        var showOcrPreview by remember { mutableStateOf(false) }
+        LaunchedEffect(ocrFrame) {
+            if (ocrFrame != null) {
+                showOcrPreview = true
+                delay(4000)
+                showOcrPreview = false
+            }
+        }
+        if (showOcrPreview && ocrFrame != null) {
+            val ocrBitmap = remember(ocrFrame) {
+                ocrFrame?.let { bytes -> BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+            }
+            if (ocrBitmap != null) {
+                Image(
+                    bitmap = ocrBitmap.asImageBitmap(),
+                    contentDescription = "Last OCR scan",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(start = 8.dp, bottom = 8.dp)
+                        .size(width = 96.dp, height = 128.dp)
+                        .border(2.dp, Color.White, androidx.compose.foundation.shape.RoundedCornerShape(4.dp)),
                 )
             }
         }

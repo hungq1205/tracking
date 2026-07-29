@@ -104,6 +104,16 @@ class ToolDispatcher(
     // enabled "Save debug OCR frames" in Settings (off by default: writing
     // every scanned frame to disk has real storage/privacy cost).
     private val saveDebugFrame: ((ByteArray) -> Unit)? = null,
+    // Live "what did OCR just look at" preview — every frame actually sent
+    // to OCR.space (one-shot scan_current_view() AND the continuous
+    // live-reading capture loop) is handed to this callback so the phone's
+    // own screen can show it, instead of the scan happening invisibly.
+    // Distinct from saveDebugFrame above (which persists to disk, gated
+    // behind a Settings toggle, off by default) — this is always-on,
+    // in-memory-only UI feedback, wired by MainViewModel/
+    // LiveAssistantService the same way the remote-edge-device camera
+    // preview (LiveAssistantService.edgeFrame) already works.
+    private val onOcrFrame: ((ByteArray) -> Unit)? = null,
     // OCR-error correction (+ translation for non-English text) — ported
     // from gt.py's Gemini-correction pipeline (see GeminiCorrectionClient's
     // own doc comment). Reuses the same geminiApiKey already used for
@@ -694,6 +704,7 @@ class ToolDispatcher(
             for (frame in ocrChannel) {
                 try {
                     sendVideoFrame(frame) // same visual-context feed toolScanCurrentView() gives Gemini
+                    onOcrFrame?.invoke(frame)
                     val ocrResult = ocrClient.analyze(frame)
                     if (ocrResult.text.isBlank()) continue
                     val (kind, block) = OcrBlockFilters.integrateRawBlock(state.readingBlocks, ocrResult.text)
@@ -889,6 +900,7 @@ class ToolDispatcher(
         // context for whatever Gemini says next (e.g. if the user then asks
         // "what does this say" / "what am I looking at").
         sendVideoFrame(frame)
+        onOcrFrame?.invoke(frame)
 
         val ocrResult = ocrClient.analyze(frame)
         Log.d(TAG, "[reading] OCR result: ${ocrResult.text.length} char(s)")
