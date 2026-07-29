@@ -555,6 +555,7 @@ def create_ui(activity_monitor) -> gr.Blocks:
 
         return (
             tabs_update,
+            tabs_update,
             _client_mode_text(snap),
             _annotate_tracking(snap["tracking"]),
             _tracking_status(snap["tracking"]),
